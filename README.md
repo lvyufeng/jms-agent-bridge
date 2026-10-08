@@ -115,6 +115,8 @@ claude mcp add jms-bridge -- jms-bridge serve
 | `jms_sync_push` / `jms_sync_pull` | rsync | Move code and artifacts across hosts |
 | `jms_submit_job` | SSH | Launch a long command detached (tmux) → job id |
 | `jms_job_status` / `jms_job_logs` / `jms_job_cancel` | SSH | Non-blocking job lifecycle |
+| `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free; estimates `world_size` |
+| `jms_cluster_submit` | SSH | Launch **one coordinated** job across the cluster with a shared rendezvous |
 
 Selectors accept host names, group names, or tags — `["cluster"]`, `["gpu"]`, `["all"]`.
 
@@ -130,6 +132,31 @@ jms_job_logs("ascend-910c", "<job-id>", offset=<size>)   # incremental
 jms_sync_pull(["cluster"], "~/torch-fl/checkpoints", "./results")
 jms_audit_query()                                # confirm the trail in JumpServer
 ```
+
+### Two kinds of "parallel"
+
+`jms_submit_job` runs the *same command independently* on each host — right for "probe
+everything", "pull logs everywhere". `jms_cluster_submit` runs *one coordinated job*:
+every host is a rank node given the same rendezvous, so a distributed launcher
+(`torchrun`, etc.) forms a single `world_size=N` job.
+
+```text
+jms_cluster_preflight(["cluster"])              # ready? world_size estimate, port free?
+jms_cluster_submit(
+  ["ascend-910c", "node-4090-1", "node-4090-2"],
+  "torchrun --nnodes=$JMS_WORLD_SIZE --node_rank=$JMS_RANK "
+  "--nproc_per_node=$JMS_NPROC "
+  "--rdzv_endpoint=$JMS_MASTER_ADDR:$JMS_MASTER_PORT train.py --rounds 100",
+)
+# -> {job_id per host, rendezvous, world_size, ranks:[...]}
+```
+
+Each rank gets `JMS_RANK`, `JMS_LOCAL_RANK`, `JMS_NPROC`, `JMS_WORLD_SIZE`,
+`JMS_MASTER_ADDR`, `JMS_MASTER_PORT` exported before its command. The bridge supplies
+the rank/world wiring (the part that must be identical across nodes); you supply the
+launcher. Note: ranks talk to each other **directly** over the rendezvous, not through
+the bastion — so `master_addr` must be the host's own reachable address (set `address:`
+in `hosts.yaml`), and all nodes must be mutually routable.
 
 ## Design notes
 

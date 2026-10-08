@@ -65,6 +65,25 @@ def build_runner_script(job_id: str, command: str, env_setup: str | None) -> str
     return "\n".join(lines) + "\n"
 
 
+def _collab_exports(
+    *, rank: int, nproc: int, world_size: int, master_addr: str, port: int
+) -> str:
+    """The ``export`` lines that wire one rank into a shared rendezvous.
+
+    Every rank gets the same ``JMS_WORLD_SIZE`` / ``JMS_MASTER_*`` and its own
+    ``JMS_RANK``; a distributed launcher on the host reads these to join the job.
+    """
+    env = {
+        "JMS_RANK": str(rank),
+        "JMS_LOCAL_RANK": "0",
+        "JMS_NPROC": str(nproc),
+        "JMS_WORLD_SIZE": str(world_size),
+        "JMS_MASTER_ADDR": master_addr,
+        "JMS_MASTER_PORT": str(port),
+    }
+    return "\n".join(f"export {k}={shell_quote(v)}" for k, v in env.items())
+
+
 @dataclass
 class JobHandle:
     job_id: str
@@ -106,6 +125,74 @@ class JobManager:
         if res.ok and "LAUNCHED" in res.stdout:
             return JobHandle(job_id, host.name, session), res
         return None, res
+
+    async def submit_collab(
+        self,
+        assignments: list[tuple[Host, int]],
+        command: str,
+        *,
+        master_addr: str,
+        port: int,
+        world_size: int,
+    ) -> tuple[list[JobHandle], list[ExecResult]]:
+        """Launch one *cooperative* job across ranked ranks sharing a rendezvous.
+
+        Unlike :meth:`submit` (which copies a command to each host to run
+        independently), this launches on every rank in parallel with the same
+        ``JMS_RANK`` / ``JMS_WORLD_SIZE`` / ``JMS_MASTER_*`` environment, so a
+        distributed launcher on each host (``torchrun --rdzv-endpoint``) can join a
+        single job. The agent supplies the launcher command; the bridge supplies the
+        rank/world wiring, which is the part that must be consistent across nodes.
+
+        ``assignments`` is ``[(host, nproc), ...]``; ranks are assigned in order, so
+        the host list order defines rank order. All ranks launch concurrently and the
+        call returns as soon as every launch is acknowledged — the job itself keeps
+        running detached.
+        """
+        handles: list[JobHandle] = []
+        results: list[ExecResult] = []
+        rank = 0
+        pending = []
+        for host, nproc in assignments:
+            job_id = _new_job_id()
+            session = f"jms-{job_id}"
+            root = _job_root(host, job_id)
+
+            # Rank/world wiring, exported before the command; the launcher reads these.
+            exports = _collab_exports(
+                rank=rank, nproc=nproc, world_size=world_size, master_addr=master_addr, port=port
+            )
+            runner_script = build_runner_script(job_id, f"{exports}\n{command}", host.env_setup)
+            launch = "\n".join(
+                [
+                    f"mkdir -p {shell_quote(root)}",
+                    f"cat > {shell_quote(root + '/run.sh')} <<'JMS_RUNNER_EOF'\n"
+                    f"{runner_script}JMS_RUNNER_EOF",
+                    f"cd {shell_quote(root)}",
+                    f"tmux new-session -d -s {shell_quote(session)} "
+                    f"-c {shell_quote(root)} 'bash {shell_quote(root + '/run.sh')} "
+                    f"> {shell_quote(root + '/stdout.log')} 2>&1; "
+                    f"echo $? > {shell_quote(root + '/tmux_exit')}'",
+                    f"tmux has-session -t {shell_quote(session)} && echo LAUNCHED",
+                ]
+            )
+            pending.append((host, job_id, session, launch))
+            rank += nproc
+
+        launched = await asyncio.gather(
+            *(self.runner.exec_on(host, launch, timeout=90) for host, _, _, launch in pending)
+        )
+        for (host, job_id, session, _), res in zip(pending, launched, strict=True):
+            results.append(res)
+            if res.ok and "LAUNCHED" in res.stdout:
+                handles.append(JobHandle(job_id, host.name, session))
+        return handles, results
+
+    async def status_many(self, pairs: list[tuple[Host, str]]) -> list[dict]:
+        """Status for ``[(host, job_id), ...]`` in parallel."""
+        return list(
+            await asyncio.gather(*(self.status(h, jid) for h, jid in pairs))
+        )
 
     async def status(self, host: Host, job_id: str) -> dict:
         _validate_job_id(job_id)

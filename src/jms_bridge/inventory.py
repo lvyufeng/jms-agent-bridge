@@ -77,6 +77,10 @@ class Host:
     login: str | None = None
     account: str | None = None
     asset_id: str | None = None
+    #: The asset's own address (IP/DNS as JumpServer knows it). Used as the
+    #: rendezvous address for distributed runs, since ranks talk to each other
+    #: directly rather than through the bastion. Falls back to the name.
+    address: str | None = None
     #: Platform key; resolved through :data:`jms_bridge.platforms.PLATFORMS`.
     platform: str = "generic"
     env_setup: str | None = None
@@ -168,6 +172,7 @@ class Inventory:
                 login=spec.get("login"),
                 account=spec.get("account"),
                 asset_id=str(spec["asset_id"]) if spec.get("asset_id") is not None else None,
+                address=spec.get("address"),
                 platform=spec.get("platform", "generic"),
                 env_setup=spec.get("env_setup"),
                 workdir=spec.get("workdir"),

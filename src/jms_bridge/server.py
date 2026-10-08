@@ -20,6 +20,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from .api import JumpServerAPI, JumpServerError
+from .cluster import DEFAULT_RDZV_PORT, preflight, resolve_rendezvous
 from .config import BastionConfig, load_config
 from .inventory import Host, Inventory
 from .jobs import JobManager
@@ -315,6 +316,90 @@ async def jms_job_cancel(host: str, job_id: str) -> dict:
     """Kill a running job on one host."""
     h = _inv().resolve([host])[0]
     return {"ok": True, **(await _jobs().cancel(h, job_id))}
+
+
+# --- cluster: preflight + coordinated launch ---------------------------------------
+
+
+@server.tool()
+async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_PORT) -> dict:
+    """Check a cluster is ready for a distributed run, host by host.
+
+    For every host: reachability, accelerator visibility and version (via the
+    platform probe), and whether the rendezvous `port` is already bound (a stale
+    previous run). Returns an estimated `world_size` and a suggested rendezvous.
+    Run this before `jms_cluster_submit`.
+    """
+    hosts = _resolve(targets)
+    health = await preflight(_ssh(), hosts, port=port)
+    ranks = sum(h.device_count or 1 for h in health if h.reachable and h.device_count)
+    rdv = resolve_rendezvous(hosts, port=port)
+    return {
+        "ok": all(h.ok for h in health),
+        "world_size_estimate": ranks,
+        "rendezvous": rdv.to_dict(),
+        "hosts": [h.to_dict() for h in health],
+        "platforms": sorted({h.platform for h in health}),
+    }
+
+
+@server.tool()
+async def jms_cluster_submit(
+    targets: list[str],
+    command: str,
+    master: str | None = None,
+    port: int = DEFAULT_RDZV_PORT,
+) -> dict:
+    """Launch ONE coordinated distributed job across a heterogeneous cluster.
+
+    Unlike `jms_submit_job` (which runs the command independently on each host),
+    this assigns every host a rank and gives them a shared rendezvous, exporting
+    `JMS_RANK`, `JMS_LOCAL_RANK`, `JMS_NPROC`, `JMS_WORLD_SIZE`, `JMS_MASTER_ADDR`
+    and `JMS_MASTER_PORT` before `command` runs. All ranks launch concurrently and
+    the call returns immediately with a job id per host.
+
+    `command` is your per-node launcher; wire it with the exported env. For torchrun:
+
+        torchrun --nnodes=$JMS_WORLD_SIZE --node_rank=$JMS_RANK \\
+                 --nproc_per_node=$JMS_NPROC \\
+                 --rdzv_endpoint=$JMS_MASTER_ADDR:$JMS_MASTER_PORT \\
+                 train.py --rounds 100
+
+    `targets` order defines rank order; each host contributes one rank node whose
+    `JMS_NPROC` is its accelerator count. Poll with `jms_job_status` / `jms_job_logs`.
+    """
+    if _looks_dangerous(command):
+        return {"ok": False, "error": "command matched the safety denylist", "command": command}
+    hosts = _resolve(targets)
+    if len(hosts) < 2:
+        return {
+            "ok": False,
+            "error": "cluster submit needs at least 2 hosts; use jms_submit_job for one",
+        }
+    rdv = resolve_rendezvous(hosts, master=master, port=port)
+
+    health = {h.host: h for h in await preflight(_ssh(), hosts, port=port)}
+    assignments = [(h, max(1, health[h.name].device_count or 1)) for h in hosts]
+    world_size = sum(n for _, n in assignments)
+
+    handles, results = await _jobs().submit_collab(
+        assignments, command, master_addr=rdv.master_addr, port=port, world_size=world_size
+    )
+    by_host = {h.host: h.job_id for h in handles}
+    return {
+        "ok": len(handles) == len(hosts),
+        "rendezvous": rdv.to_dict(),
+        "world_size": world_size,
+        "ranks": [
+            {
+                "host": h.name,
+                "job_id": by_host.get(h.name),
+                "nproc": n,
+                "launched": h.name in by_host,
+            }
+            for h, n in assignments
+        ],
+    }
 
 
 # --- helpers ----------------------------------------------------------------------
