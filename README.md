@@ -158,6 +158,33 @@ launcher. Note: ranks talk to each other **directly** over the rendezvous, not t
 the bastion — so `master_addr` must be the host's own reachable address (set `address:`
 in `hosts.yaml`), and all nodes must be mutually routable.
 
+### Heterogeneous clusters — islands and federation
+
+Ascend (HCCL) and NVIDIA (NCCL) nodes **cannot form one collective** — different
+libraries, different transports. So a mixed cluster is not one `world_size`; it is
+several *islands*, one per communication backend, that **federate** (exchange model
+updates between rounds) rather than share a collective.
+
+`jms_cluster_plan` returns this layout; `jms_cluster_submit` refuses a mixed set and
+points you at it:
+
+```text
+jms_cluster_plan(["cluster"])
+# -> islands: [
+#      {backend: "hccl", hosts: ["ascend-910c"],  world_size: 1, rendezvous: {...}},
+#      {backend: "nccl", hosts: ["node-4090-1", "node-4090-2"], world_size: 2, ...},
+#    ]
+
+# then one coordinated job per island (they form their own collectives):
+jms_cluster_submit(["node-4090-1", "node-4090-2"], "torchrun --nnodes=2 --node_rank=$JMS_RANK ...")
+jms_cluster_submit(["ascend-910c"],             "torchrun --nnodes=1 --node_rank=0 ...")
+```
+
+The island *exchange* (all-reduce across islands, or a parameter server) is
+application logic you write in the training script; the bridge gives each island its
+launch and rendezvous. For a plain same-chip cluster this collapses to a single island
+and a normal `jms_cluster_submit` — no federation needed.
+
 ## Design notes
 
 - **Local, not deployed.** The server runs on your machine, launched by Claude Code. No

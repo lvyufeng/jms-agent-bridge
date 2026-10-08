@@ -20,7 +20,13 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from .api import JumpServerAPI, JumpServerError
-from .cluster import DEFAULT_RDZV_PORT, preflight, resolve_rendezvous
+from .cluster import (
+    DEFAULT_RDZV_PORT,
+    is_heterogeneous,
+    plan_islands,
+    preflight,
+    resolve_rendezvous,
+)
 from .config import BastionConfig, load_config
 from .inventory import Host, Inventory
 from .jobs import JobManager
@@ -338,8 +344,45 @@ async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_POR
         "ok": all(h.ok for h in health),
         "world_size_estimate": ranks,
         "rendezvous": rdv.to_dict(),
+        "heterogeneous": is_heterogeneous(hosts),
+        "islands": [i.to_dict() for i in plan_islands(hosts)],
         "hosts": [h.to_dict() for h in health],
         "platforms": sorted({h.platform for h in health}),
+    }
+
+
+@server.tool()
+async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) -> dict:
+    """Plan a federated layout for a target set, grouped by communication backend.
+
+    Ascend (HCCL) and NVIDIA (NCCL) nodes cannot form a single collective. This
+    partitions the targets into **islands** — one per backend — each of which runs
+    its own coordinated job, and returns the federation plan: per-island rendezvous,
+    world size and job wiring. Run `jms_cluster_submit` once per island, then let the
+    islands exchange model updates between rounds (the FL exchange is the agent's
+    application logic; the bridge provides per-island launch + rendezvous).
+    """
+    hosts = _resolve(targets)
+    plan = []
+    for island in plan_islands(hosts):
+        rdv = resolve_rendezvous(island.hosts, port=port)
+        plan.append(
+            {
+                **island.to_dict(),
+                "rendezvous": rdv.to_dict(),
+                "world_size": len(island.hosts),
+                "submit_with_targets": [h.name for h in island.hosts],
+            }
+        )
+    return {
+        "ok": True,
+        "heterogeneous": is_heterogeneous(hosts),
+        "islands": plan,
+        "note": (
+            "Same-backend hosts in one island CAN form a single collective. Cross-island "
+            "training must federate (exchange updates between rounds), not share a "
+            "collective — HCCL and NCCL do not interoperate."
+        ),
     }
 
 
@@ -375,6 +418,19 @@ async def jms_cluster_submit(
         return {
             "ok": False,
             "error": "cluster submit needs at least 2 hosts; use jms_submit_job for one",
+        }
+    if is_heterogeneous(hosts):
+        islands = plan_islands(hosts)
+        return {
+            "ok": False,
+            "error": (
+                "targets span multiple communication backends "
+                f"({[i.backend for i in islands]}); a single collective is impossible "
+                "(e.g. HCCL and NCCL do not interoperate). Submit one island at a time "
+                "and federate across them."
+            ),
+            "islands": [i.to_dict() for i in islands],
+            "hint": "call jms_cluster_plan, then jms_cluster_submit once per island",
         }
     rdv = resolve_rendezvous(hosts, master=master, port=port)
 

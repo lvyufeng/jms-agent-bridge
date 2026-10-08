@@ -92,3 +92,44 @@ def test_health_to_dict_roundtrip():
     h = HostHealth("a", "cuda", True, 8, "12.4", 29400, True)
     d = h.to_dict()
     assert d["device_count"] == 8 and d["port_free"] is True and d["host"] == "a"
+
+
+# --- heterogeneous topology -------------------------------------------------------
+
+
+def test_plan_islands_partitions_by_backend():
+    from jms_bridge.cluster import plan_islands
+
+    hosts = [
+        Host(name="asc1", platform="ascend-910c"),
+        Host(name="gpu1", platform="cuda"),
+        Host(name="gpu2", platform="cuda"),
+        Host(name="arm", platform="aarch64"),
+    ]
+    islands = plan_islands(hosts)
+    assert [i.backend for i in islands] == ["hccl", "nccl", "gloo"]
+    assert [h.name for h in islands[1].hosts] == ["gpu1", "gpu2"]
+    assert islands[0].name == "island-0-hccl"
+    assert islands[0].to_dict()["nodes"] == 1
+
+
+def test_plan_islands_homogeneous_is_one_island():
+    from jms_bridge.cluster import plan_islands
+
+    hosts = [Host(name=f"g{i}", platform="cuda") for i in range(4)]
+    islands = plan_islands(hosts)
+    assert len(islands) == 1
+    assert islands[0].backend == "nccl"
+    assert islands[0].to_dict()["nodes"] == 4
+
+
+def test_is_heterogeneous():
+    from jms_bridge.cluster import is_heterogeneous
+
+    assert is_heterogeneous([Host(name="a", platform="cuda")]) is False
+    assert (
+        is_heterogeneous(
+            [Host(name="a", platform="cuda"), Host(name="b", platform="ascend-910c")]
+        )
+        is True
+    )

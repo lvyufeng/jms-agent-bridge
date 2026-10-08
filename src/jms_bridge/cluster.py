@@ -154,11 +154,70 @@ def resolve_rendezvous(
     return Rendezvous(master_host=chosen.name, master_addr=addr, port=port)
 
 
+# --- heterogeneous topology: islands + federation ----------------------------------
+
+
+@dataclass
+class Island:
+    """A set of hosts that share a communication backend and *can* form one collective.
+
+    Ascend (HCCL) and NVIDIA (NCCL) nodes cannot rendezvous into a single
+    ``world_size`` job — different collective libraries, different transports. So a
+    mixed cluster is partitioned into islands, each island running its own
+    distributed job, and the islands are *federated*: they exchange model updates
+    between rounds rather than gradients within one collective.
+    """
+
+    id: int
+    backend: str
+    hosts: list[Host]
+
+    @property
+    def name(self) -> str:
+        return f"island-{self.id}-{self.backend}"
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "backend": self.backend,
+            "hosts": [h.name for h in self.hosts],
+            "nodes": len(self.hosts),
+        }
+
+
+def plan_islands(hosts: list[Host]) -> list[Island]:
+    """Partition hosts into islands by communication backend, preserving order.
+
+    Hosts are grouped by their platform's ``dist_backend`` (``hccl`` / ``nccl`` /
+    ``gloo``). Same-backend hosts form one island that runs a single collective;
+    differing backends become separate islands that federate. A homogeneous cluster
+    yields a single island, which the caller may run as a plain coordinated job.
+    """
+    order: list[str] = []
+    buckets: dict[str, list[Host]] = {}
+    for h in hosts:
+        backend = h.platform_def.dist_backend
+        if backend not in buckets:
+            buckets[backend] = []
+            order.append(backend)
+        buckets[backend].append(h)
+    return [Island(id=i, backend=b, hosts=buckets[b]) for i, b in enumerate(order)]
+
+
+def is_heterogeneous(hosts: list[Host]) -> bool:
+    """True when a target set spans more than one communication backend."""
+    return len({h.platform_def.dist_backend for h in hosts}) > 1
+
+
 # Re-export for callers that only import cluster.
 __all__ = [
     "DEFAULT_RDZV_PORT",
     "HostHealth",
+    "Island",
     "Rendezvous",
+    "is_heterogeneous",
+    "plan_islands",
     "preflight",
     "resolve_rendezvous",
     "wrap_command",  # re-exported for symmetry with inventory
