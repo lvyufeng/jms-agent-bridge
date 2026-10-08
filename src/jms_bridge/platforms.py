@@ -49,8 +49,9 @@ ASCEND = Platform(
         "ASCEND_RT_VISIBLE_DEVICES": "all",
     },
     version_re=r"(?:Version|version)\s*[:=]?\s*([0-9][0-9A-Za-z._\-]+)",
-    # per-chip row: "| 0  0  | 0000:01:00.0 | ..." — the PCI bus-id column is the anchor
-    device_re=r"^\|\s*(\d+)\s+\d+\s+\|\s*[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:",
+    # Per-chip row, anchored on the PCI bus-id so it survives npu-smi column changes
+    # (26.x emits "| 0 | 0000:C1:00.0 |", 24.x emitted "| 0  0 | 0000:01:00.0 |").
+    device_re=r"^\|\s*(\d+)\s+.*?[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:",
 )
 
 # --- NVIDIA (CUDA / NCCL) --------------------------------------------------------
@@ -60,8 +61,8 @@ CUDA = Platform(
     dist_backend="nccl",
     dist_env={},
     version_re=r"CUDA Version:\s*([0-9][0-9A-Za-z._\-]*)",
-    # GPU row: "|   0  NVIDIA GeForce ...  | 00000000:01:00.0 Off |" — anchor on the bus id
-    device_re=r"^\|\s+(\d+)\s+.*?\|\s*[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:",
+    # GPU row: "|   0  NVIDIA GeForce RTX 4090  On  |   00000000:1B:00.0 Off |"
+    device_re=r"^\|\s*(\d+)\s+.*?[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:",
 )
 
 # --- aarch64 board (CPU / small accelerator) -------------------------------------

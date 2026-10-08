@@ -81,6 +81,12 @@ class Host:
     #: rendezvous address for distributed runs, since ranks talk to each other
     #: directly rather than through the bastion. Falls back to the name.
     address: str | None = None
+    #: Direct-SSH override: connect straight to this host (tailscale name, IP, or an
+    #: ``~/.ssh/config`` alias) instead of through the JumpServer gateway. Lets the
+    #: same tool address both bastion'd assets and directly-reachable machines.
+    ssh_host: str | None = None
+    ssh_user: str | None = None
+    ssh_port: int | None = None
     #: Platform key; resolved through :data:`jms_bridge.platforms.PLATFORMS`.
     platform: str = "generic"
     env_setup: str | None = None
@@ -112,6 +118,11 @@ class Host:
         if self.asset_id:
             pieces.append(self.asset_id)
         return "#".join(pieces)
+
+    @property
+    def is_direct(self) -> bool:
+        """True when this host is reached by plain SSH, not through JumpServer."""
+        return bool(self.ssh_host)
 
 
 @dataclass
@@ -173,6 +184,9 @@ class Inventory:
                 account=spec.get("account"),
                 asset_id=str(spec["asset_id"]) if spec.get("asset_id") is not None else None,
                 address=spec.get("address"),
+                ssh_host=spec.get("ssh_host"),
+                ssh_user=spec.get("ssh_user"),
+                ssh_port=int(spec["ssh_port"]) if spec.get("ssh_port") else None,
                 platform=spec.get("platform", "generic"),
                 env_setup=spec.get("env_setup"),
                 workdir=spec.get("workdir"),

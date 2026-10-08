@@ -20,18 +20,42 @@ def test_runner_exports_rank_wiring_for_collab():
 
 def test_runner_records_pid_status_exit_code():
     script = build_runner_script("abcd1234", "echo hello", "source env.sh")
-    assert "echo \"$$\" > pid" in script
-    assert "echo running > status" in script
-    assert "echo done > status" in script
-    assert "echo failed > status" in script
-    assert 'echo "$code" > exit_code' in script
+    # Self-locating: state is written with absolute paths under $R (the job dir),
+    # so it lands there regardless of the cwd tmux handed the session.
+    assert 'R="$(cd "$(dirname "$0")" && pwd)"' in script
+    assert 'echo "$$" > "$R/pid"' in script
+    assert 'echo running > "$R/status"' in script
+    assert 'echo done > "$R/status"' in script
+    assert 'echo failed > "$R/status"' in script
+    assert 'echo "$code" > "$R/exit_code"' in script
     # env activation happens before the command
     assert script.index("source env.sh") < script.index("echo hello")
+
+
+def test_runner_cds_into_workdir_tilde_safe():
+    """A tilde workdir must be a shell expression, not a literal '~' in quotes."""
+    script = build_runner_script("abcd1234", "python train.py", None, "~/torch-fl")
+    assert 'cd "$HOME"/torch-fl 2>/dev/null || cd "$R"' in script
+    # absolute workdir is single-quoted
+    script = build_runner_script("abcd1234", "python train.py", None, "/data/fl")
+    assert "cd '/data/fl' 2>/dev/null || cd \"$R\"" in script
 
 
 def test_runner_wraps_command_snippet():
     script = build_runner_script("abcd1234", "python train.py --epochs 3", None)
     assert "python train.py --epochs 3" in script
+
+
+def test_runner_isolates_command_exit_in_subshell():
+    """A command ending in `exit N` must not kill the wrapper before status is written."""
+    script = build_runner_script("abcd1234", "echo boom >&2; exit 7", None)
+    lines = script.splitlines()
+    cmd_i = lines.index("echo boom >&2; exit 7")
+    # the command sits between a lone '(' and a lone ')'
+    assert lines[cmd_i - 1].strip() == "("
+    assert lines[cmd_i + 1].strip() == ")"
+    # and the exit-code capture follows the subshell
+    assert script.index("code=$?") > script.index("exit 7")
 
 
 def test_validate_job_id_accepts_8_hex():

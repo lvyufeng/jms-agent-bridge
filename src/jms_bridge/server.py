@@ -185,7 +185,7 @@ async def jms_probe(targets: list[str]) -> dict:
     results = []
     for host in hosts:
         platform = host.platform_def
-        res = await _ssh().exec_on(host, platform.probe_cmd, timeout=45)
+        res = await _ssh().exec_on(host, platform.probe_cmd, timeout=45, workdir=False)
         parsed = platform.parse_probe(res.stdout) if res.ok else {}
         results.append(
             {

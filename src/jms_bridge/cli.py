@@ -165,7 +165,7 @@ async def cmd_probe(args: argparse.Namespace) -> int:
     try:
         for host in inv.resolve(args.targets):
             platform = host.platform_def
-            res = await runner.exec_on(host, platform.probe_cmd, timeout=45)
+            res = await runner.exec_on(host, platform.probe_cmd, timeout=45, workdir=False)
             print(f"### {host.name} [{platform.name}]  exit={res.exit_code}")
             if res.ok:
                 for k, v in platform.parse_probe(res.stdout).items():

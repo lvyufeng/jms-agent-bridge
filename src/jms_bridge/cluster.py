@@ -95,7 +95,9 @@ async def preflight(
 
     async def one(host: Host) -> HostHealth:
         platform = host.platform_def
-        res = await runner.exec_on(host, _preflight_command(platform, port), timeout=timeout)
+        res = await runner.exec_on(
+            host, _preflight_command(platform, port), timeout=timeout, workdir=False
+        )
         if not res.ok and not res.stdout:
             return HostHealth(
                 host=host.name,

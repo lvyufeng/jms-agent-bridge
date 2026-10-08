@@ -38,28 +38,65 @@ def _new_job_id() -> str:
 
 
 def _job_root(host: Host, job_id: str) -> str:
-    base = host.workdir or "$HOME"
-    return f"{base.rstrip('/')}/{JOB_DIR}/{job_id}"
+    """A *shell expression* for the remote job directory — use it unquoted.
+
+    A leading ``~`` becomes ``"$HOME"`` so the remote shell expands it; an absolute
+    path is single-quoted. The result is embedded directly into command strings and
+    must NOT be wrapped in :func:`shell_quote` again.
+    """
+    base = host.workdir or "~"
+    if base.startswith("~"):
+        rest = base[1:].lstrip("/")
+        tail = f"{rest}/{JOB_DIR}/{job_id}" if rest else f"{JOB_DIR}/{job_id}"
+        return f'"$HOME"/{tail}'
+    return shell_quote(f"{base.rstrip('/')}/{JOB_DIR}/{job_id}")
 
 
-def build_runner_script(job_id: str, command: str, env_setup: str | None) -> str:
+def _workdir_expr(workdir: str | None) -> str | None:
+    """A shell expression for a workdir, tilde-safe (``~`` → ``"$HOME"``)."""
+    if not workdir:
+        return None
+    if workdir.startswith("~"):
+        rest = workdir[1:].lstrip("/")
+        return f'"$HOME"/{rest}' if rest else '"$HOME"'
+    return shell_quote(workdir)
+
+
+def build_runner_script(
+    job_id: str, command: str, env_setup: str | None, workdir: str | None = None
+) -> str:
     """The remote bash script that wraps one job.
 
-    Written carefully so the exit status, a terminal ``status`` marker and the PID
-    are all recorded even if the command fails, and so the tmux session ends with
-    the job rather than lingering.
+    Self-locating: it derives its own directory (the job dir) into ``$R`` and writes
+    ``pid``/``status``/``exit_code`` there with **absolute** paths, so the state lands
+    in the job dir no matter what cwd tmux handed it. Written so the exit status, a
+    terminal ``status`` marker and the PID are recorded even if the command fails, and
+    the tmux session ends with the job rather than lingering.
     """
-    lines = ["set -uo pipefail"]
+    lines = [
+        "set -uo pipefail",
+        'R="$(cd "$(dirname "$0")" && pwd)"',
+    ]
     if env_setup:
         lines.append(env_setup)
+    wd = _workdir_expr(workdir)
+    if wd:
+        # Run in the host workdir when it exists, else stay in the job dir.
+        lines.append(f'cd {wd} 2>/dev/null || cd "$R"')
     lines += [
-        'echo "$$" > pid',
-        'echo running > status',
+        'echo "$$" > "$R/pid"',
+        'echo running > "$R/status"',
         "set +e",
+        # Run the command in a subshell: a command that ends in `exit N` would
+        # otherwise terminate this wrapper before the status/exit_code are written,
+        # leaving the job forever 'running' with no exit code.
+        "(",
         command,
+        ")",
         "code=$?",
-        'echo "$code" > exit_code',
-        'if [ "$code" -eq 0 ]; then echo done > status; else echo failed > status; fi',
+        'echo "$code" > "$R/exit_code"',
+        'if [ "$code" -eq 0 ]; then echo done > "$R/status"; '
+        'else echo failed > "$R/status"; fi',
         'exit "$code"',
     ]
     return "\n".join(lines) + "\n"
@@ -94,6 +131,37 @@ class JobHandle:
         return {"job_id": self.job_id, "host": self.host, "tmux_session": self.tmux_session}
 
 
+def _launch_script(
+    root: str,
+    session: str,
+    job_id: str,
+    body: str,
+    env_setup: str | None,
+    workdir: str | None = None,
+) -> str:
+    """Build the remote script that stages and launches one detached job.
+
+    ``root`` is a shell *expression* (from :func:`_job_root`), embedded unquoted.
+    All the quoting is done here, once: the runner is written with a quoted heredoc
+    (so nothing in it is expanded on the way in), and the tmux command is built by
+    assigning ``R="$HOME"/...`` first so the doubly-quoted inner command sees a plain
+    path with no stray single quotes from the absolute-path form.
+    """
+    runner_script = build_runner_script(job_id, body, env_setup, workdir)
+    return "\n".join(
+        [
+            "set -eu",
+            f'R={root}',
+            'mkdir -p "$R"',
+            f'cat > "$R/run.sh" <<\'JMS_RUNNER_EOF\'\n{runner_script}JMS_RUNNER_EOF',
+            f"tmux new-session -d -s {shell_quote(session)} "
+            f"\"bash \\\"$R/run.sh\\\" > \\\"$R/stdout.log\\\" 2>&1; "
+            f"echo \\$? > \\\"$R/tmux_exit\\\"\"",
+            f"tmux has-session -t {shell_quote(session)} && echo LAUNCHED",
+        ]
+    )
+
+
 class JobManager:
     def __init__(self, runner: SSHRunner):
         self.runner = runner
@@ -105,23 +173,10 @@ class JobManager:
         job_id = _new_job_id()
         session = f"jms-{job_id}"
         root = _job_root(host, job_id)
-        runner_script = build_runner_script(job_id, command, host.env_setup)
-
-        # Create dirs, drop the runner, launch it under tmux, then confirm it started.
-        launch = "\n".join(
-            [
-                f"mkdir -p {shell_quote(root)}",
-                f"cat > {shell_quote(root + '/run.sh')} <<'JMS_RUNNER_EOF'\n"
-                f"{runner_script}JMS_RUNNER_EOF",
-                f"cd {shell_quote(root)}",
-                f"tmux new-session -d -s {shell_quote(session)} "
-                f"-c {shell_quote(root)} 'bash {shell_quote(root + '/run.sh')} "
-                f"> {shell_quote(root + '/stdout.log')} 2>&1; "
-                f"echo $? > {shell_quote(root + '/tmux_exit')}'",
-                f"tmux has-session -t {shell_quote(session)} && echo LAUNCHED",
-            ]
+        launch = _launch_script(
+            root, session, job_id, command, host.env_setup, host.workdir
         )
-        res = await self.runner.exec_on(host, launch, timeout=90)
+        res = await self.runner.exec_on(host, launch, timeout=90, workdir=False)
         if res.ok and "LAUNCHED" in res.stdout:
             return JobHandle(job_id, host.name, session), res
         return None, res
@@ -162,25 +217,17 @@ class JobManager:
             exports = _collab_exports(
                 rank=rank, nproc=nproc, world_size=world_size, master_addr=master_addr, port=port
             )
-            runner_script = build_runner_script(job_id, f"{exports}\n{command}", host.env_setup)
-            launch = "\n".join(
-                [
-                    f"mkdir -p {shell_quote(root)}",
-                    f"cat > {shell_quote(root + '/run.sh')} <<'JMS_RUNNER_EOF'\n"
-                    f"{runner_script}JMS_RUNNER_EOF",
-                    f"cd {shell_quote(root)}",
-                    f"tmux new-session -d -s {shell_quote(session)} "
-                    f"-c {shell_quote(root)} 'bash {shell_quote(root + '/run.sh')} "
-                    f"> {shell_quote(root + '/stdout.log')} 2>&1; "
-                    f"echo $? > {shell_quote(root + '/tmux_exit')}'",
-                    f"tmux has-session -t {shell_quote(session)} && echo LAUNCHED",
-                ]
+            launch = _launch_script(
+                root, session, job_id, f"{exports}\n{command}", host.env_setup, host.workdir
             )
             pending.append((host, job_id, session, launch))
             rank += nproc
 
         launched = await asyncio.gather(
-            *(self.runner.exec_on(host, launch, timeout=90) for host, _, _, launch in pending)
+            *(
+                self.runner.exec_on(host, launch, timeout=90, workdir=False)
+                for host, _, _, launch in pending
+            )
         )
         for (host, job_id, session, _), res in zip(pending, launched, strict=True):
             results.append(res)
@@ -197,7 +244,7 @@ class JobManager:
     async def status(self, host: Host, job_id: str) -> dict:
         _validate_job_id(job_id)
         root = _job_root(host, job_id)
-        q = shell_quote(root)
+        q = root
         alive_probe = f"tmux has-session -t jms-{job_id} 2>/dev/null && echo yes || echo no"
         cmd = (
             f"if [ -d {q} ]; then "
@@ -208,7 +255,7 @@ class JobManager:
             f"echo \"alive=$({alive_probe})\"; "
             f"else echo 'status=missing'; fi"
         )
-        res = await self.runner.exec_on(host, cmd, timeout=60)
+        res = await self.runner.exec_on(host, cmd, timeout=60, workdir=False)
         parsed: dict[str, str] = {"host": host.name, "job_id": job_id}
         for line in res.stdout.splitlines():
             if "=" in line:
@@ -222,7 +269,7 @@ class JobManager:
     ) -> dict:
         """Return log bytes from ``offset`` onward (for incremental polling)."""
         _validate_job_id(job_id)
-        log_path = shell_quote(f"{_job_root(host, job_id)}/stdout.log")
+        log_path = f"{_job_root(host, job_id)}/stdout.log"
         cmd = (
             f"if [ -f {log_path} ]; then "
             f"size=$(stat -c %s {log_path}); "
@@ -230,7 +277,7 @@ class JobManager:
             f"tail -c +{int(offset) + 1} {log_path} | head -c {int(max_bytes)}; "
             f"else echo 'size=0'; fi"
         )
-        res = await self.runner.exec_on(host, cmd, timeout=60)
+        res = await self.runner.exec_on(host, cmd, timeout=60, workdir=False)
         size = 0
         body = res.stdout
         if body.startswith("size="):
@@ -244,17 +291,17 @@ class JobManager:
 
     async def cancel(self, host: Host, job_id: str) -> dict:
         _validate_job_id(job_id)
-        root = shell_quote(_job_root(host, job_id))
+        root = _job_root(host, job_id)
         cmd = (
             f"tmux kill-session -t jms-{job_id} 2>/dev/null && echo KILLED || echo NO_SESSION; "
             f"echo cancelled > {root}/status 2>/dev/null || true"
         )
-        res = await self.runner.exec_on(host, cmd, timeout=60)
+        res = await self.runner.exec_on(host, cmd, timeout=60, workdir=False)
         return {"host": host.name, "job_id": job_id, "killed": "KILLED" in res.stdout, "ok": res.ok}
 
     async def list_jobs(self, host: Host) -> list[str]:
         cmd = "tmux ls 2>/dev/null | grep -o '^jms-[0-9a-f]\\{8\\}' || true"
-        res = await self.runner.exec_on(host, cmd, timeout=60)
+        res = await self.runner.exec_on(host, cmd, timeout=60, workdir=False)
         return [
             line.strip().removeprefix("jms-")
             for line in res.stdout.splitlines()

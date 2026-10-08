@@ -17,6 +17,7 @@ Design notes that matter:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shlex
 import tempfile
@@ -67,7 +68,14 @@ class SSHRunner:
         self.cfg = cfg
         self.max_parallel = max_parallel
         self._sem = asyncio.Semaphore(max_parallel)
-        self._cmi_dir = Path(tempfile.mkdtemp(prefix="jms-bridge-cm-"))
+        # A short socket dir: the full ControlPath must fit in a Unix-domain socket
+        # path (104 bytes on macOS), so a long temp dir + long host name overflows.
+        self._cmi_dir = Path(tempfile.mkdtemp(prefix="jmsb-", dir="/tmp"))
+
+    def _sock(self, host: Host) -> Path:
+        """A short, collision-free control-socket path for a host."""
+        digest = hashlib.sha256(host.name.encode()).hexdigest()[:12]
+        return self._cmi_dir / f"{digest}.sock"
 
     # --- target construction ---------------------------------------------------
 
@@ -75,20 +83,31 @@ class SSHRunner:
         """``login#account#asset_id@bastion`` — the JumpServer per-asset address."""
         return f"{host.login_string(self.cfg.login_user)}@{self.cfg.url.split('://')[-1].split('/')[0]}"
 
+    def _host_port(self, host: Host) -> tuple[str, int]:
+        """Resolve the ssh target and port for a host (direct override or bastion)."""
+        if host.is_direct:
+            return host.ssh_host, host.ssh_port or 22
+        return self.target(host), self.cfg.ssh_port
+
     def _ssh_argv(self, host: Host, *, tty: bool = False) -> list[str]:
-        control = f"{self._cmi_dir}/{host.name}.sock"
+        control = str(self._sock(host))
         argv = ["ssh", *_BASE_OPTS]
-        if self.cfg.ssh_key:
-            argv += ["-i", str(self.cfg.ssh_key), "-o", "IdentitiesOnly=yes"]
+        key = self.cfg.ssh_key
+        if host.is_direct and host.ssh_user:
+            argv += ["-l", host.ssh_user]
+        if key:
+            argv += ["-i", str(key), "-o", "IdentitiesOnly=yes"]
         argv += [
             "-o", "ControlMaster=auto",
             "-o", f"ControlPath={control}",
             "-o", "ControlPersist=300",
-            "-p", str(self.cfg.ssh_port),
         ]
+        target, port = self._host_port(host)
+        if port != 22:
+            argv += ["-p", str(port)]
         if tty:
             argv.append("-tt")
-        argv += [self.target(host), "bash -s"]
+        argv += [target, "bash -s"]
         return argv
 
     # --- execution -------------------------------------------------------------
@@ -125,9 +144,15 @@ class SSHRunner:
                     timed_out=True,
                 )
 
-    async def exec_on(self, host: Host, command: str, *, timeout: float = 60.0) -> ExecResult:
-        """Run a short command on one host, activating the host's env first."""
-        script = wrap_command(host.env_setup, host.workdir, command)
+    async def exec_on(
+        self, host: Host, command: str, *, timeout: float = 60.0, workdir: bool = True
+    ) -> ExecResult:
+        """Run a short command on one host, activating the host's env first.
+
+        ``workdir=False`` skips the ``cd`` into the host workdir — used by probes,
+        which must succeed even before the workdir exists.
+        """
+        script = wrap_command(host.env_setup, host.workdir if workdir else None, command)
         return await self._run_script(host, script, timeout)
 
     async def exec_many(
@@ -152,25 +177,25 @@ class SSHRunner:
         timeout: float = 900.0,
     ) -> ExecResult:
         """Push or pull a path via rsync over the multiplexed SSH connection."""
-        ssh_cmd = " ".join(
-            shlex.quote(a)
-            for a in [
-                "ssh",
-                *_BASE_OPTS,
-                *(("-i", str(self.cfg.ssh_key)) if self.cfg.ssh_key else ()),
-                "-o", "ControlMaster=auto",
-                "-o", f"ControlPath={self._cmi_dir}/{host.name}.sock",
-                "-o", "ControlPersist=300",
-                "-p", str(self.cfg.ssh_port),
-            ]
-        )
+        target, port = self._host_port(host)
+        ssh_parts = [
+            "ssh",
+            *_BASE_OPTS,
+            *(["-l", host.ssh_user] if host.is_direct and host.ssh_user else []),
+            *(("-i", str(self.cfg.ssh_key)) if self.cfg.ssh_key else ()),
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={self._sock(host)}",
+            "-o", "ControlPersist=300",
+            *(["-p", str(port)] if port != 22 else []),
+        ]
+        ssh_cmd = " ".join(shlex.quote(a) for a in ssh_parts)
         argv = ["rsync", "-az", "--info=stats1", "-e", ssh_cmd]
         if delete:
             argv.append("--delete")
         for pat in excludes or []:
             argv += ["--exclude", pat]
 
-        remote_spec = f"{self.target(host)}:{remote}"
+        remote_spec = f"{target}:{remote}"
         if direction == "push":
             argv += [local, remote_spec]
         else:
