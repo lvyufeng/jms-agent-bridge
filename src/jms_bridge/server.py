@@ -100,16 +100,19 @@ async def jms_list_assets(search: str | None = None) -> dict:
 
 @server.tool()
 async def jms_audit_query(
-    asset: str | None = None, user: str | None = None, limit: int = 30
+    asset_id: str | None = None, user: str | None = None, days: int = 5, limit: int = 30
 ) -> dict:
     """Recent command records from JumpServer's audit log.
 
     This is how the agent (and you) answer 'what has actually been executed?' —
     every data-plane command is attributed here because it goes through KoKo.
+    `days` is the look-back window (JumpServer defaults to the last 5 days).
     """
     api = _api()
     try:
-        records = await api.command_records(asset=asset, user=user, limit=limit)
+        records = await api.command_records(
+            asset_id=asset_id, user=user, days=days, limit=limit
+        )
     except JumpServerError as exc:
         return {"ok": False, "error": str(exc)}
     return {
@@ -119,6 +122,7 @@ async def jms_audit_query(
             {
                 "user": r.get("user"),
                 "asset": r.get("asset"),
+                "account": r.get("account"),
                 "input": r.get("input"),
                 "timestamp": r.get("timestamp"),
                 "session": r.get("session"),
@@ -130,14 +134,31 @@ async def jms_audit_query(
 
 @server.tool()
 async def jms_create_ticket(
-    title: str, ticket_type: str, body: str = "", assignees: list[str] | None = None
+    title: str,
+    ticket_type: str = "login_asset_confirm",
+    comment: str = "",
+    org_id: str | None = None,
+    fields: dict | None = None,
 ) -> dict:
-    """Raise a JumpServer approval ticket (e.g. for a command or login that policy gates)."""
+    """Raise a JumpServer approval ticket via the subtype's ``open`` action.
+
+    `ticket_type` is one of: `login_asset_confirm`, `command_confirm`, `apply_asset`,
+    `login_confirm`. `fields` carries the type-specific payload, e.g. for a
+    login-asset ticket ``{"apply_login_user": "<uuid>", "apply_login_asset":
+    "<uuid>", "apply_login_account": "root"}``.
+    """
     api = _api()
     try:
-        return {"ok": True, "ticket": await api.create_ticket(
-            title=title, ticket_type=ticket_type, body=body, assignees=assignees
-        )}
+        return {
+            "ok": True,
+            "ticket": await api.create_ticket(
+                title=title,
+                ticket_type=ticket_type,
+                comment=comment,
+                org_id=org_id,
+                **(fields or {}),
+            ),
+        }
     except JumpServerError as exc:
         return {"ok": False, "error": str(exc)}
 

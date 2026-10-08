@@ -90,8 +90,12 @@ class Host:
     def login_string(self, default_login: str | None = None) -> str:
         """The JumpServer per-asset SSH login: ``login#account#asset_id``.
 
-        Missing pieces are omitted, so ``user#assetid`` (no account) also works,
-        matching JumpServer's own ``#``-separated form.
+        Verified against koko (``pkg/auth/ssh.go``): the ``#``-separated form takes
+        exactly three fields (``user#account#asset``) or four
+        (``user#protocol#account#asset``); two fields do not parse, so a direct
+        login needs an *account*. ``asset_id`` may be a UUID or an asset name/IP;
+        it must resolve to exactly one permitted asset. ``@`` also works as the
+        separator, but ``#`` is unambiguous here.
         """
         login = self.login or default_login
         if not login:

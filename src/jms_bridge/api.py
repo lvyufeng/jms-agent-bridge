@@ -1,17 +1,41 @@
 """JumpServer REST control plane.
 
-Used for what the API is genuinely good at: discovering assets and their accounts,
-reading the audit trail, and raising approval tickets. Anything that *executes* on
-a host goes through the SSH data plane instead (see :mod:`jms_bridge.ssh`).
+Used for what the API is genuinely good at: discovering the assets and accounts an
+account may reach, reading the audit trail, and raising approval tickets. Anything
+that *executes* on a host goes through the SSH data plane instead (see
+:mod:`jms_bridge.ssh`).
 
-Authentication supports the two schemes JumpServer deployments actually use:
+Authentication
+--------------
+JumpServer accepts several schemes (DRF authenticator order, see
+``apps/jumpserver/settings/libs.py``); this client supports the two that are stable
+and unattended:
 
 * **Private token** — ``Authorization: Token <token>``
-* **Access key** — request signing with an id/secret pair
+* **Access key** — the *HTTP Signature* scheme (``pyhttpsig``), NOT a plain HMAC
+  header. The signed string is::
+
+      (request-target): <method> <path>\\n
+      date: <RFC1123 date>\\n
+      accept: application/json
+
+  (plus ``x-jms-org`` when an org is set), signed with HMAC-SHA256 and the secret,
+  base64-encoded, and placed in::
+
+      Authorization: Signature keyId="<id>",algorithm="hmac-sha256",
+                     headers="(request-target) date accept",signature="<b64>"
 
 Session login (username/password → bearer token) is available via
-:meth:`JumpServerAPI.login_with_password` but the bridge prefers a long-lived
-token or access key so nothing asks for a password at runtime.
+:meth:`JumpServerAPI.login_with_password` but the bridge prefers a long-lived token
+or access key so nothing asks for a password at runtime.
+
+Endpoint facts verified against ``jumpserver/jumpserver@dev``:
+
+* pagination is ``limit`` / ``offset``; ordering is ``order``; global search is ``q``
+* asset list for the current user: ``GET /api/v1/perms/users/my/assets/``
+* command audit: ``GET /api/v1/terminal/commands/`` (default window: last 5 days)
+* tickets are created via the ``open`` action, not a plain ``POST`` on the collection
+* product version (unauthenticated): ``GET /api/v1/settings/public/open/``
 """
 
 from __future__ import annotations
@@ -19,6 +43,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,6 +54,9 @@ import httpx
 from .config import BastionConfig
 
 log = logging.getLogger("jms_bridge.api")
+
+#: Headers bound into the signature, in the order JumpServer's verifier expects.
+SIGNED_HEADERS = ["(request-target)", "date", "accept"]
 
 
 class JumpServerError(RuntimeError):
@@ -49,7 +77,6 @@ class JumpServerAPI:
                 base_url=self.cfg.url,
                 timeout=self.cfg.api_timeout,
                 verify=self.cfg.verify_tls,
-                headers={"Accept": "application/json"},
             )
         return self._client
 
@@ -58,13 +85,57 @@ class JumpServerAPI:
             await self._client.aclose()
             self._client = None
 
-    def _org_headers(self) -> dict[str, str]:
-        return {"X-JMS-ORG": self.cfg.org_id} if self.cfg.org_id else {}
+    # --- auth ------------------------------------------------------------------
 
-    def _auth_headers(self, method: str, path: str, body: bytes = b"") -> dict[str, str]:
-        """Build the auth header for one request, choosing the configured scheme."""
+    def sign_access_key(
+        self, method: str, path: str, *, date: str, accept: str, org: str | None
+    ) -> tuple[str, dict[str, str]]:
+        """Return ``(authorization_header, headers_to_send)`` for an access-key request.
+
+        Mirrors ``pyhttpsig``'s ``HeaderSigner`` exactly (see
+        ``httpsig.utils.generate_message`` and ``build_signature_template``): the
+        signed lines are ``<header>: <value>`` joined by ``\\n``, with
+        ``(request-target): <method> <path>`` first.
+        """
+        assert self.cfg.access_key_id and self.cfg.access_key_secret
+
+        headers = {"date": date, "accept": accept}
+        signed = list(SIGNED_HEADERS)
+        if org:
+            headers["x-jms-org"] = org
+            signed = [*SIGNED_HEADERS, "x-jms-org"]
+
+        lines = []
+        for h in signed:
+            if h == "(request-target)":
+                lines.append(f"(request-target): {method.lower()} {path}")
+            else:
+                lines.append(f"{h}: {headers[h]}")
+        signable = "\n".join(lines).encode("ascii")
+
+        signature = base64.b64encode(
+            hmac.new(
+                self.cfg.access_key_secret.encode("ascii"), signable, hashlib.sha256
+            ).digest()
+        ).decode("ascii")
+
+        authorization = (
+            f'Signature keyId="{self.cfg.access_key_id}",'
+            f'algorithm="hmac-sha256",signature="{signature}",'
+            f'headers="{" ".join(signed)}"'
+        )
+        return authorization, headers
+
+    def _auth_headers(self, method: str, path: str) -> dict[str, str]:
+        """Build the auth headers for one request, choosing the configured scheme."""
         if self.cfg.access_key_id and self.cfg.access_key_secret:
-            return {"Authorization": self._sign_access_key(method, path, body)}
+            date = format_datetime(datetime.now(timezone.utc))
+            auth, extra = self.sign_access_key(
+                method, path, date=date, accept="application/json", org=self.cfg.org_id
+            )
+            return {"Authorization": auth, "Date": extra["date"], **{
+                k.title(): v for k, v in extra.items() if k in ("accept", "x-jms-org")
+            }}
         token = self._token or self.cfg.private_token
         if token:
             # Private tokens use the "Token" scheme; session tokens use "Bearer".
@@ -76,49 +147,23 @@ class JumpServerAPI:
             "login_with_password()."
         )
 
-    def _sign_access_key(self, method: str, path: str, body: bytes = b"") -> str:
-        """Sign a request with the access-key id/secret (HMAC-SHA256).
-
-        Header form: ``Authorization: Signature <access_key_id>:<base64 signature>``.
-        The signed string binds method, path, body digest, content type and date, so
-        a replayed or mutated request fails verification.
-        """
-        assert self.cfg.access_key_id and self.cfg.access_key_secret
-
-        content_type = "application/json"
-        date = format_datetime(datetime.now(timezone.utc))
-        body_hash = base64.b64encode(hashlib.sha256(body).digest()).decode()
-        string_to_sign = "\n".join(
-            [method.upper(), path, content_type, date, body_hash]
-        )
-        signature = base64.b64encode(
-            hmac.new(
-                self.cfg.access_key_secret.encode(),
-                string_to_sign.encode(),
-                hashlib.sha256,
-            ).digest()
-        ).decode()
-        return f"Signature {self.cfg.access_key_id}:{signature}"
-
     async def request(
         self, method: str, path: str, *, params: dict | None = None, json: dict | None = None
     ) -> dict:
         body = b"" if json is None else __import__("json").dumps(json).encode()
-        # The signing path must include the query string as sent.
+        # The signature binds the full path *including* the query string.
         signed_path = path
         if params:
             qs = str(httpx.QueryParams(params))
             signed_path = f"{path}?{qs}" if qs else path
 
-        headers = {**self._org_headers(), **self._auth_headers(method, signed_path, body)}
+        headers = self._auth_headers(method, signed_path)
         client = await self.client()
         resp = await client.request(
             method, self.cfg.api_url(path), params=params, content=body or None, headers=headers
         )
         if not resp.is_success:
-            raise JumpServerError(
-                f"{method} {path} -> {resp.status_code}: {resp.text[:500]}"
-            )
+            raise JumpServerError(f"{method} {path} -> {resp.status_code}: {resp.text[:500]}")
         if not resp.content:
             return {}
         try:
@@ -126,15 +171,12 @@ class JumpServerAPI:
         except ValueError:
             return {"_raw": resp.text}
 
-    # --- auth ------------------------------------------------------------------
-
     async def login_with_password(self, username: str, password: str) -> str:
         """Session login; stores a bearer token for subsequent calls."""
         client = await self.client()
         resp = await client.post(
             self.cfg.api_url("authentication/auth/"),
             json={"username": username, "password": password},
-            headers=self._org_headers(),
         )
         if not resp.is_success:
             raise JumpServerError(f"login failed: {resp.status_code} {resp.text[:300]}")
@@ -152,18 +194,31 @@ class JumpServerAPI:
         resp.raise_for_status()
         return resp.json()
 
+    async def version(self) -> str | None:
+        """Product version, from the unauthenticated public-settings endpoint."""
+        try:
+            data = await self.request("GET", "settings/public/open/")
+        except JumpServerError:
+            return None
+        interface = data.get("INTERFACE") or {}
+        return interface.get("version") or None
+
     # --- discovery -------------------------------------------------------------
 
     async def list_assets(self, *, search: str | None = None, limit: int = 200) -> list[dict]:
-        """Assets visible to the current account (permission-filtered by JumpServer)."""
+        """Assets the current account is permitted to reach (the perm-scoped list)."""
         params: dict = {"limit": limit}
         if search:
-            params["search"] = search
-        data = await self.request("GET", "assets/assets/", params=params)
+            params["q"] = search
+        data = await self.request("GET", "perms/users/my/assets/", params=params)
         return data.get("results", data if isinstance(data, list) else [])
 
     async def get_asset(self, asset_id: str) -> dict:
-        return await self.request("GET", f"assets/assets/{asset_id}/")
+        """One permitted asset, including its ``permed_accounts`` and protocols.
+
+        This single call carries everything needed to build a direct-login string.
+        """
+        return await self.request("GET", f"perms/users/my/assets/{asset_id}/")
 
     async def list_accounts(self, asset_id: str) -> list[dict]:
         """Accounts (system users) bound to an asset — the ``#account`` in a login."""
@@ -175,36 +230,68 @@ class JumpServerAPI:
     # --- audit -----------------------------------------------------------------
 
     async def command_records(
-        self, *, asset: str | None = None, user: str | None = None, limit: int = 50
+        self,
+        *,
+        asset_id: str | None = None,
+        user: str | None = None,
+        days: int | None = None,
+        limit: int = 50,
     ) -> list[dict]:
-        """Recent command records — the answer to 'what did the agent just run?'."""
+        """Recent command records — the answer to 'what did the agent just run?'"""
         params: dict = {"limit": limit, "order": "-timestamp"}
-        if asset:
-            params["asset"] = asset
+        if asset_id:
+            params["asset_id"] = asset_id
         if user:
             params["user"] = user
-        data = await self.request("GET", "audits/commands/", params=params)
+        if days:
+            params["days"] = days
+        data = await self.request("GET", "terminal/commands/", params=params)
         return data.get("results", [])
 
     async def login_records(self, *, limit: int = 50) -> list[dict]:
         data = await self.request(
-            "GET", "audits/login-logs/", params={"limit": limit, "order": "-timestamp"}
+            "GET", "audits/login-logs/", params={"limit": limit, "order": "-datetime"}
         )
         return data.get("results", [])
 
     # --- tickets ---------------------------------------------------------------
 
+    #: Ticket subtypes map to their own ``apply-*`` collections; creation is the
+    #: ``open`` action on that collection, not a POST to the collection itself.
+    TICKET_TYPES = {
+        "login_asset_confirm": "apply-login-asset-tickets",
+        "command_confirm": "apply-command-tickets",
+        "apply_asset": "apply-asset-tickets",
+        "login_confirm": "apply-login-tickets",
+    }
+
     async def create_ticket(
-        self, *, title: str, ticket_type: str, body: str = "", assignees: list[str] | None = None
+        self,
+        *,
+        title: str,
+        ticket_type: str = "login_asset_confirm",
+        org_id: str | None = None,
+        comment: str = "",
+        **fields: object,
     ) -> dict:
-        """Raise an approval ticket (e.g. a command or login-approval request)."""
+        """Raise an approval ticket via the subtype's ``open`` action.
+
+        ``fields`` carries the type-specific payload, e.g. for a login-asset ticket:
+        ``apply_login_user``, ``apply_login_asset``, ``apply_login_account``.
+        """
+        collection = self.TICKET_TYPES.get(ticket_type)
+        if collection is None:
+            raise JumpServerError(
+                f"unknown ticket type {ticket_type!r}; known: {sorted(self.TICKET_TYPES)}"
+            )
         payload = {
             "title": title,
             "type": ticket_type,
-            "body": body,
-            "assignees": assignees or [],
+            "org_id": org_id or self.cfg.org_id,
+            "comment": comment,
+            **fields,
         }
-        return await self.request("POST", "tickets/tickets/", json=payload)
+        return await self.request("POST", f"tickets/{collection}/open/", json=payload)
 
     async def list_tickets(self, *, state: str | None = None, limit: int = 50) -> list[dict]:
         params: dict = {"limit": limit, "order": "-date_created"}
@@ -212,3 +299,6 @@ class JumpServerAPI:
             params["state"] = state
         data = await self.request("GET", "tickets/tickets/", params=params)
         return data.get("results", [])
+
+
+__all__ = ["JumpServerAPI", "JumpServerError", "SIGNED_HEADERS", "json"]
