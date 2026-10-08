@@ -148,6 +148,14 @@ jms_audit_query()                                # confirm the trail in JumpServ
 
 - Data plane uses SSH keys and per-asset identity, so every command is attributed in the
   audit log. The bridge never bypasses the bastion.
+- **Know this about login approval:** JumpServer runs its login-review (登录复核) wait only
+  for *interactive* asset sessions. A non-interactive direct connect — which is exactly
+  what `jms_exec` / `jms_submit_job` use, because the remote script is piped to `bash -s`
+  — **does not enter the approval queue**. Sessions and commands are still recorded in the
+  audit log, but a pending login-approval ticket will not block a one-shot command. If
+  policy requires approval before anything runs, gate at the account/permission layer or
+  raise a `login_asset_confirm` ticket with `jms_create_ticket` and wait for it out of
+  band.
 - `jms_exec` / `jms_submit_job` apply a small denylist for obviously destructive commands
   (`rm -rf /`, `mkfs`, `dd if=`, fork bombs), overridable with `allow_dangerous=true`.
   This is a *typo guard*, not a security boundary — JumpServer's command blacklist and
