@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jms-agent-bridge"
+version = "0.1.0"
+description = "MCP bridge for JumpServer: drive heterogeneous GPU/NPU clusters from Claude Code over the audited bastion"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "lvyufeng" }]
+keywords = ["jumpserver", "mcp", "bastion", "torch", "federated-learning", "ascend", "cuda"]
+dependencies = [
+    "mcp>=2.0",
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+jms-bridge = "jms_bridge.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lvyufeng/jms-agent-bridge"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jms_bridge"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
