@@ -74,6 +74,18 @@ def test_session_token_uses_bearer_scheme():
     assert api._auth_headers("GET", "/p")["Authorization"] == "Bearer SESSION"
 
 
+def test_cached_session_token_uses_bearer_and_beats_private_token():
+    """A token cached by `jms-bridge login` is sent as Bearer, taking precedence."""
+    api = JumpServerAPI(BastionConfig(url="https://x", session_token="SESS", private_token="TOK"))
+    assert api._auth_headers("GET", "/p")["Authorization"] == "Bearer SESS"
+
+
+def test_live_token_beats_cached_session_token():
+    api = JumpServerAPI(BastionConfig(url="https://x", session_token="CACHED"))
+    api._token = "LIVE"
+    assert api._auth_headers("GET", "/p")["Authorization"] == "Bearer LIVE"
+
+
 def test_no_credentials_raises():
     api = JumpServerAPI(BastionConfig(url="https://x"))
     with pytest.raises(JumpServerError):

@@ -92,6 +92,52 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_login(args: argparse.Namespace) -> int:
+    """Exchange username+password for a private token and cache it in the config.
+
+    JumpServer's API is authenticated with a long-lived token, but the credential a
+    person actually has is a username/password. This logs in once and writes the
+    resulting token into the config file, so subsequent runs (and the MCP server) need
+    no password. The token is not echoed to the terminal.
+    """
+    import os
+    import re
+
+    cfg = load_config()
+    username = args.username or cfg.login_user
+    password = args.password or os.environ.get("JMS_BRIDGE_PASSWORD")
+    if not username or not password:
+        print(
+            "error: need a username and password "
+            "(pass --username/--password, or set JMS_BRIDGE_PASSWORD)",
+            file=sys.stderr,
+        )
+        return 2
+
+    api = JumpServerAPI(cfg)
+    try:
+        token = await api.login_with_password(username, password)
+    except JumpServerError as exc:
+        print(f"login failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await api.aclose()
+
+    path = _config_path()
+    text = path.read_text()
+    line = f'session_token = "{token}"'
+    if re.search(r"(?m)^\s*session_token\s*=", text):
+        text = re.sub(r"(?m)^\s*session_token\s*=.*$", line, text)
+    elif "[bastion]" in text:
+        text = text.replace("[bastion]", f"[bastion]\n{line}", 1)
+    else:
+        text += f"\n[bastion]\n{line}\n"
+    path.write_text(text)
+    os.chmod(path, 0o600)
+    print(f"logged in as {username}; token cached in {path} (mode 600)")
+    return 0
+
+
 async def cmd_doctor(args: argparse.Namespace) -> int:
     ok = True
 
@@ -132,7 +178,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         assets = await api.list_assets()
         print(f"  assets       OK   {len(assets)} visible")
     except JumpServerError as exc:
-        print(f"  assets       SKIP {exc} (configure credentials to test the API)")
+        print(f"  assets       SKIP {exc} (run `jms-bridge login` to authenticate)")
     except Exception as exc:  # noqa: BLE001 - doctor must not crash on a bad API
         print(f"  assets       FAIL {type(exc).__name__}: {exc}")
         ok = False
@@ -184,6 +230,13 @@ def main(argv: list[str] | None = None) -> int:
     p_init = sub.add_parser("init", help="write starter config + inventory")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=lambda a: asyncio.run(_sync(cmd_init, a)))
+
+    p_login = sub.add_parser("login", help="log in and cache a private token in the config")
+    p_login.add_argument("--username", help="defaults to bastion.login_user")
+    p_login.add_argument(
+        "--password", help="prefer JMS_BRIDGE_PASSWORD over argv (argv leaks to ps)"
+    )
+    p_login.set_defaults(func=lambda a: asyncio.run(cmd_login(a)))
 
     p_doc = sub.add_parser("doctor", help="check tooling, config, API and SSH end to end")
     p_doc.add_argument("targets", nargs="*", default=["all"])

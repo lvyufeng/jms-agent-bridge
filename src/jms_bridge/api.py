@@ -136,15 +136,19 @@ class JumpServerAPI:
             return {"Authorization": auth, "Date": extra["date"], **{
                 k.title(): v for k, v in extra.items() if k in ("accept", "x-jms-org")
             }}
-        token = self._token or self.cfg.private_token
-        if token:
-            # Private tokens use the "Token" scheme; session tokens use "Bearer".
-            scheme = "Token" if (self.cfg.private_token and not self._token) else "Bearer"
-            return {"Authorization": f"{scheme} {token}"}
+        # Precedence: a live session token, then a cached session token, then a
+        # long-lived private token. Session tokens use "Bearer"; private tokens use
+        # "Token". Access-key signing is handled above.
+        if self._token:
+            return {"Authorization": f"Bearer {self._token}"}
+        if self.cfg.session_token:
+            return {"Authorization": f"Bearer {self.cfg.session_token}"}
+        if self.cfg.private_token:
+            return {"Authorization": f"Token {self.cfg.private_token}"}
         raise JumpServerError(
-            "No JumpServer credentials configured. Set JMS_BRIDGE_ACCESS_KEY_ID/"
-            "JMS_BRIDGE_ACCESS_KEY_SECRET or JMS_BRIDGE_PRIVATE_TOKEN, or call "
-            "login_with_password()."
+            "No JumpServer credentials configured. Run `jms-bridge login`, or set "
+            "JMS_BRIDGE_SESSION_TOKEN / JMS_BRIDGE_PRIVATE_TOKEN / "
+            "JMS_BRIDGE_ACCESS_KEY_ID + JMS_BRIDGE_ACCESS_KEY_SECRET."
         )
 
     async def request(

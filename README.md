@@ -90,12 +90,19 @@ groups:
   cluster: [ascend-910c, node-4090-1]
 ```
 
-Check it end to end:
+Authenticate the control plane, then check it end to end:
 
 ```bash
-jms-bridge doctor           # tooling → config → API → SSH, layer by layer
-jms-bridge probe cluster    # accelerator + driver/CANN version per host
+export JMS_BRIDGE_PASSWORD='...'   # your JumpServer password
+jms-bridge login                   # caches a session token in the config (mode 600)
+jms-bridge doctor                  # tooling → config → API → SSH, layer by layer
+jms-bridge probe cluster           # accelerator + driver/CANN version per host
 ```
+
+`login` exchanges your username/password for a token once, so the MCP server itself
+never handles a password. If your deployment issues API keys instead, skip `login`
+and set `JMS_BRIDGE_ACCESS_KEY_ID` / `JMS_BRIDGE_ACCESS_KEY_SECRET` or
+`JMS_BRIDGE_PRIVATE_TOKEN`.
 
 ## Register with Claude Code
 

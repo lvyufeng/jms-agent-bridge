@@ -46,6 +46,9 @@ class BastionConfig:
     access_key_secret: str | None = None
     #: Private token, if the deployment uses that instead of an access key.
     private_token: str | None = None
+    #: A session token from ``jms-bridge login`` (sent as ``Bearer``, unlike a
+    #: private token which is sent as ``Token``). Cached in the config file.
+    session_token: str | None = None
     #: Explicit base path for the REST API. JumpServer is usually ``/api/v1``.
     api_base: str = "/api/v1"
 
@@ -110,6 +113,7 @@ def load_config(path: str | Path | None = None) -> BastionConfig:
         access_key_id=_env("JMS_BRIDGE_ACCESS_KEY_ID") or bastion.get("access_key_id"),
         access_key_secret=_env("JMS_BRIDGE_ACCESS_KEY_SECRET") or bastion.get("access_key_secret"),
         private_token=_env("JMS_BRIDGE_PRIVATE_TOKEN") or bastion.get("private_token"),
+        session_token=_env("JMS_BRIDGE_SESSION_TOKEN") or bastion.get("session_token"),
         api_base=bastion.get("api_base", "/api/v1"),
     )
 
