@@ -34,11 +34,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
 from .config import inventory_path
 from .platforms import PLATFORMS, Platform
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle is broken at runtime in load()
+    from .workspace import Workspace
 
 
 class InventoryError(RuntimeError):
@@ -134,6 +138,7 @@ class Host:
 class Inventory:
     hosts: dict[str, Host]
     groups: dict[str, list[str]]
+    workspaces: dict[str, Workspace] = field(default_factory=dict)
 
     def resolve(self, selectors: list[str]) -> list[Host]:
         """Resolve a list of names / tags / group names into a unique host list.
@@ -164,6 +169,31 @@ class Inventory:
                     )
                 for h in tagged:
                     picked[h.name] = h
+        return list(picked.values())
+
+    def resolve_workspaces(self, selectors: list[str]) -> list[Workspace]:
+        """Resolve names / tags into a unique workspace list.
+
+        Unlike hosts there are no groups; a selector is:
+        - a workspace name (the key, e.g. ``fl-ascend``)
+        - a tag (``ascend``) — expands to every workspace carrying it
+        - ``all`` / ``*`` — every workspace
+        """
+        picked: dict[str, Workspace] = {}
+        for sel in selectors:
+            if sel in ("all", "*"):
+                picked.update(self.workspaces)
+            elif sel in self.workspaces:
+                picked[sel] = self.workspaces[sel]
+            else:
+                tagged = [w for w in self.workspaces.values() if sel in w.tags]
+                if not tagged:
+                    raise InventoryError(
+                        f"selector {sel!r} matched no workspace or tag "
+                        f"(known workspaces: {sorted(self.workspaces)})"
+                    )
+                for w in tagged:
+                    picked[w.name] = w
         return list(picked.values())
 
     @classmethod
@@ -199,4 +229,35 @@ class Inventory:
             )
 
         groups = {k: list(v) for k, v in (data.get("groups") or {}).items()}
-        return cls(hosts=hosts, groups=groups)
+
+        # Imported here rather than at module scope: workspace.py needs
+        # shell_quote from this module, so a top-level import would be circular.
+        from .workspace import DEFAULT_UT_CMD, Workspace, WorkspaceError
+
+        raw_workspaces = data.get("workspaces") or {}
+        workspaces: dict[str, Workspace] = {}
+        for name, spec in raw_workspaces.items():
+            spec = spec or {}
+            host = spec.get("host")
+            if host not in hosts:
+                raise InventoryError(
+                    f"workspace {name!r} references unknown host {host!r} "
+                    f"(known hosts: {sorted(hosts)})"
+                )
+            try:
+                workspaces[name] = Workspace(
+                    name=name,
+                    host=host,
+                    container=spec.get("container", "lvyufeng-torch-fl"),
+                    repo=spec.get("repo", ""),
+                    source=spec.get("source", "git"),
+                    proxy=spec.get("proxy"),
+                    ut_cmd=spec.get("ut_cmd", DEFAULT_UT_CMD),
+                    mount=spec.get("mount"),
+                    local=spec.get("local"),
+                    tags=list(spec.get("tags") or []),
+                )
+            except WorkspaceError as exc:
+                raise InventoryError(str(exc)) from exc
+
+        return cls(hosts=hosts, groups=groups, workspaces=workspaces)

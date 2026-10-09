@@ -109,3 +109,49 @@ def test_missing_inventory_raises(tmp_path):
 def test_platform_def_falls_back_to_generic():
     h = Host(name="x", platform="nonexistent")
     assert h.platform_def.name == "generic"
+
+def test_load_workspaces(tmp_path):
+    p = write_inventory(
+        tmp_path,
+        """
+        hosts:
+          a: {login: u, account: root, asset_id: A1, platform: ascend-910c}
+        workspaces:
+          fl-ascend:
+            host: a
+            container: lvyufeng-torch-fl
+            repo: /work/Torch-FL
+            source: git
+            tags: [ascend]
+        """,
+    )
+    inv = Inventory.load(p)
+    assert set(inv.workspaces) == {"fl-ascend"}
+    w = inv.workspaces["fl-ascend"]
+    assert w.host == "a" and w.container == "lvyufeng-torch-fl"
+
+
+def test_workspace_referencing_unknown_host_raises(tmp_path):
+    p = write_inventory(
+        tmp_path,
+        "hosts:\n  a: {login: u}\nworkspaces:\n  w: {host: ghost, container: c, repo: /r}\n",
+    )
+    with pytest.raises(InventoryError):
+        Inventory.load(p)
+
+
+def test_resolve_workspaces_by_name_and_tag(tmp_path):
+    p = write_inventory(
+        tmp_path,
+        """
+        hosts:
+          a: {login: u}
+          b: {login: u}
+        workspaces:
+          wa: {host: a, container: c, repo: /r, tags: [ascend]}
+          wb: {host: b, container: c, repo: /r, tags: [cuda]}
+        """,
+    )
+    inv = Inventory.load(p)
+    assert [w.name for w in inv.resolve_workspaces(["ascend"])] == ["wa"]
+    assert {w.name for w in inv.resolve_workspaces(["all"])} == {"wa", "wb"}
