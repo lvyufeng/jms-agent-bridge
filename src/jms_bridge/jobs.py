@@ -37,6 +37,14 @@ def _new_job_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _launcher_of(stdout: str) -> str:
+    """Which detached launcher the remote picked: ``tmux`` or ``setsid``."""
+    for line in stdout.splitlines():
+        if line.startswith("LAUNCHER="):
+            return line.split("=", 1)[1].strip() or "unknown"
+    return "unknown"
+
+
 def _job_root(host: Host, job_id: str) -> str:
     """A *shell expression* for the remote job directory — use it unquoted.
 
@@ -125,10 +133,16 @@ def _collab_exports(
 class JobHandle:
     job_id: str
     host: str
-    tmux_session: str
+    session: str
+    launcher: str = "tmux"  # "tmux" or "setsid"
 
     def to_dict(self) -> dict:
-        return {"job_id": self.job_id, "host": self.host, "tmux_session": self.tmux_session}
+        return {
+            "job_id": self.job_id,
+            "host": self.host,
+            "session": self.session,
+            "launcher": self.launcher,
+        }
 
 
 def _launch_script(
@@ -148,16 +162,27 @@ def _launch_script(
     path with no stray single quotes from the absolute-path form.
     """
     runner_script = build_runner_script(job_id, body, env_setup, workdir)
+    # Prefer tmux (nice `list_jobs`, clean kill); fall back to setsid on hosts that
+    # lack it (e.g. minimal domestic-chip images) so detached jobs still survive the
+    # SSH disconnect. Detection and launch happen in the same remote script.
     return "\n".join(
         [
             "set -eu",
-            f'R={root}',
+            f"R={root}",
             'mkdir -p "$R"',
             f'cat > "$R/run.sh" <<\'JMS_RUNNER_EOF\'\n{runner_script}JMS_RUNNER_EOF',
-            f"tmux new-session -d -s {shell_quote(session)} "
-            f"\"bash \\\"$R/run.sh\\\" > \\\"$R/stdout.log\\\" 2>&1; "
-            f"echo \\$? > \\\"$R/tmux_exit\\\"\"",
-            f"tmux has-session -t {shell_quote(session)} && echo LAUNCHED",
+            # Common detached runner body (records the launcher, then runs the job).
+            'if command -v tmux >/dev/null 2>&1; then',
+            f"  tmux new-session -d -s {shell_quote(session)} "
+            '"bash \\"$R/run.sh\\" > \\"$R/stdout.log\\" 2>&1; echo \\$? > \\"$R/tmux_exit\\""',
+            f"  tmux has-session -t {shell_quote(session)} && echo LAUNCHER=tmux",
+            "else",
+            "  command -v setsid >/dev/null 2>&1 || { echo 'no tmux and no setsid' >&2; exit 3; }",
+            '  setsid bash "$R/run.sh" > "$R/stdout.log" 2>&1 < /dev/null &',
+            '  echo "$!" > "$R/launcher_pid"',
+            "  sleep 1",
+            '  kill -0 "$(cat "$R/launcher_pid")" 2>/dev/null && echo LAUNCHER=setsid',
+            "fi",
         ]
     )
 
@@ -177,8 +202,8 @@ class JobManager:
             root, session, job_id, command, host.env_setup, host.workdir
         )
         res = await self.runner.exec_on(host, launch, timeout=90, workdir=False)
-        if res.ok and "LAUNCHED" in res.stdout:
-            return JobHandle(job_id, host.name, session), res
+        if res.ok and "LAUNCHER=" in res.stdout:
+            return JobHandle(job_id, host.name, session, _launcher_of(res.stdout)), res
         return None, res
 
     async def submit_collab(
@@ -231,8 +256,10 @@ class JobManager:
         )
         for (host, job_id, session, _), res in zip(pending, launched, strict=True):
             results.append(res)
-            if res.ok and "LAUNCHED" in res.stdout:
-                handles.append(JobHandle(job_id, host.name, session))
+            if res.ok and "LAUNCHER=" in res.stdout:
+                handles.append(
+                    JobHandle(job_id, host.name, session, _launcher_of(res.stdout))
+                )
         return handles, results
 
     async def status_many(self, pairs: list[tuple[Host, str]]) -> list[dict]:
@@ -245,7 +272,11 @@ class JobManager:
         _validate_job_id(job_id)
         root = _job_root(host, job_id)
         q = root
-        alive_probe = f"tmux has-session -t jms-{job_id} 2>/dev/null && echo yes || echo no"
+        alive_probe = (
+            f"if tmux has-session -t jms-{job_id} 2>/dev/null; then echo yes; "
+            f"elif [ -f {q}/pid ] && kill -0 \"$(cat {q}/pid)\" 2>/dev/null; then echo yes; "
+            f"else echo no; fi"
+        )
         cmd = (
             f"if [ -d {q} ]; then "
             f"echo \"status=$(cat {q}/status 2>/dev/null || echo unknown)\"; "
@@ -293,14 +324,24 @@ class JobManager:
         _validate_job_id(job_id)
         root = _job_root(host, job_id)
         cmd = (
-            f"tmux kill-session -t jms-{job_id} 2>/dev/null && echo KILLED || echo NO_SESSION; "
-            f"echo cancelled > {root}/status 2>/dev/null || true"
+            f"killed=no; "
+            f"if tmux has-session -t jms-{job_id} 2>/dev/null; then "
+            f"tmux kill-session -t jms-{job_id} && killed=yes; fi; "
+            f"if [ -f {root}/pid ]; then pid=$(cat {root}/pid); "
+            f'kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; killed=yes; fi; '
+            f"echo cancelled > {root}/status 2>/dev/null || true; "
+            f'echo "killed=$killed"'
         )
         res = await self.runner.exec_on(host, cmd, timeout=60, workdir=False)
-        return {"host": host.name, "job_id": job_id, "killed": "KILLED" in res.stdout, "ok": res.ok}
+        return {
+            "host": host.name,
+            "job_id": job_id,
+            "killed": "killed=yes" in res.stdout,
+            "ok": res.ok,
+        }
 
     async def list_jobs(self, host: Host) -> list[str]:
-        cmd = "tmux ls 2>/dev/null | grep -o '^jms-[0-9a-f]\\{8\\}' || true"
+        cmd = "tmux ls 2>/dev/null | grep -o '^jms-[0-9a-f]\\{8\\}' || true"  # tmux hosts only
         res = await self.runner.exec_on(host, cmd, timeout=60, workdir=False)
         return [
             line.strip().removeprefix("jms-")

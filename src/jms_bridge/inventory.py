@@ -57,7 +57,9 @@ def wrap_command(env_setup: str | None, workdir: str | None, command: str) -> st
     """
     lines = ["set -euo pipefail"]
     if env_setup:
-        lines.append(env_setup)
+        # Vendor env scripts (CANN's set_env.sh, many conda hooks) reference
+        # variables that may be unset; relax `-u` just for them.
+        lines += ["set +u", env_setup, "set -u"]
     if workdir:
         # Create it if missing, then enter it — a bare `cd` would make every exec
         # fail on a host whose workdir has not been created yet.
