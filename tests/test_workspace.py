@@ -1,6 +1,6 @@
 import pytest
 
-from jms_bridge.workspace import Workspace, WorkspaceError
+from jms_bridge.workspace import Workspace, WorkspaceError, parse_pytest_summary
 
 
 def test_workspace_defaults():
@@ -22,3 +22,25 @@ def test_workspace_proxy_git_wraps_proxy():
 def test_workspace_bad_source_raises():
     with pytest.raises(WorkspaceError):
         Workspace(name="w", host="a", container="c", repo="/r", source="ftp")
+
+SAMPLE = """\
+=================== short test summary info ===================
+PASSED tests/test_ops.py::test_softmax
+FAILED tests/test_ops.py::test_layer_norm - AssertionError: max diff 1e-3
+SKIPPED [1] tests/test_ops.py::test_gemm_dtype: not supported on this backend
+ERROR tests/test_ops.py::test_bad_setup - RuntimeError: boom
+1 failed, 1 passed, 1 skipped, 1 error
+"""
+
+
+def test_parse_pytest_summary():
+    got = parse_pytest_summary(SAMPLE)
+    assert got["tests/test_ops.py::test_softmax"]["outcome"] == "PASS"
+    assert got["tests/test_ops.py::test_layer_norm"]["outcome"] == "FAIL"
+    assert "max diff" in got["tests/test_ops.py::test_layer_norm"]["message"]
+    assert got["tests/test_ops.py::test_gemm_dtype"]["outcome"] == "SKIP"
+    assert got["tests/test_ops.py::test_bad_setup"]["outcome"] == "ERROR"
+
+
+def test_parse_pytest_summary_empty():
+    assert parse_pytest_summary("no summary here") == {}

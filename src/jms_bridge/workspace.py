@@ -26,6 +26,7 @@ Example inventory entry::
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .inventory import shell_quote
@@ -119,3 +120,53 @@ class Workspace:
             "ut_cmd": self.ut_cmd,
             "tags": list(self.tags),
         }
+
+
+#: ``PASSED/FAILED/ERROR/SKIPPED [n]? <test id><separator><message>`` summary line.
+#: The ``[n]`` group is pytest's count for whole-module SKIPPED reports.
+_PYTEST_LINE = re.compile(
+    r"^(PASSED|FAILED|ERROR|SKIPPED)\s+(?:\[\d+\]\s+)?(?P<rest>.*)$"
+)
+
+#: pytest's one-letter terminal statuses -> our normalized outcome.
+_PYTEST_OUTCOMES = {
+    "PASSED": "PASS",
+    "FAILED": "FAIL",
+    "ERROR": "ERROR",
+    "SKIPPED": "SKIP",
+}
+
+
+def _split_test_id(rest: str) -> tuple[str, str]:
+    """Split a summary line body into ``(test_id, message)``.
+
+    pytest separates the two with `` - `` (assertion lines) or ``: `` (skip/error
+    reasons). A test id may itself contain ``::``, so only a bare ``": "`` counts.
+    """
+    for sep in (" - ", ": "):
+        idx = rest.find(sep)
+        if idx != -1:
+            return rest[:idx].strip(), rest[idx + len(sep) :].strip()
+    return rest.strip(), ""
+
+
+def parse_pytest_summary(output: str) -> dict[str, dict]:
+    """Parse pytest's ``-rA`` short summary into ``{test_id: {outcome, message}}``.
+
+    Only the per-test summary lines are meaningful — the trailing
+    "N failed, M passed" counts are ignored. A test that appears more than once
+    keeps its first report.
+    """
+    summary: dict[str, dict] = {}
+    for line in output.splitlines():
+        match = _PYTEST_LINE.match(line.strip())
+        if not match:
+            continue
+        test_id, message = _split_test_id(match.group("rest"))
+        if not test_id or test_id in summary:
+            continue
+        summary[test_id] = {
+            "outcome": _PYTEST_OUTCOMES[match.group(1)],
+            "message": message,
+        }
+    return summary
