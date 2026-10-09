@@ -38,7 +38,10 @@ SOURCES = ("git", "proxy-git", "push")
 #: name is interpolated into ``docker exec`` without quoting).
 _CONTAINER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
 
-#: Default unit-test command; overridable per workspace.
+#: Default unit-test command; overridable per workspace. Any override MUST emit
+#: pytest ``-rA`` short-summary lines (``PASSED/FAILED/ERROR/SKIPPED ... <id> - <msg>``)
+#: — the cross-chip consistency table is built from them, so a command that does not
+#: emit them yields zero rows and the run is reported as not-ok.
 DEFAULT_UT_CMD = "python -m pytest tests/ -q --tb=line -rA"
 
 
@@ -57,6 +60,8 @@ class Workspace:
     source: str = "git"
     #: HTTP(S) proxy the container must use to reach the git remote (``proxy-git``).
     proxy: str | None = None
+    #: Unit-test command; an override MUST emit pytest ``-rA`` short-summary lines
+    #: (see :data:`DEFAULT_UT_CMD`) or the consistency table will have no rows.
     ut_cmd: str = DEFAULT_UT_CMD
     #: Host-side directory bind-mounted into the container (``push``).
     mount: str | None = None
@@ -128,7 +133,7 @@ class Workspace:
         # FETCH_HEAD is written by the explicit-ref fetch above.
         return (
             f"{self._proxy_prefix()}cd {q} && "
-            f"git fetch origin {qref} --depth=1 && git checkout --detach FETCH_HEAD"
+            f"git fetch origin {qref} --depth=1 && git checkout -f --detach FETCH_HEAD"
         )
 
     def to_dict(self) -> dict:

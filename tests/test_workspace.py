@@ -106,7 +106,9 @@ def test_delivery_commands_per_source():
     assert "git fetch origin" in cmd
     # Pin the fetched commit detached, NOT the local branch: a stale local
     # `feat/x` would otherwise be checked out instead of the freshly fetched one.
-    assert "git checkout --detach FETCH_HEAD" in cmd
+    # `-f` also discards local modifications to tracked files, which would
+    # otherwise carry into the new tree and re-test stale content.
+    assert "git checkout -f --detach FETCH_HEAD" in cmd
     assert "git checkout 'feat/x'" not in cmd
 
     p = Workspace(name="p", host="a", container="c", repo="/r",
