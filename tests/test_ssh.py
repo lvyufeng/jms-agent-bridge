@@ -1,6 +1,6 @@
 from jms_bridge.config import BastionConfig
 from jms_bridge.inventory import Host
-from jms_bridge.ssh import SSHRunner
+from jms_bridge.ssh import ExecResult, SSHRunner
 
 
 def make_runner(**kw):
@@ -65,3 +65,37 @@ def test_direct_host_ignores_bastion_password():
     argv = r._ssh_argv(Host(name="d", ssh_host="h", ssh_user="ubuntu"))
     assert "sshpass" not in argv
     assert "PreferredAuthentications=password" not in argv
+
+
+def test_exec_on_env_setup_false_omits_source_line():
+    """``env_setup=False`` must not source the host toolchain in the remote script.
+
+    Workspace commands run inside a container, where the host env script is absent;
+    leaking it in would abort the command under ``set -e``. Capture the script the
+    runner would pipe, without touching SSH.
+    """
+    import asyncio
+
+    r = make_runner()
+    h = Host(
+        name="a",
+        login="u",
+        asset_id="A",
+        env_setup="source /opt/cann/set_env.sh",
+        workdir="/work",
+    )
+    captured = {}
+
+    async def fake_run_script(host, script, timeout, *, tty=False):
+        captured["script"] = script
+        return ExecResult(host.name, 0, "", "")
+
+    r._run_script = fake_run_script
+
+    asyncio.run(r.exec_on(h, "echo hi", env_setup=False, workdir=False))
+    assert "set_env.sh" not in captured["script"]
+    assert "source" not in captured["script"]
+    assert captured["script"].rstrip().endswith("echo hi")
+
+    asyncio.run(r.exec_on(h, "echo hi", env_setup=True, workdir=False))
+    assert "source /opt/cann/set_env.sh" in captured["script"]

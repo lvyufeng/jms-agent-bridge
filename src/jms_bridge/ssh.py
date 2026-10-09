@@ -181,14 +181,29 @@ class SSHRunner:
                 )
 
     async def exec_on(
-        self, host: Host, command: str, *, timeout: float = 60.0, workdir: bool = True
+        self,
+        host: Host,
+        command: str,
+        *,
+        timeout: float = 60.0,
+        workdir: bool = True,
+        env_setup: bool = True,
     ) -> ExecResult:
         """Run a short command on one host, activating the host's env first.
 
         ``workdir=False`` skips the ``cd`` into the host workdir — used by probes,
         which must succeed even before the workdir exists.
+
+        ``env_setup=False`` skips sourcing the host's ``env_setup`` entirely. Used by
+        commands that run *inside a container* (workspaces): the host toolchain is
+        irrelevant there, and a missing or failing host env script would abort the
+        whole command under ``set -e``.
         """
-        script = wrap_command(host.env_setup, host.workdir if workdir else None, command)
+        script = wrap_command(
+            host.env_setup if env_setup else None,
+            host.workdir if workdir else None,
+            command,
+        )
         return await self._run_script(host, script, timeout)
 
     async def exec_many(
