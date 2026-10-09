@@ -72,7 +72,7 @@ hosts:
   ascend-910c:
     login: your-login
     account: root
-    asset_id: 2b0d31bf-....          # from jms_list_assets, or the JumpServer UI
+    asset_id: <asset-uuid>            # from jms_list_assets, or the JumpServer UI
     platform: ascend-910c
     env_setup: "source /path/to/env.sh"
     workdir: /path/to/torch-fl
@@ -123,6 +123,9 @@ claude mcp add jms-bridge -- jms-bridge serve
 
 ## Tools
 
+14 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
+metadata only); "SSH" = data plane (real execution through the KoKo gateway).
+
 | Tool | Plane | What it does |
 |---|---|---|
 | `jms_list_assets` | REST | Assets + accounts this account can reach (for building the inventory) |
@@ -131,10 +134,11 @@ claude mcp add jms-bridge -- jms-bridge serve
 | `jms_probe` | SSH | Liveness + accelerator + version across a host set |
 | `jms_exec` | SSH | Short command on one or many hosts, in parallel |
 | `jms_sync_push` / `jms_sync_pull` | rsync | Move code and artifacts across hosts |
-| `jms_submit_job` | SSH | Launch a long command detached (tmux) → job id |
+| `jms_submit_job` | SSH | Launch a long command detached (tmux/setsid) → job id |
 | `jms_job_status` / `jms_job_logs` / `jms_job_cancel` | SSH | Non-blocking job lifecycle |
 | `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free; estimates `world_size` |
-| `jms_cluster_submit` | SSH | Launch **one coordinated** job across the cluster with a shared rendezvous |
+| `jms_cluster_plan` | SSH | Partition targets into backend-homogeneous **islands** (HCCL/NCCL) |
+| `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous |
 
 Selectors accept host names, group names, or tags — `["cluster"]`, `["gpu"]`, `["all"]`.
 

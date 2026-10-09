@@ -68,10 +68,10 @@ def test_group_referencing_unknown_host_raises(tmp_path):
 
 
 def test_login_string_full_and_partial():
-    h = Host(name="a", login="yflv", account="root", asset_id="ASSET")
-    assert h.login_string() == "yflv#root#ASSET"
+    h = Host(name="a", login="alice", account="root", asset_id="ASSET")
+    assert h.login_string() == "alice#root#ASSET"
     # no asset id -> user#account (asset resolved by name elsewhere)
-    assert Host(name="b", login="yflv", account="root").login_string() == "yflv#root"
+    assert Host(name="b", login="alice", account="root").login_string() == "alice#root"
     # login falls back to the bastion default
     fallback = Host(name="c", account="root", asset_id="ASSET").login_string("fallback")
     assert fallback == "fallback#root#ASSET"

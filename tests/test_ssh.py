@@ -10,8 +10,8 @@ def make_runner(**kw):
 
 def test_target_is_jumpserver_login_string():
     r = make_runner()
-    h = Host(name="a", login="yflv", account="root", asset_id="ASSET")
-    assert r.target(h) == "yflv#root#ASSET@bastion.example.com"
+    h = Host(name="a", login="alice", account="root", asset_id="ASSET")
+    assert r.target(h) == "alice#root#ASSET@bastion.example.com"
 
 
 def test_target_strips_scheme_and_path():

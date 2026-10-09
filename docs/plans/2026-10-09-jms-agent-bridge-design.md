@@ -1,14 +1,14 @@
 # jms-agent-bridge — Design
 
 **Date:** 2026-10-09
-**Status:** approved (v1)
+**Status:** implemented and verified against a live JumpServer (v4.10.18-ce)
 **Author:** lvyufeng
 
 ## Problem
 
 I run heterogeneous compute hosts — Huawei Ascend 910C (openEuler, CANN), NVIDIA
 4090 nodes (Ubuntu/CUDA), an aarch64 board — reached only through an open-source
-**JumpServer** bastion (`https://bastion.aiops.baai.ac.cn`). The bastion is the
+**JumpServer** bastion (`https://bastion.example.com`). The bastion is the
 audited, permission-gated entry point; there is no general-purpose SSH jump.
 
 I want a Claude Code session to treat that whole cluster as one workspace:

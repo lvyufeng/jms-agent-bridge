@@ -9,16 +9,16 @@ Example ``~/.config/jms-bridge/hosts.yaml``::
 
     hosts:
       ascend-910c:
-        login: yflv
+        login: your-login
         account: root
-        asset_id: 2b0d31bf-2a4c-48aa-9512-ead025a4659f
+        asset_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
         platform: ascend-910c
-        env_setup: "source /public-flash/lvyufeng/env.sh"
-        workdir: /public-flash/lvyufeng/torch-fl
+        env_setup: "source /path/to/ascend/env.sh"
+        workdir: /path/to/torch-fl
         tags: [gpu, ascend, training]
 
       node-4090-1:
-        login: yflv
+        login: your-login
         account: ubuntu
         asset_id: 11111111-2222-3333-4444-555555555555
         platform: cuda
