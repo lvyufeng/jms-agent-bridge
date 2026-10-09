@@ -59,7 +59,10 @@ def wrap_command(env_setup: str | None, workdir: str | None, command: str) -> st
     if env_setup:
         lines.append(env_setup)
     if workdir:
-        lines.append(f"cd {shell_quote(workdir)}")
+        # Create it if missing, then enter it — a bare `cd` would make every exec
+        # fail on a host whose workdir has not been created yet.
+        q = shell_quote(workdir)
+        lines.append(f"mkdir -p {q} && cd {q}")
     lines.append(command)
     return "\n".join(lines) + "\n"
 

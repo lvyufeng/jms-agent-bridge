@@ -91,7 +91,8 @@ def test_wrap_command_sources_env_and_cds():
     script = wrap_command("source /x/env.sh", "/work/dir", "echo hi")
     assert script.startswith("set -euo pipefail\n")
     assert "source /x/env.sh" in script
-    assert "cd '/work/dir'" in script
+    # workdir is created if missing, then entered, so a fresh host does not fail
+    assert "mkdir -p '/work/dir' && cd '/work/dir'" in script
     assert script.rstrip().endswith("echo hi")
 
 
