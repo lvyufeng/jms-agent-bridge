@@ -65,7 +65,7 @@ class Workspace:
     tags: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if not _CONTAINER_RE.match(self.container):
+        if not _CONTAINER_RE.fullmatch(self.container):
             raise WorkspaceError(
                 f"workspace {self.name!r}: invalid container {self.container!r} "
                 "(must match [a-zA-Z0-9][a-zA-Z0-9_.-]*)"
@@ -91,7 +91,7 @@ class Workspace:
         q = shell_quote(self.proxy)
         return f"export http_proxy={q} https_proxy={q}; "
 
-    def container_cmd(self, command: str) -> str:
+    def container_cmd(self, command: str, *, with_proxy: bool = True) -> str:
         """Wrap ``command`` to run inside this workspace's container.
 
         For ``proxy-git`` the proxy is exported to the container process via
@@ -99,8 +99,13 @@ class Workspace:
         it spawns) inherits it. The command itself is single-quoted, so a command
         containing quotes survives — untrusted values must still be passed through
         :func:`~jms_bridge.inventory.shell_quote` before being embedded.
+
+        ``with_proxy=False`` suppresses that export. Use it for the UT run: the
+        tests do not need the proxy, and leaking it would change the test
+        environment on proxy chips only.
         """
-        q = shell_quote(self.proxy) if self.source == "proxy-git" and self.proxy else None
+        use_proxy = with_proxy and self.source == "proxy-git"
+        q = shell_quote(self.proxy) if use_proxy and self.proxy else None
         env = f"env http_proxy={q} https_proxy={q} " if q else ""
         # The container name is interpolated unquoted, so it must not carry shell
         # metacharacters. The docker charset [a-zA-Z0-9][a-zA-Z0-9_.-]* is enforced
@@ -117,9 +122,13 @@ class Workspace:
             return None
         q = shell_quote(self.repo)
         qref = shell_quote(ref)
+        # Pin the freshly fetched commit detached. `git checkout <ref>` would land
+        # on a *stale local branch* of the same name (git checks out the local
+        # branch when one exists), so every re-sync of a branch would test old code.
+        # FETCH_HEAD is written by the explicit-ref fetch above.
         return (
             f"{self._proxy_prefix()}cd {q} && "
-            f"git fetch origin {qref} --depth=1 && git checkout {qref}"
+            f"git fetch origin {qref} --depth=1 && git checkout --detach FETCH_HEAD"
         )
 
     def to_dict(self) -> dict:
@@ -227,4 +236,8 @@ def build_consistency_table(per_workspace: dict[str, dict[str, dict]]) -> dict:
         ) == 1
         rows.append({"test_id": test_id, "outcomes": outcomes, "consistent": consistent})
 
-    return {"ok": all(row["consistent"] for row in rows), "columns": columns, "rows": rows}
+    return {
+        "ok": bool(rows) and all(row["consistent"] for row in rows),
+        "columns": columns,
+        "rows": rows,
+    }

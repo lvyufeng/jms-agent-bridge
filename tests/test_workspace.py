@@ -102,8 +102,12 @@ def test_table_aligns_by_test_id_and_flags_divergence():
 
 def test_delivery_commands_per_source():
     g = Workspace(name="g", host="a", container="c", repo="/r", source="git")
-    assert "git fetch origin" in g.delivery_cmd("feat/x")
-    assert "git checkout 'feat/x'" in g.delivery_cmd("feat/x")
+    cmd = g.delivery_cmd("feat/x")
+    assert "git fetch origin" in cmd
+    # Pin the fetched commit detached, NOT the local branch: a stale local
+    # `feat/x` would otherwise be checked out instead of the freshly fetched one.
+    assert "git checkout --detach FETCH_HEAD" in cmd
+    assert "git checkout 'feat/x'" not in cmd
 
     p = Workspace(name="p", host="a", container="c", repo="/r",
                   source="proxy-git", proxy="http://prx:80")
@@ -133,3 +137,27 @@ def test_table_single_workspace_is_consistent():
     table = build_consistency_table({"A": {"t": {"outcome": "FAIL"}}})
     assert table["ok"] is True
     assert table["rows"][0]["consistent"] is True
+
+
+def test_empty_table_is_not_ok():
+    # An empty result set vacuously satisfies ``all(...)``; a run that produced no
+    # results at all must NOT report success.
+    assert build_consistency_table({"A": {}})["ok"] is False
+    assert build_consistency_table({})["ok"] is False
+
+
+def test_workspace_container_trailing_newline_raises():
+    # re.match(r"...$", "c\n") is True because ``$`` matches before a trailing
+    # newline; the container is interpolated raw into `docker exec`, so fullmatch.
+    with pytest.raises(WorkspaceError):
+        Workspace(name="w", host="a", container="c\n", repo="/r")
+
+
+def test_container_cmd_with_proxy_false_omits_proxy():
+    w = Workspace(
+        name="w1", host="a", container="c", repo="/r",
+        source="proxy-git", proxy="http://proxy:8080",
+    )
+    assert "http_proxy" not in w.container_cmd("python -m pytest", with_proxy=False)
+    # delivery (the default) still carries the proxy
+    assert "http_proxy='http://proxy:8080'" in w.container_cmd("git fetch")
