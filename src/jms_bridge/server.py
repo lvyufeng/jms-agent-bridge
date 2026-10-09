@@ -28,7 +28,7 @@ from .cluster import (
     resolve_rendezvous,
 )
 from .config import BastionConfig, load_config
-from .inventory import Host, Inventory
+from .inventory import Host, Inventory, shell_quote
 from .jobs import JobManager
 from .ssh import SSHRunner
 
@@ -322,6 +322,131 @@ async def jms_job_cancel(host: str, job_id: str) -> dict:
     """Kill a running job on one host."""
     h = _inv().resolve([host])[0]
     return {"ok": True, **(await _jobs().cancel(h, job_id))}
+
+
+# --- dev loop: workspace sync / run / logs -----------------------------------------
+
+
+def _workspaces(selectors: list[str]):  # noqa: ANN202
+    return _inv().resolve_workspaces(selectors)
+
+
+def _host_of(ws):  # noqa: ANN001, ANN202
+    return _inv().hosts[ws.host]
+
+
+async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
+    """Put the workspace's repo at ``ref`` using its configured source."""
+    host = _host_of(ws)
+    if ws.source == "push":
+        res = await _ssh().rsync(
+            host, ws.local, ws.mount, direction="push", excludes=_DEFAULT_EXCLUDES
+        )
+        return {
+            "workspace": ws.name,
+            "source": "push",
+            "ok": res.ok,
+            "stderr": res.stderr.strip()[:400],
+        }
+    cmd = ws.delivery_cmd(ref)
+    res = await _ssh().exec_on(
+        host, ws.container_cmd(cmd), timeout=300, workdir=False, env_setup=False
+    )
+    return {
+        "workspace": ws.name,
+        "source": ws.source,
+        "ok": res.ok,
+        "stderr": res.stderr.strip()[:400],
+    }
+
+
+@server.tool()
+async def jms_dev_sync(targets: list[str], ref: str) -> dict:
+    """Deliver a git `ref` to every selected workspace's container.
+
+    Each workspace uses its configured source (git / proxy-git / push), so hosts with
+    direct GitHub access, hosts behind a proxy, and offline hosts all work from this
+    one call. `ref` is a branch on the workspace's `origin` (the developer's fork).
+    """
+    workspaces = _workspaces(targets)
+    results = await asyncio.gather(*(_deliver(w, ref) for w in workspaces))
+    return {"ok": all(r["ok"] for r in results), "ref": ref, "results": list(results)}
+
+
+@server.tool()
+async def jms_dev_run(
+    targets: list[str], ref: str, timeout: float = 600.0, ut_cmd: str | None = None
+) -> dict:
+    """Deliver `ref` to every workspace, run the UT suite in each container, and
+    return ONE cross-chip consistency table.
+
+    This is the development loop: write once, verify on every chip. Each workspace
+    runs its configured `ut_cmd` (override with `ut_cmd`) and reports per-test
+    outcomes; results are aligned by test id. A FAIL carries a one-line summary
+    inline — fetch full output with `jms_dev_logs`.
+
+    Long training runs do NOT go here; use `jms_submit_job` / `jms_cluster_submit`.
+    """
+    from .workspace import build_consistency_table, parse_pytest_summary
+
+    workspaces = _workspaces(targets)
+    delivered = await asyncio.gather(*(_deliver(w, ref) for w in workspaces))
+    if not all(d["ok"] for d in delivered):
+        return {"ok": False, "stage": "deliver", "ref": ref, "results": list(delivered)}
+
+    async def one(ws):  # noqa: ANN001, ANN202
+        host = _host_of(ws)
+        # Run the suite from inside the repo: the container's default cwd is not
+        # the checkout, so `python -m pytest tests/` would not find the tests.
+        inner = f"cd {shell_quote(ws.repo)} && {ut_cmd or ws.ut_cmd}"
+        res = await _ssh().exec_on(
+            host, ws.container_cmd(inner), timeout=timeout, workdir=False, env_setup=False
+        )
+        return ws.name, res, parse_pytest_summary(res.stdout)
+
+    ran = await asyncio.gather(*(one(w) for w in workspaces))
+    per_ws = {name: parsed for name, _, parsed in ran}
+    table = build_consistency_table(per_ws)
+    table.update(
+        {
+            "ref": ref,
+            "hosts": {
+                name: {
+                    "ok": res.ok,
+                    "exit_code": res.exit_code,
+                    "stderr": res.stderr.strip()[:400],
+                }
+                for name, res, _ in ran
+            },
+        }
+    )
+    return table
+
+
+@server.tool()
+async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> dict:
+    """Full output for one `test_id` on one `workspace` (drill into a FAIL).
+
+    Re-runs just that test in the container with a full traceback, so it works for
+    any suite without depending on a saved report file.
+    """
+    ws = _inv().resolve_workspaces([workspace])[0]
+    host = _host_of(ws)
+    inner = (
+        f"cd {shell_quote(ws.repo)} && python -m pytest "
+        f"{shell_quote(test_id)} -q --tb=long -rA"
+    )
+    res = await _ssh().exec_on(
+        host, ws.container_cmd(inner), timeout=timeout, workdir=False, env_setup=False
+    )
+    return {
+        "ok": res.ok,
+        "workspace": ws.name,
+        "test_id": test_id,
+        "exit_code": res.exit_code,
+        "output": res.stdout[-20000:],
+        "stderr": res.stderr.strip()[:2000],
+    }
 
 
 # --- cluster: preflight + coordinated launch ---------------------------------------

@@ -34,6 +34,7 @@ def test_mcp_server_lists_all_tools():
         "jms_probe", "jms_exec", "jms_sync_push", "jms_sync_pull",
         "jms_submit_job", "jms_job_status", "jms_job_logs", "jms_job_cancel",
         "jms_cluster_preflight", "jms_cluster_plan", "jms_cluster_submit",
+        "jms_dev_sync", "jms_dev_run", "jms_dev_logs",
     }
 
     async def run():
