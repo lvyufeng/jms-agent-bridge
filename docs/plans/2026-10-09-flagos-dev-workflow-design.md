@@ -81,7 +81,7 @@ Inventory (`hosts.yaml`) gains a `workspaces:` section:
 workspaces:
   ascend-910c-108:
     host: ascend-910c-108          # an existing host entry (bastion asset)
-    container: torchfl             # container name — uniform across hosts
+    container: lvyufeng-torch-fl             # container name — uniform across hosts
     source: git                    # git | proxy-git | push
     repo: /work/Torch-FL           # repo path *inside the container*
     proxy: http://proxy:8080       # only for source=proxy-git
@@ -90,7 +90,7 @@ workspaces:
 
   cuda-4090-1:
     host: cuda-4090-1
-    container: torchfl
+    container: lvyufeng-torch-fl
     source: push                   # this host has no GitHub access
     repo: /work/Torch-FL
     mount: /srv/torch-fl           # host dir bind-mounted to repo (for source=push)

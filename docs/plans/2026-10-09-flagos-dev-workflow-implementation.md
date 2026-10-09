@@ -40,14 +40,14 @@ from jms_bridge.workspace import Workspace, WorkspaceError
 
 
 def test_workspace_defaults():
-    w = Workspace(name="w1", host="a", container="torchfl", repo="/work/Torch-FL")
+    w = Workspace(name="w1", host="a", container="lvyufeng-torch-fl", repo="/work/Torch-FL")
     assert w.source == "git"
-    assert w.container_cmd("echo hi") == "docker exec torchfl bash -lc 'echo hi'"
+    assert w.container_cmd("echo hi") == "docker exec lvyufeng-torch-fl bash -lc 'echo hi'"
 
 
 def test_workspace_proxy_git_wraps_proxy():
     w = Workspace(
-        name="w1", host="a", container="torchfl", repo="/work/Torch-FL",
+        name="w1", host="a", container="lvyufeng-torch-fl", repo="/work/Torch-FL",
         source="proxy-git", proxy="http://proxy:8080",
     )
     cmd = w.container_cmd("git fetch")
@@ -173,7 +173,7 @@ def test_load_workspaces(tmp_path):
         workspaces:
           fl-ascend:
             host: a
-            container: torchfl
+            container: lvyufeng-torch-fl
             repo: /work/Torch-FL
             source: git
             tags: [ascend]
@@ -182,7 +182,7 @@ def test_load_workspaces(tmp_path):
     inv = Inventory.load(p)
     assert set(inv.workspaces) == {"fl-ascend"}
     w = inv.workspaces["fl-ascend"]
-    assert w.host == "a" and w.container == "torchfl"
+    assert w.host == "a" and w.container == "lvyufeng-torch-fl"
 
 
 def test_workspace_referencing_unknown_host_raises(tmp_path):
@@ -260,7 +260,7 @@ In `load()`, after building `hosts` and before `return`:
             workspaces[name] = Workspace(
                 name=name,
                 host=spec["host"],
-                container=spec.get("container", "torchfl"),
+                container=spec.get("container", "lvyufeng-torch-fl"),
                 repo=spec["repo"],
                 source=spec.get("source", "git"),
                 proxy=spec.get("proxy"),
@@ -739,7 +739,7 @@ git commit -m "docs: document the flagos development loop"
 
 **Not TDD** — this validates against real hardware.
 
-**Step 1:** Confirm the container name on `ascend-910c-108` (assumed `torchfl`):
+**Step 1:** Confirm the container name on `ascend-910c-108` (assumed `lvyufeng-torch-fl`):
 
 ```
 jms_exec(["ascend-910c-108"], "docker ps --format '{{.Names}}'")
