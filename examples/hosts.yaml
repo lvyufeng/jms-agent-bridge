@@ -1,0 +1,94 @@
+# Example inventory: a small heterogeneous cluster addressed through JumpServer.
+#
+# Each host maps a friendly name to a JumpServer asset login (`login#account#asset_id`)
+# plus the metadata the bridge needs to probe and launch work correctly:
+#
+#   platform   one of: ascend-910c | cuda | aarch64 | generic
+#   env_setup  shell snippet that activates the toolchain (sourced before every command)
+#   workdir    where code and job state live on that host
+#   tags       free-form; usable as selectors in tool calls
+#
+# Get asset ids from `jms_list_assets` or the JumpServer web UI.
+
+hosts:
+  ascend-910c:
+    login: your-login
+    account: root
+    asset_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+    platform: ascend-910c
+    env_setup: "source /path/to/ascend/env.sh"
+    workdir: /path/to/torch-fl
+    tags: [gpu, ascend, training]
+
+  node-4090-1:
+    login: your-login
+    account: ubuntu
+    asset_id: 11111111-2222-3333-4444-555555555555
+    platform: cuda
+    env_setup: "source ~/miniconda3/etc/profile.d/conda.sh && conda activate fl"
+    workdir: ~/torch-fl
+    tags: [gpu, cuda, training]
+
+  node-4090-2:
+    login: your-login
+    account: ubuntu
+    asset_id: 66666666-7777-8888-9999-000000000000
+    platform: cuda
+    env_setup: "source ~/miniconda3/etc/profile.d/conda.sh && conda activate fl"
+    workdir: ~/torch-fl
+    tags: [gpu, cuda, training]
+
+  rdk-board:
+    login: your-login
+    account: root
+    asset_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+    platform: aarch64
+    env_setup: "source ~/miniconda3/etc/profile.d/conda.sh && conda activate fl"
+    workdir: ~/torch-fl
+    tags: [arm, edge]
+
+groups:
+  cluster: [ascend-910c, node-4090-1, node-4090-2, rdk-board]
+  trainers: [ascend-910c, node-4090-1, node-4090-2]
+
+# Workspaces: the unit of the "write once, verify on every chip" dev loop. Each binds a
+# host + a container (the SAME name on every host) + the repo inside it + how it gets
+# code, so `jms_dev_run` can fan one UT suite across all chips and align the results.
+#
+#   container  same name on every host (must match [a-zA-Z0-9][a-zA-Z0-9_.-]*)
+#   repo       path to the checkout *inside the container*
+#   source     git | proxy-git | push   (how `ref` reaches the container)
+#   proxy      required for proxy-git: HTTP proxy the container uses to reach GitHub
+#   mount/local required for push: host dir bind-mounted to `repo`, and the local tree to rsync
+#   ut_cmd     must emit pytest -rA short-summary lines (the default already does)
+#   tags       free-form; usable as selectors, like host tags
+#
+# The `ref` the tools deliver is a branch on each workspace's `origin` (your fork).
+
+workspaces:
+  fl-ascend:
+    host: ascend-910c
+    container: lvyufeng-torch-fl
+    repo: /work/Torch-FL
+    source: git
+    tags: [ascend]
+
+  fl-4090:
+    host: node-4090-1
+    container: lvyufeng-torch-fl
+    repo: /work/Torch-FL
+    source: proxy-git
+    proxy: http://proxy.example:8080
+    tags: [cuda]
+
+  fl-edge:
+    host: rdk-board
+    container: lvyufeng-torch-fl
+    repo: /work/Torch-FL
+    source: push                 # offline host: no GitHub access
+    mount: /srv/torch-fl
+    local: ~/Projects/Torch-FL
+    tags: [arm]
+
+# Select workspaces by name, tag, or "all": jms_dev_run(["ascend"], ref="...") or
+# jms_dev_run(["all"], ref="..."). Unlike hosts, workspaces have no groups.

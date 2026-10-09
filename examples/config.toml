@@ -1,0 +1,32 @@
+# Example jms-agent-bridge config.
+# Copy to ~/.config/jms-bridge/config.toml and adjust.
+#
+# Secrets are intentionally NOT here — pass them via the environment so they never
+# land in a dotfile you might sync or share:
+#
+#   export JMS_BRIDGE_ACCESS_KEY_ID=...
+#   export JMS_BRIDGE_ACCESS_KEY_SECRET=...
+#   # or, for deployments that use a private token:
+#   export JMS_BRIDGE_PRIVATE_TOKEN=...
+
+[bastion]
+url = "https://bastion.example.com"
+
+# KoKo SSH gateway port. JumpServer's stock default is 2222; some deployments
+# (some internal deployments) use 2224.
+ssh_port = 2222
+
+# The login dimension of the per-asset SSH address `<login>#<account>#<asset_id>`.
+login_user = "your-login"
+
+# Private key for the data plane. Omit to use ssh-agent / your default key.
+# ssh_key = "~/.ssh/id_ed25519"
+
+# Set false only for a self-signed internal certificate you trust.
+verify_tls = true
+
+# How long to wait on the REST control plane, seconds.
+api_timeout = 30.0
+
+# Set only if the deployment enforces multi-org (sent as the X-JMS-ORG header).
+# org_id = "00000000-0000-0000-0000-000000000000"
