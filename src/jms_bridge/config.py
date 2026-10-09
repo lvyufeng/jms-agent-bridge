@@ -49,6 +49,11 @@ class BastionConfig:
     #: A session token from ``jms-bridge login`` (sent as ``Bearer``, unlike a
     #: private token which is sent as ``Token``). Cached in the config file.
     session_token: str | None = None
+    #: Password for the KoKo SSH gateway, used via ``sshpass``. JumpServer's SSH
+    #: service accepts password auth directly, which lets a fresh checkout reach
+    #: assets without first registering an SSH public key. Prefer a key in
+    #: production; use ``JMS_BRIDGE_SSH_PASSWORD`` rather than the config file.
+    ssh_password: str | None = None
     #: Explicit base path for the REST API. JumpServer is usually ``/api/v1``.
     api_base: str = "/api/v1"
 
@@ -101,12 +106,14 @@ def load_config(path: str | Path | None = None) -> BastionConfig:
     )
 
     ssh_key = _env("JMS_BRIDGE_SSH_KEY") or bastion.get("ssh_key")
+    ssh_password = _env("JMS_BRIDGE_SSH_PASSWORD") or bastion.get("ssh_password")
 
     return BastionConfig(
         url=url.rstrip("/"),
         ssh_port=int(_env("JMS_BRIDGE_SSH_PORT") or bastion.get("ssh_port", 2222)),
         login_user=_env("JMS_BRIDGE_LOGIN_USER") or bastion.get("login_user"),
         ssh_key=Path(_expand(ssh_key)).expanduser() if ssh_key else None,
+        ssh_password=ssh_password,
         verify_tls=bool(verify_tls),
         api_timeout=float(bastion.get("api_timeout", 30.0)),
         org_id=_env("JMS_BRIDGE_ORG_ID") or bastion.get("org_id"),

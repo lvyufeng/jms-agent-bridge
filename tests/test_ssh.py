@@ -46,3 +46,22 @@ def test_controlmaster_is_enabled_for_reuse():
     joined = " ".join(argv)
     assert "ControlMaster=auto" in joined
     assert "ControlPersist=300" in joined
+
+
+def test_bastion_password_uses_sshpass_and_forces_password_auth():
+    r = make_runner(ssh_password="s3cret")
+    argv = r._ssh_argv(Host(name="a", login="u", asset_id="A"))
+    assert argv[0] == "sshpass" and argv[1] == "-e"
+    assert "PubkeyAuthentication=no" in argv
+    assert "PreferredAuthentications=password" in argv
+    # password rides in the env, never in argv (argv is visible in `ps`)
+    assert "s3cret" not in argv
+    assert r._subproc_env()["SSHPASS"] == "s3cret"
+
+
+def test_direct_host_ignores_bastion_password():
+    """A direct host stays key-based even when a bastion password is configured."""
+    r = make_runner(ssh_password="s3cret")
+    argv = r._ssh_argv(Host(name="d", ssh_host="h", ssh_user="ubuntu"))
+    assert "sshpass" not in argv
+    assert "PreferredAuthentications=password" not in argv

@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import os
 import shlex
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +80,29 @@ class SSHRunner:
 
     # --- target construction ---------------------------------------------------
 
+    def _sshpass_prefix(self, host: Host) -> list[str]:
+        """``sshpass`` argv prefix for password auth, or ``[]``.
+
+        Only used for the bastion gateway: direct hosts are key-based. Failing
+        loudly here is better than silently falling back to an interactive prompt
+        that nothing can answer under the MCP server.
+        """
+        if host.is_direct or not self.cfg.ssh_password:
+            return []
+        if shutil.which("sshpass") is None:
+            raise RuntimeError(
+                "bastion ssh_password is set but `sshpass` is not installed "
+                "(apt/brew install sshpass), or register an SSH key instead"
+            )
+        return ["sshpass", "-e"]  # password read from the SSHPASS env var
+
+    def _subproc_env(self) -> dict[str, str]:
+        """Environment for a spawned ssh/rsync, carrying SSHPASS when in use."""
+        env = {**os.environ, "TERM": os.environ.get("TERM", "dumb")}
+        if self.cfg.ssh_password:
+            env["SSHPASS"] = self.cfg.ssh_password
+        return env
+
     def target(self, host: Host) -> str:
         """``login#account#asset_id@bastion`` — the JumpServer per-asset address."""
         return f"{host.login_string(self.cfg.login_user)}@{self.cfg.url.split('://')[-1].split('/')[0]}"
@@ -91,12 +115,15 @@ class SSHRunner:
 
     def _ssh_argv(self, host: Host, *, tty: bool = False) -> list[str]:
         control = str(self._sock(host))
-        argv = ["ssh", *_BASE_OPTS]
+        argv = self._sshpass_prefix(host) + ["ssh", *_BASE_OPTS]
         key = self.cfg.ssh_key
         if host.is_direct and host.ssh_user:
             argv += ["-l", host.ssh_user]
         if key:
             argv += ["-i", str(key), "-o", "IdentitiesOnly=yes"]
+        if self.cfg.ssh_password and not host.is_direct:
+            # Password auth to the bastion; the key, if any, may still be tried first.
+            argv += ["-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password"]
         argv += [
             "-o", "ControlMaster=auto",
             "-o", f"ControlPath={control}",
@@ -121,7 +148,7 @@ class SSHRunner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "TERM": os.environ.get("TERM", "dumb")},
+                env=self._subproc_env(),
             )
             try:
                 out, err = await asyncio.wait_for(
@@ -179,10 +206,16 @@ class SSHRunner:
         """Push or pull a path via rsync over the multiplexed SSH connection."""
         target, port = self._host_port(host)
         ssh_parts = [
+            *self._sshpass_prefix(host),
             "ssh",
             *_BASE_OPTS,
             *(["-l", host.ssh_user] if host.is_direct and host.ssh_user else []),
             *(("-i", str(self.cfg.ssh_key)) if self.cfg.ssh_key else ()),
+            *(
+                ("-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password")
+                if self.cfg.ssh_password and not host.is_direct
+                else ()
+            ),
             "-o", "ControlMaster=auto",
             "-o", f"ControlPath={self._sock(host)}",
             "-o", "ControlPersist=300",
@@ -206,6 +239,7 @@ class SSHRunner:
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=self._subproc_env(),
             )
             try:
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -227,7 +261,10 @@ class SSHRunner:
             argv = ["ssh", "-o", f"ControlPath={sock}", "-O", "exit", host]
             try:
                 p = await asyncio.create_subprocess_exec(
-                    *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                    *argv,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=self._subproc_env(),
                 )
                 await p.wait()
             except Exception:  # pragma: no cover - best-effort cleanup

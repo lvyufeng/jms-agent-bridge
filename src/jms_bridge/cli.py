@@ -29,6 +29,8 @@ ssh_port = 2222
 login_user = "your-login"
 # path to the SSH private key used for the data plane (optional; ssh-agent works too)
 # ssh_key = "~/.ssh/id_ed25519"
+# or the bastion login password, used via sshpass (prefer JMS_BRIDGE_SSH_PASSWORD)
+# ssh_password = "..."
 # set false only for a self-signed internal certificate
 verify_tls = true
 
