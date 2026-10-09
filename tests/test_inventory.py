@@ -155,3 +155,38 @@ def test_resolve_workspaces_by_name_and_tag(tmp_path):
     inv = Inventory.load(p)
     assert [w.name for w in inv.resolve_workspaces(["ascend"])] == ["wa"]
     assert {w.name for w in inv.resolve_workspaces(["all"])} == {"wa", "wb"}
+
+
+def test_resolve_workspaces_by_name(tmp_path):
+    p = write_inventory(
+        tmp_path,
+        """
+        hosts:
+          a: {login: u}
+          b: {login: u}
+        workspaces:
+          wa: {host: a, container: c, repo: /r, tags: [ascend]}
+          wb: {host: b, container: c, repo: /r, tags: [cuda]}
+        """,
+    )
+    inv = Inventory.load(p)
+    assert [w.name for w in inv.resolve_workspaces(["wa"])] == ["wa"]
+
+
+def test_resolve_workspaces_unknown_selector_raises(tmp_path):
+    p = write_inventory(
+        tmp_path,
+        "hosts:\n  a: {login: u}\nworkspaces:\n  wa: {host: a, container: c, repo: /r}\n",
+    )
+    inv = Inventory.load(p)
+    with pytest.raises(InventoryError):
+        inv.resolve_workspaces(["ghost"])
+
+
+def test_workspace_missing_repo_raises(tmp_path):
+    p = write_inventory(
+        tmp_path,
+        "hosts:\n  a: {login: u}\nworkspaces:\n  wa: {host: a, container: c}\n",
+    )
+    with pytest.raises(InventoryError):
+        Inventory.load(p)

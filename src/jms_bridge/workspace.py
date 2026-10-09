@@ -34,6 +34,10 @@ from .inventory import shell_quote
 #: How a workspace receives code.
 SOURCES = ("git", "proxy-git", "push")
 
+#: Docker container names: ``[a-zA-Z0-9][a-zA-Z0-9_.-]*`` (enforced below, since the
+#: name is interpolated into ``docker exec`` without quoting).
+_CONTAINER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
 #: Default unit-test command; overridable per workspace.
 DEFAULT_UT_CMD = "python -m pytest tests/ -q --tb=line -rA"
 
@@ -61,6 +65,13 @@ class Workspace:
     tags: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if not _CONTAINER_RE.match(self.container):
+            raise WorkspaceError(
+                f"workspace {self.name!r}: invalid container {self.container!r} "
+                "(must match [a-zA-Z0-9][a-zA-Z0-9_.-]*)"
+            )
+        if not self.repo or not self.repo.strip():
+            raise WorkspaceError(f"workspace {self.name!r}: 'repo' must be a non-empty path")
         if self.source not in SOURCES:
             raise WorkspaceError(
                 f"workspace {self.name!r}: unknown source {self.source!r} "
@@ -91,8 +102,9 @@ class Workspace:
         """
         q = shell_quote(self.proxy) if self.source == "proxy-git" and self.proxy else None
         env = f"env http_proxy={q} https_proxy={q} " if q else ""
-        # The container name is an inventory-controlled identifier and docker only
-        # accepts [a-zA-Z0-9][a-zA-Z0-9_.-]*, so it carries no shell metacharacters.
+        # The container name is interpolated unquoted, so it must not carry shell
+        # metacharacters. The docker charset [a-zA-Z0-9][a-zA-Z0-9_.-]* is enforced
+        # in __post_init__ (not merely assumed), so by here it is safe to embed.
         return f"docker exec {self.container} {env}bash -lc {shell_quote(command)}"
 
     def delivery_cmd(self, ref: str) -> str | None:
@@ -141,13 +153,32 @@ def _split_test_id(rest: str) -> tuple[str, str]:
     """Split a summary line body into ``(test_id, message)``.
 
     pytest separates the two with `` - `` (assertion lines) or ``: `` (skip/error
-    reasons). A test id may itself contain ``::``, so only a bare ``": "`` counts.
+    reasons). A nodeid may itself contain spaces and ``-``/``:`` *inside* its
+    parametrize brackets (``test_x[lo - hi]``), so we scan from the start tracking
+    bracket depth and let the id end at the first whitespace at depth 0. A trailing
+    ``:`` (the no-space skip form ``id: reason``) belongs to the separator, not the
+    id; whatever follows (with a leading ``" - "`` or ``": "`` stripped) is the
+    message.
     """
-    for sep in (" - ", ": "):
-        idx = rest.find(sep)
-        if idx != -1:
-            return rest[:idx].strip(), rest[idx + len(sep) :].strip()
-    return rest.strip(), ""
+    depth = 0
+    end = len(rest)
+    for i, ch in enumerate(rest):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif ch.isspace() and depth == 0:
+            end = i
+            break
+    test_id = rest[:end].strip()
+    message = rest[end:].strip()
+    if test_id.endswith(":"):
+        test_id = test_id[:-1].strip()
+    for sep in ("- ", ": "):
+        if message.startswith(sep):
+            message = message[len(sep) :].strip()
+            break
+    return test_id, message
 
 
 def parse_pytest_summary(output: str) -> dict[str, dict]:

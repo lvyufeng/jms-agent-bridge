@@ -51,6 +51,40 @@ def test_parse_pytest_summary_empty():
     assert parse_pytest_summary("no summary here") == {}
 
 
+def test_parse_pytest_summary_parametrized_id_with_dash():
+    got = parse_pytest_summary("FAILED tests/test_ops.py::test_x[lo - hi] - AssertionError: bad")
+    assert "tests/test_ops.py::test_x[lo - hi]" in got
+    entry = got["tests/test_ops.py::test_x[lo - hi]"]
+    assert entry["outcome"] == "FAIL"
+    assert entry["message"].startswith("AssertionError")
+
+
+def test_parse_pytest_summary_duplicate_line_keeps_first():
+    got = parse_pytest_summary("PASSED tests/a.py::t\nFAILED tests/a.py::t - boom")
+    assert list(got) == ["tests/a.py::t"]
+    assert got["tests/a.py::t"]["outcome"] == "PASS"
+
+
+def test_workspace_proxy_git_requires_proxy():
+    with pytest.raises(WorkspaceError):
+        Workspace(name="w", host="a", container="c", repo="/r", source="proxy-git")
+
+
+def test_workspace_push_requires_mount_and_local():
+    with pytest.raises(WorkspaceError):
+        Workspace(name="w", host="a", container="c", repo="/r", source="push")
+
+
+def test_workspace_bad_container_raises():
+    with pytest.raises(WorkspaceError):
+        Workspace(name="w", host="a", container="foo; id", repo="/r")
+
+
+def test_workspace_empty_repo_raises():
+    with pytest.raises(WorkspaceError):
+        Workspace(name="w", host="a", container="c", repo="")
+
+
 def test_table_aligns_by_test_id_and_flags_divergence():
     per_ws = {
         "ascend": {"t_a": {"outcome": "PASS"}, "t_b": {"outcome": "FAIL", "message": "x"}},
@@ -78,3 +112,24 @@ def test_delivery_commands_per_source():
     u = Workspace(name="u", host="a", container="c", repo="/r",
                   source="push", mount="/srv/fl", local="/Users/me/Torch-FL")
     assert u.delivery_cmd("feat/x") is None
+
+
+def test_table_flags_a_missing_test_even_when_others_agree():
+    # Both workspaces agree on t_shared; A also reported t_x but B did not, so the
+    # t_x row must be inconsistent purely because a workspace never ran it.
+    per_ws = {
+        "A": {"t_shared": {"outcome": "PASS"}, "t_x": {"outcome": "PASS"}},
+        "B": {"t_shared": {"outcome": "PASS"}},
+    }
+    table = build_consistency_table(per_ws)
+    rows = {r["test_id"]: r for r in table["rows"]}
+    assert rows["t_shared"]["consistent"] is True
+    assert rows["t_x"]["consistent"] is False
+    assert rows["t_x"]["outcomes"]["B"] is None
+    assert table["ok"] is False
+
+
+def test_table_single_workspace_is_consistent():
+    table = build_consistency_table({"A": {"t": {"outcome": "FAIL"}}})
+    assert table["ok"] is True
+    assert table["rows"][0]["consistent"] is True
