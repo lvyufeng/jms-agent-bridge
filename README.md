@@ -104,6 +104,17 @@ never handles a password. If your deployment issues API keys instead, skip `logi
 and set `JMS_BRIDGE_ACCESS_KEY_ID` / `JMS_BRIDGE_ACCESS_KEY_SECRET` or
 `JMS_BRIDGE_PRIVATE_TOKEN`.
 
+The **data plane** authenticates to the KoKo SSH gateway. Register an SSH key with
+JumpServer (个人设置 → SSH 公钥) and point `ssh_key` at it — that is the recommended
+setup. For a quick start before the key is registered, KoKo also accepts password
+auth; set `JMS_BRIDGE_SSH_PASSWORD` and it is used via `sshpass` (installed locally,
+never on the remote host):
+
+```bash
+export JMS_BRIDGE_SSH_PASSWORD='...'
+jms-bridge doctor
+```
+
 ## Register with Claude Code
 
 ```bash
