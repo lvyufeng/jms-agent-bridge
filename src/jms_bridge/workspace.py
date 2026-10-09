@@ -107,7 +107,7 @@ class Workspace:
         qref = shell_quote(ref)
         return (
             f"{self._proxy_prefix()}cd {q} && "
-            f"git fetch --depth=1 origin {qref} && git checkout {qref}"
+            f"git fetch origin {qref} --depth=1 && git checkout {qref}"
         )
 
     def to_dict(self) -> dict:

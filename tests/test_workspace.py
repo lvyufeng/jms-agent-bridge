@@ -64,3 +64,17 @@ def test_table_aligns_by_test_id_and_flags_divergence():
     assert rows["t_b"]["outcomes"]["ascend"]["message"] == "x"
     assert table["columns"] == ["ascend", "cuda", "maca"]
     assert table["ok"] is False
+
+
+def test_delivery_commands_per_source():
+    g = Workspace(name="g", host="a", container="c", repo="/r", source="git")
+    assert "git fetch origin" in g.delivery_cmd("feat/x")
+    assert "git checkout 'feat/x'" in g.delivery_cmd("feat/x")
+
+    p = Workspace(name="p", host="a", container="c", repo="/r",
+                  source="proxy-git", proxy="http://prx:80")
+    assert "http_proxy='http://prx:80'" in p.delivery_cmd("feat/x")
+
+    u = Workspace(name="u", host="a", container="c", repo="/r",
+                  source="push", mount="/srv/fl", local="/Users/me/Torch-FL")
+    assert u.delivery_cmd("feat/x") is None
