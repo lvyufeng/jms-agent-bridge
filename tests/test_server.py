@@ -1,4 +1,10 @@
+import asyncio
+
+import jms_bridge.server as S
+from jms_bridge.inventory import Host, Inventory
 from jms_bridge.server import _looks_dangerous
+from jms_bridge.ssh import ExecResult
+from jms_bridge.workspace import Workspace
 
 
 def test_denylist_catches_obvious_destruction():
@@ -50,3 +56,104 @@ def test_mcp_server_lists_all_tools():
 
     names = asyncio.run(run())
     assert expected <= names, f"missing tools: {expected - names}"
+
+
+# --- jms_dev_run unit coverage (fakes; no SSH, no hardware) -------------------------
+
+
+class _FakeSSH:
+    """A tiny SSHRunner stand-in driven by a per-workspace script of responses.
+
+    ``plan`` maps a substring of the command to an :class:`ExecResult`-shaped
+    ``(exit_code, stdout, stderr)`` tuple, so a test declares what each chip's
+    delivery and UT run produce.
+    """
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.calls = []
+
+    async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+        self.calls.append({"host": host.name, "command": command,
+                           "workdir": workdir, "env_setup": env_setup})
+        code, out, err = 0, "", ""
+        for key, value in self.plan.items():
+            if key in command:
+                code, out, err = value
+                break
+        return ExecResult(host.name, code, out, err)
+
+    async def rsync(self, host, local, remote, **kw):
+        self.calls.append({"host": host.name, "rsync": (local, remote)})
+        return ExecResult(host.name, 0, "", "")
+
+
+def _install(monkeypatch, workspaces, plan):
+    """Point the server's lazy singletons at fakes and return the fake runner."""
+    inv = Inventory(
+        hosts={w.host: Host(name=w.host, login="u", asset_id="A") for w in workspaces},
+        groups={},
+        workspaces={w.name: w for w in workspaces},
+    )
+    fake = _FakeSSH(plan)
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", fake)
+    return fake
+
+
+def _ws(name="w1", host="h1"):
+    return Workspace(name=name, host=host, container="c", repo="/work/Torch-FL", source="git")
+
+
+def test_dev_run_all_pass_is_ok(monkeypatch):
+    fake = _install(monkeypatch, [_ws("a", "h1"), _ws("b", "h2")], {
+        "git fetch": (0, "abc123\n", ""),
+        "pytest": (0, "PASSED tests/t.py::test_x\n1 passed\n", ""),
+    })
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["ok"] is True
+    assert r["revisions_consistent"] is True
+    assert r["failed_hosts"] == []
+    # the UT run must not source the host env, and must be proxyless
+    run_calls = [c for c in fake.calls if "pytest" in c["command"]]
+    assert run_calls and all(c["env_setup"] is False for c in run_calls)
+
+
+def test_dev_run_nonzero_exit_is_not_ok(monkeypatch):
+    # Chip ``b`` times out / exits nonzero with empty stdout -> no parsed rows, but
+    # the run is still not ok.
+    _install(monkeypatch, [_ws("a", "h1"), _ws("b", "h2")], {
+        "git fetch": (0, "abc123\n", ""),
+        "pytest": (124, "", "timed out"),
+    })
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["ok"] is False
+    assert r["failed_hosts"] == ["a", "b"]
+
+
+def test_dev_run_mixed_revisions_is_not_ok(monkeypatch):
+    # Two chips, one delivery pins a different commit -> not consistent even though
+    # every parsed outcome agrees and both exited zero.
+    def plan_for(cmd):
+        return (0, "PASSED tests/t.py::test_x\n1 passed\n", "")
+
+    class _RevSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            self.calls.append({"host": host.name, "command": command})
+            if "git fetch" in command:
+                sha = "abc123" if host.name == "h1" else "def456"
+                return ExecResult(host.name, 0, sha + "\n", "")
+            return ExecResult(host.name, 0, plan_for(command)[1], "")
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={},
+        workspaces={"a": _ws("a", "h1"), "b": _ws("b", "h2")},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _RevSSH({}))
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["revisions"] == {"a": "abc123", "b": "def456"}
+    assert r["revisions_consistent"] is False
+    assert r["ok"] is False

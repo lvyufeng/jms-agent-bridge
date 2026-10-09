@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -335,27 +336,68 @@ def _host_of(ws):  # noqa: ANN001, ANN202
     return _inv().hosts[ws.host]
 
 
+def _local_sha(path: str) -> str | None:
+    """Best-effort HEAD sha of a *local* git tree (for ``push`` workspaces).
+
+    The container has no git for a ``push`` workspace, but the developer's tree
+    does, and a fork and the local tree share commit ids — so this is what lets a
+    mixed git+push run detect that the pushed tree is not at ``ref``.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _last_stdout_line(text: str) -> str:
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
 async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
-    """Put the workspace's repo at ``ref`` using its configured source."""
+    """Put the workspace's repo at ``ref`` using its configured source.
+
+    Returns the delivered commit under ``sha`` (best-effort) so a caller can spot
+    revision divergence across chips. For ``push`` the code arrives out-of-band and
+    the container has no git, so ``ref_pinned`` is False and the sha — when the
+    local tree could be read — is the *local* HEAD, not the container's.
+    """
     host = _host_of(ws)
     if ws.source == "push":
         res = await _ssh().rsync(
             host, ws.local, ws.mount, direction="push", excludes=_DEFAULT_EXCLUDES
         )
+        sha = await asyncio.to_thread(_local_sha, ws.local)
         return {
             "workspace": ws.name,
             "source": "push",
             "ok": res.ok,
+            "sha": sha,
+            "ref_pinned": sha is not None,
             "stderr": res.stderr.strip()[:400],
         }
     cmd = ws.delivery_cmd(ref)
+    # One round trip: fetch + checkout write to stderr, rev-parse to stdout.
     res = await _ssh().exec_on(
-        host, ws.container_cmd(cmd), timeout=300, workdir=False, env_setup=False
+        host,
+        ws.container_cmd(f"{cmd} && git rev-parse HEAD"),
+        timeout=300,
+        workdir=False,
+        env_setup=False,
     )
+    sha = _last_stdout_line(res.stdout)
     return {
         "workspace": ws.name,
         "source": ws.source,
-        "ok": res.ok,
+        "ok": res.ok and bool(sha),
+        "sha": sha or None,
+        "ref_pinned": True,
         "stderr": res.stderr.strip()[:400],
     }
 
@@ -400,16 +442,30 @@ async def jms_dev_run(
         # the checkout, so `python -m pytest tests/` would not find the tests.
         inner = f"cd {shell_quote(ws.repo)} && {ut_cmd or ws.ut_cmd}"
         res = await _ssh().exec_on(
-            host, ws.container_cmd(inner), timeout=timeout, workdir=False, env_setup=False
+            host,
+            # The UT run must not inherit the delivery proxy.
+            ws.container_cmd(inner, with_proxy=False),
+            timeout=timeout,
+            workdir=False,
+            env_setup=False,
         )
         return ws.name, res, parse_pytest_summary(res.stdout)
 
     ran = await asyncio.gather(*(one(w) for w in workspaces))
     per_ws = {name: parsed for name, _, parsed in ran}
     table = build_consistency_table(per_ws)
+    # A chip that timed out or exited nonzero (often with empty stdout, hence no
+    # parsed rows) must fail the whole run, not just be reported as informational.
+    failed = [name for name, res, _ in ran if not res.ok]
+    shas = {d["workspace"]: d["sha"] for d in delivered if d.get("sha")}
+    revisions_consistent = len(set(shas.values())) <= 1
     table.update(
         {
+            "ok": table["ok"] and not failed and revisions_consistent,
             "ref": ref,
+            "failed_hosts": failed,
+            "revisions": shas,
+            "revisions_consistent": revisions_consistent,
             "hosts": {
                 name: {
                     "ok": res.ok,
@@ -437,7 +493,11 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
         f"{shell_quote(test_id)} -q --tb=long -rA"
     )
     res = await _ssh().exec_on(
-        host, ws.container_cmd(inner), timeout=timeout, workdir=False, env_setup=False
+        host,
+        ws.container_cmd(inner, with_proxy=False),
+        timeout=timeout,
+        workdir=False,
+        env_setup=False,
     )
     return {
         "ok": res.ok,
