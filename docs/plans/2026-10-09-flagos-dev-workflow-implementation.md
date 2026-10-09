@@ -713,8 +713,8 @@ Rows for `jms_dev_sync`, `jms_dev_run`, `jms_dev_logs` under a "Dev loop" headin
 short section showing the loop:
 
 ```
-jms_dev_sync(["flagos-cluster"], ref="feat/unify-softmax")
-jms_dev_run(["flagos-cluster"], ref="feat/unify-softmax")   # → consistency table
+jms_dev_sync(["all"], ref="feat/unify-softmax")
+jms_dev_run(["all"], ref="feat/unify-softmax")   # → consistency table
 jms_dev_logs("fl-ascend", "tests/test_ops.py::test_layer_norm")
 ```
 

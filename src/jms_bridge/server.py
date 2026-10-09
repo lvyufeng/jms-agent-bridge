@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import subprocess
 from typing import Any
@@ -352,7 +353,9 @@ def _local_sha(path: str) -> str | None:
     """
     try:
         out = subprocess.run(
-            ["git", "-C", path, "rev-parse", "HEAD"],
+            # expanduser: `local:` in the inventory is often `~/...`, and this path
+            # goes straight to exec (no shell), so `~` would never be expanded.
+            ["git", "-C", os.path.expanduser(path), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
@@ -431,7 +434,13 @@ async def jms_dev_sync(targets: list[str], ref: str) -> dict:
     """
     workspaces = _workspaces(targets)
     results = await asyncio.gather(*(_deliver(w, ref) for w in workspaces))
-    return {"ok": all(r["ok"] for r in results), "ref": ref, "results": list(results)}
+    # `bool(results)`: delivering nothing (empty selector) is not success —
+    # all([]) is True, the same trap the consistency table guards against.
+    return {
+        "ok": bool(results) and all(r["ok"] for r in results),
+        "ref": ref,
+        "results": list(results),
+    }
 
 
 @server.tool()
@@ -457,8 +466,35 @@ async def jms_dev_run(
 
     workspaces = _workspaces(targets)
     delivered = await asyncio.gather(*(_deliver(w, ref) for w in workspaces))
+    if not delivered:
+        # No workspace matched: report it the same shape as a normal run (empty
+        # table) rather than a bare success, so the caller can always read `rows`.
+        return {
+            "ok": False,
+            "stage": "deliver",
+            "error": "no workspace matched the selector",
+            "ref": ref,
+            "columns": [],
+            "rows": [],
+            "revisions": {},
+            "revisions_consistent": False,
+            "revisions_unverified": [],
+            "failed_hosts": [],
+            "results": [],
+        }
     if not all(d["ok"] for d in delivered):
-        return {"ok": False, "stage": "deliver", "ref": ref, "results": list(delivered)}
+        return {
+            "ok": False,
+            "stage": "deliver",
+            "ref": ref,
+            "columns": [],
+            "rows": [],
+            "revisions": {},
+            "revisions_consistent": False,
+            "revisions_unverified": [d["workspace"] for d in delivered if not d.get("sha")],
+            "failed_hosts": [d["workspace"] for d in delivered if not d["ok"]],
+            "results": list(delivered),
+        }
 
     async def one(ws):  # noqa: ANN001, ANN202
         host = _host_of(ws)

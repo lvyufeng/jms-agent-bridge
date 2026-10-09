@@ -130,7 +130,7 @@ semantic — *"make the container's repo be at `ref`"*:
 The agent sees one verb:
 
 ```
-jms_dev_sync(["flagos-cluster"], ref="feat/unify-softmax")
+jms_dev_sync(["all"], ref="feat/unify-softmax")
 ```
 
 ### 3. Run + aggregate — one suite, one table
@@ -156,8 +156,9 @@ tracebacks are fetched on demand.
 ### 4. Drill-down
 
 `jms_dev_logs(target, test_id)` returns the full output for one test on one workspace.
-pytest leaves per-test output on disk in the container (e.g. via `--junitxml` or a
-saved `-rA` report); the bridge slices out the requested test by name.
+As shipped, the bridge **re-runs** the single test in the container with `--tb=long -rA`
+rather than reading a saved report: it needs no on-disk report file to be configured per
+host, so it works on any suite unchanged, at the cost of one more pytest invocation.
 
 ### 5. Training stays separate
 

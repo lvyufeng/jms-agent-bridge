@@ -152,6 +152,39 @@ def test_dev_run_git_chip_without_sha_fails_delivery(monkeypatch):
     r = asyncio.run(S.jms_dev_run(["all"], "main"))
     assert r["ok"] is False
     assert r["stage"] == "deliver"
+    # The failure shape stays readable by an agent that keys on `rows`.
+    for key in ("rows", "columns", "revisions", "failed_hosts"):
+        assert key in r
+    assert r["failed_hosts"] == ["a", "b"]
+
+
+def test_dev_sync_empty_selector_is_not_ok(monkeypatch):
+    # Delivering to zero workspaces is not success (all([]) is True).
+    monkeypatch.setitem(S._state, "inv", Inventory(hosts={}, groups={}, workspaces={}))
+    monkeypatch.setitem(S._state, "ssh", _FakeSSH({}))
+    r = asyncio.run(S.jms_dev_sync(["all"], "main"))
+    assert r["ok"] is False
+    assert r["results"] == []
+
+
+def test_local_sha_expands_user(monkeypatch, tmp_path):
+    # `local:` is commonly `~/...` and `_local_sha` execs git directly (no shell),
+    # so it must expanduser or every push chip lands in revisions_unverified.
+    import subprocess
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    subprocess.run(["git", "init", "-q", str(tree)], check=True)
+    subprocess.run(["git", "-C", str(tree), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(tree), "config", "user.name", "t"], check=True)
+    (tree / "f").write_text("x")
+    subprocess.run(["git", "-C", str(tree), "add", "f"], check=True)
+    subprocess.run(["git", "-C", str(tree), "commit", "-qm", "init"], check=True)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sha = S._local_sha("~/tree")
+    assert sha is not None
+    assert S._SHA_RE.match(sha)
 
 
 def test_dev_run_push_without_local_sha_is_unverified(monkeypatch):

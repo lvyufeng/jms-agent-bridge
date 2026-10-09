@@ -237,14 +237,17 @@ workspaces:
     repo: /work/Torch-FL
     source: push                     # this host can't reach GitHub
     mount: /srv/torch-fl             # host dir bind-mounted to `repo`
+    local: ~/Projects/Torch-FL       # local tree the bridge rsyncs from
     tags: [cuda]
 ```
 
-Then the loop is three calls:
+Then the loop is three calls (workspaces are selected by name, by tag, or by `all` —
+unlike hosts they have no group concept):
 
 ```text
-jms_dev_sync(["flagos-cluster"], ref="feat/unify-softmax")   # deliver the ref
-jms_dev_run(["flagos-cluster"],  ref="feat/unify-softmax")   # → consistency table
+jms_dev_sync(["all"], ref="feat/unify-softmax")   # deliver the ref to every workspace
+# or a subset by tag:  ["ascend"]  /  ["ascend", "cuda"]
+jms_dev_run(["all"],  ref="feat/unify-softmax")   # → consistency table
 jms_dev_logs("fl-ascend", "tests/test_ops.py::test_layer_norm")  # full traceback on a FAIL
 ```
 
