@@ -583,6 +583,9 @@ async def jms_dev_discover(
     source: str = "git",
     repo_match: str = DEFAULT_REPO_MATCH,
     max_depth: int = 5,
+    proxy: str | None = None,
+    mount: str | None = None,
+    local: str | None = None,
     timeout: float = 120.0,
 ) -> dict:
     """Inspect each host's container and emit a paste-ready `workspaces:` block.
@@ -595,14 +598,20 @@ async def jms_dev_discover(
 
     `container` is normally the same name on every host (`lvyufeng-torch-fl`);
     `source` seeds the `source:` field (git / proxy-git / push) and `repo_match` is
-    a case-insensitive substring a checkout path must contain. Every host's raw
-    findings are in `hosts`; anything the probe could not confirm is a `warnings`
-    entry (an unreachable origin, a missing pytest, a container that is not there)
-    and hosts without the container or without a match are listed in `skipped` —
-    `ok` is true only when at least one workspace was emitted.
+    a case-insensitive substring a checkout path must contain. Because the emitted
+    block must be *loadable*, `source='proxy-git'` requires `proxy` and
+    `source='push'` requires `mount` + `local` — without them the pasted entry would
+    make `Inventory.load` reject the whole inventory, so this call refuses rather
+    than emit a block that cannot be pasted.
 
-    The emitted `source` is a *guess* from reachability alone; confirm it (and add
-    `proxy` / `mount` / `local`) before relying on it.
+    Every host's raw findings are in `hosts`; anything the probe could not confirm
+    is a `warnings` entry (a timed-out or unreachable origin, a missing pytest, a
+    missing docker, a container that is not there) and a host that could not be
+    inspected is listed in `skipped` — `ok` is true only when every requested host
+    produced at least one workspace.
+
+    The emitted `source` is a *guess* from reachability alone; confirm it before
+    relying on it.
     """
     from .discover import (
         build_discovery_script,
@@ -614,6 +623,13 @@ async def jms_dev_discover(
         return {"ok": False, "error": f"invalid container name {container!r}"}
     if source not in SOURCES:
         return {"ok": False, "error": f"source must be one of {SOURCES}, got {source!r}"}
+    # The emitted block is advertised as paste-ready, so it must survive
+    # Inventory.load: Workspace rejects proxy-git without a proxy and push without
+    # both mount and local, and a single bad entry aborts the whole inventory.
+    if source == "proxy-git" and not proxy:
+        return {"ok": False, "error": "source 'proxy-git' requires a 'proxy' argument"}
+    if source == "push" and not (mount and local):
+        return {"ok": False, "error": "source 'push' requires both 'mount' and 'local'"}
 
     hosts = _resolve(targets)
     script = build_discovery_script(container, repo_match=repo_match, max_depth=max_depth)
@@ -631,6 +647,8 @@ async def jms_dev_discover(
         {
             "host": res.host,
             "exit_code": res.exit_code,
+            "timed_out": res.timed_out,
+            "timeout": timeout,
             "report": parse_discovery(res.stdout),
             "stderr": res.stderr.strip()[:400],
         }
@@ -640,10 +658,13 @@ async def jms_dev_discover(
         reports,
         container=container,
         source=source,
+        proxy=proxy,
+        mount=mount,
+        local=local,
         host_tags={h.name: h.tags for h in hosts},
     )
     return {
-        "ok": bool(rendered["workspaces"]),
+        "ok": rendered["ok"],
         "container": container,
         "source": source,
         "hosts": reports,

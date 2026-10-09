@@ -81,7 +81,8 @@ class _FakeSSH:
             if key in command:
                 code, out, err = value
                 break
-        return ExecResult(host.name, code, out, err)
+        # Mirror the real runner: a timeout surfaces as exit 124 + timed_out=True.
+        return ExecResult(host.name, code, out, err, timed_out=(code == 124))
 
     async def rsync(self, host, local, remote, **kw):
         self.calls.append({"host": host.name, "rsync": (local, remote)})
@@ -275,7 +276,7 @@ _DISCOVERED = (
     "JMSD remote=git@github.com:lvyufeng/PyTorch-Plugin-FL.git\n"
     "JMSD branch=flagos-plugin\n"
     "JMSD sha=abc1234def5678\n"
-    "JMSD reachable=1\n"
+    "JMSD reachable=ok\n"
 )
 
 
@@ -295,7 +296,7 @@ def test_dev_discover_emits_workspaces(monkeypatch):
     fake = _install_hosts(
         monkeypatch,
         [Host(name="ascend-910c-108", login="u", asset_id="A", tags=["ascend"])],
-        {"docker inspect": (0, _DISCOVERED, "")},
+        {"docker exec": (0, _DISCOVERED, "")},
     )
     r = asyncio.run(S.jms_dev_discover(["all"]))
     assert r["ok"] is True
@@ -303,6 +304,9 @@ def test_dev_discover_emits_workspaces(monkeypatch):
         "/public-flash/lvyufeng/PyTorch-Plugin-FL"
     assert r["workspaces"]["fl-ascend-910c-108"]["tags"] == ["ascend"]
     assert "workspaces:" in r["yaml"]
+    # The command actually sent must be the real discovery script, not a stub.
+    sent = fake.calls[0]["command"]
+    assert "docker exec" in sent and "-print0" in sent and "PyTorch" not in sent
     # discovery must not source the host env or cd into the host workdir
     assert all(c["env_setup"] is False and c["workdir"] is False for c in fake.calls)
 
@@ -321,14 +325,66 @@ def test_dev_discover_rejects_bad_source(monkeypatch):
     assert "source must be" in r["error"]
 
 
+def test_dev_discover_requires_proxy_for_proxy_git(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover(["all"], source="proxy-git"))
+    assert r["ok"] is False
+    assert "proxy" in r["error"]
+
+
+def test_dev_discover_requires_mount_and_local_for_push(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover(["all"], source="push", mount="/srv/fl"))
+    assert r["ok"] is False
+    assert "mount" in r["error"] and "local" in r["error"]
+
+
 def test_dev_discover_no_match_is_not_ok(monkeypatch):
     from jms_bridge.inventory import Host
 
     _install_hosts(
         monkeypatch,
         [Host(name="h1", login="u", asset_id="A")],
-        {"docker inspect": (0, "JMSD container_absent=1\n", "")},
+        {"docker exec": (0, "JMSD container_absent=1\n", "")},
     )
     r = asyncio.run(S.jms_dev_discover(["all"]))
     assert r["ok"] is False
     assert r["skipped"] == ["h1"]
+
+
+def test_dev_discover_partial_is_not_ok(monkeypatch):
+    from jms_bridge.inventory import Host
+
+    # one healthy host + one with the container absent -> ok must be False even
+    # though workspaces were emitted for the healthy one.
+    class _TwoSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            self.calls.append({"host": host.name, "command": command})
+            if host.name == "h2":
+                return ExecResult(host.name, 0, "JMSD container_absent=1\n", "")
+            return ExecResult(host.name, 0, _DISCOVERED, "")
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={}, workspaces={},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _TwoSSH({}))
+    r = asyncio.run(S.jms_dev_discover(["all"]))
+    assert r["ok"] is False
+    assert "fl-h1" in r["workspaces"]
+    assert r["skipped"] == ["h2"]
+
+
+def test_dev_discover_timeout_is_reported_as_timeout(monkeypatch):
+    from jms_bridge.inventory import Host
+
+    _install_hosts(
+        monkeypatch,
+        [Host(name="h1", login="u", asset_id="A")],
+        {"docker exec": (124, "", "timed out")},
+    )
+    r = asyncio.run(S.jms_dev_discover(["all"]))
+    assert r["ok"] is False
+    assert any("timed out" in w for w in r["warnings"])

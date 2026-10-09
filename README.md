@@ -257,7 +257,15 @@ alone**, so anything it could not confirm — a container it could not inspect, 
 unreachable origin, a missing pytest — comes back as a `warnings` entry, and a host
 without the container or without a matching checkout is listed in `skipped` rather than
 emitted as a half-formed entry. Confirm the guess (`source`, and any `proxy` / `mount` /
-`local`) before relying on it.
+`local`) before relying on it. `ok` is true only when every requested host produced at
+least one workspace — a skipped host means the picture is incomplete.
+
+Because the block must be *loadable*, the tool refuses a `source` it cannot complete:
+`proxy-git` requires `proxy`, and `push` requires both `mount` and `local`, so pass them
+(`jms_dev_discover(["all"], source="proxy-git", proxy="http://…:8080")`). The
+reachability probe distinguishes three outcomes rather than one bit — `ok`,
+`denied` (unreachable *or* unauthenticated) and `timeout` (could not tell) — because
+"retry" and "change `source`" are different fixes.
 
 Once the block is in the inventory, the loop is three calls (workspaces are selected by
 name, by tag, or by `all` — unlike hosts they have no group concept):
