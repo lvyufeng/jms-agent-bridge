@@ -107,7 +107,7 @@ def _ws(name="w1", host="h1"):
 
 def test_dev_run_all_pass_is_ok(monkeypatch):
     fake = _install(monkeypatch, [_ws("a", "h1"), _ws("b", "h2")], {
-        "git fetch": (0, "abc123\n", ""),
+        "git fetch": (0, "abc1234\n", ""),
         "pytest": (0, "PASSED tests/t.py::test_x\n1 passed\n", ""),
     })
     r = asyncio.run(S.jms_dev_run(["all"], "main"))
@@ -123,12 +123,84 @@ def test_dev_run_nonzero_exit_is_not_ok(monkeypatch):
     # Chip ``b`` times out / exits nonzero with empty stdout -> no parsed rows, but
     # the run is still not ok.
     _install(monkeypatch, [_ws("a", "h1"), _ws("b", "h2")], {
-        "git fetch": (0, "abc123\n", ""),
+        "git fetch": (0, "abc1234\n", ""),
         "pytest": (124, "", "timed out"),
     })
     r = asyncio.run(S.jms_dev_run(["all"], "main"))
     assert r["ok"] is False
     assert r["failed_hosts"] == ["a", "b"]
+
+
+def test_dev_run_git_chip_without_sha_fails_delivery(monkeypatch):
+    # A git chip whose rev-parse stdout carries no sha-shaped line (banner, empty)
+    # cannot prove which commit landed, so its delivery is a failure.
+    class _NoShaSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            self.calls.append({"host": host.name, "command": command})
+            if "git fetch" in command:
+                return ExecResult(host.name, 0, "Welcome to the container\n", "")
+            return ExecResult(host.name, 0, "PASSED tests/t.py::test_x\n", "")
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={},
+        workspaces={"a": _ws("a", "h1"), "b": _ws("b", "h2")},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _NoShaSSH({}))
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["ok"] is False
+    assert r["stage"] == "deliver"
+
+
+def test_dev_run_push_without_local_sha_is_unverified(monkeypatch):
+    # A push chip delivers the local tree and cannot report an in-container sha;
+    # when the local tree's sha cannot be read either, that chip must not be
+    # silently dropped from the revision comparison.
+    push = Workspace(
+        name="p", host="h2", container="c", repo="/work/Torch-FL", source="push",
+        mount="/srv/fl", local="/nonexistent/local/tree",
+    )
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={},
+        workspaces={"g": _ws("g", "h1"), "p": push},
+    )
+    fake = _FakeSSH({
+        "git fetch": (0, "abc1234\n", ""),
+        "pytest": (0, "PASSED tests/t.py::test_x\n", ""),
+    })
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", fake)
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["revisions_unverified"] == ["p"]
+    assert r["revisions_consistent"] is False
+    assert r["ok"] is False
+
+
+def test_dev_run_banner_after_sha_is_ignored(monkeypatch):
+    # A banner printed *after* the sha must not become a fake sha: we take the last
+    # sha-shaped line, so both chips agree on the real commit.
+    class _BannerSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            self.calls.append({"host": host.name, "command": command})
+            if "git fetch" in command:
+                return ExecResult(host.name, 0, "abc1234\nGoodbye, see you soon!\n", "")
+            return ExecResult(host.name, 0, "PASSED tests/t.py::test_x\n", "")
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={},
+        workspaces={"a": _ws("a", "h1"), "b": _ws("b", "h2")},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _BannerSSH({}))
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["revisions"] == {"a": "abc1234", "b": "abc1234"}
+    assert r["ok"] is True
 
 
 def test_dev_run_mixed_revisions_is_not_ok(monkeypatch):
@@ -141,7 +213,7 @@ def test_dev_run_mixed_revisions_is_not_ok(monkeypatch):
         async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
             self.calls.append({"host": host.name, "command": command})
             if "git fetch" in command:
-                sha = "abc123" if host.name == "h1" else "def456"
+                sha = "abc1234" if host.name == "h1" else "def4567"
                 return ExecResult(host.name, 0, sha + "\n", "")
             return ExecResult(host.name, 0, plan_for(command)[1], "")
 
@@ -154,6 +226,6 @@ def test_dev_run_mixed_revisions_is_not_ok(monkeypatch):
     monkeypatch.setitem(S._state, "inv", inv)
     monkeypatch.setitem(S._state, "ssh", _RevSSH({}))
     r = asyncio.run(S.jms_dev_run(["all"], "main"))
-    assert r["revisions"] == {"a": "abc123", "b": "def456"}
+    assert r["revisions"] == {"a": "abc1234", "b": "def4567"}
     assert r["revisions_consistent"] is False
     assert r["ok"] is False

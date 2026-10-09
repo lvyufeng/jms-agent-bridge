@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
 from typing import Any
 
@@ -336,12 +337,18 @@ def _host_of(ws):  # noqa: ANN001, ANN202
     return _inv().hosts[ws.host]
 
 
+#: A git object name as `git rev-parse` emits it: 7..40 lowercase hex chars.
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
 def _local_sha(path: str) -> str | None:
     """Best-effort HEAD sha of a *local* git tree (for ``push`` workspaces).
 
     The container has no git for a ``push`` workspace, but the developer's tree
     does, and a fork and the local tree share commit ids — so this is what lets a
-    mixed git+push run detect that the pushed tree is not at ``ref``.
+    mixed git+push run detect that the pushed tree is not at ``ref``. Validated
+    against :data:`_SHA_RE` so a banner or a short/full mismatch cannot slip
+    through as a divergence (or false agreement).
     """
     try:
         out = subprocess.run(
@@ -350,14 +357,22 @@ def _local_sha(path: str) -> str | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return out.stdout.strip() if out.returncode == 0 else None
+    sha = out.stdout.strip() if out.returncode == 0 else ""
+    return sha if _SHA_RE.match(sha) else None
 
 
-def _last_stdout_line(text: str) -> str:
-    for line in reversed(text.splitlines()):
-        if line.strip():
-            return line.strip()
-    return ""
+def _last_sha(stdout: str) -> str | None:
+    """The last sha-shaped line of an SSH stdout, or None.
+
+    Scanning for a *sha-shaped* line (bottom-up) rather than the last non-empty
+    line means a container logout banner or login notice printed to stdout after
+    ``git rev-parse`` is ignored instead of being mistaken for the commit.
+    """
+    for line in reversed(stdout.splitlines()):
+        candidate = line.strip()
+        if _SHA_RE.match(candidate):
+            return candidate
+    return None
 
 
 async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
@@ -393,12 +408,14 @@ async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
         workdir=False,
         env_setup=False,
     )
-    sha = _last_stdout_line(res.stdout)
+    sha = _last_sha(res.stdout)
     return {
         "workspace": ws.name,
         "source": ws.source,
-        "ok": res.ok and bool(sha),
-        "sha": sha or None,
+        # A delivery that cannot report which commit it landed on is a failure:
+        # a run over unverified code must not report ok.
+        "ok": res.ok and sha is not None,
+        "sha": sha,
         "ref_pinned": True,
         "stderr": res.stderr.strip()[:400],
     }
@@ -428,6 +445,11 @@ async def jms_dev_run(
     runs its configured `ut_cmd` (override with `ut_cmd`) and reports per-test
     outcomes; results are aligned by test id. A FAIL carries a one-line summary
     inline — fetch full output with `jms_dev_logs`.
+
+    An `ut_cmd` override MUST emit pytest `-rA` short-summary lines
+    (`PASSED/FAILED/ERROR/SKIPPED ... <id> - <msg>`): the consistency table is
+    built from them, so a command without `-rA` yields no rows and the run is
+    reported as not-ok even on a clean pass.
 
     Long training runs do NOT go here; use `jms_submit_job` / `jms_cluster_submit`.
     """
@@ -460,7 +482,11 @@ async def jms_dev_run(
     # parsed rows) must fail the whole run, not just be reported as informational.
     failed = [name for name, res, _ in ran if not res.ok]
     shas = {d["workspace"]: d["sha"] for d in delivered if d.get("sha")}
-    revisions_consistent = len(set(shas.values())) <= 1
+    # A workspace whose revision could not be read must not be silently dropped:
+    # comparing only the survivors could report agreement while a chip ran
+    # unverified code.
+    unverified = [d["workspace"] for d in delivered if not d.get("sha")]
+    revisions_consistent = len(set(shas.values())) <= 1 and len(shas) == len(delivered)
     table.update(
         {
             "ok": table["ok"] and not failed and revisions_consistent,
@@ -468,6 +494,7 @@ async def jms_dev_run(
             "failed_hosts": failed,
             "revisions": shas,
             "revisions_consistent": revisions_consistent,
+            "revisions_unverified": unverified,
             "hosts": {
                 name: {
                     "ok": res.ok,
