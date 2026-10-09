@@ -154,17 +154,24 @@ class JumpServerAPI:
     async def request(
         self, method: str, path: str, *, params: dict | None = None, json: dict | None = None
     ) -> dict:
-        body = b"" if json is None else __import__("json").dumps(json).encode()
-        # The signature binds the full path *including* the query string.
-        signed_path = path
+        url = self.cfg.api_url(path)
+        # The signature binds the *request target* exactly as it goes on the wire:
+        # the full path including the API base prefix and the query string
+        # (JumpServer verifies against ``request.get_full_path()``). Signing the
+        # bare relative path silently fails every request with "Invalid signature".
+        signed_path = url.split(self.cfg.url.rstrip("/"), 1)[-1] or "/"
         if params:
             qs = str(httpx.QueryParams(params))
-            signed_path = f"{path}?{qs}" if qs else path
+            signed_path = f"{signed_path}?{qs}" if qs else signed_path
 
         headers = self._auth_headers(method, signed_path)
+        body = None
+        if json is not None:
+            body = __import__("json").dumps(json).encode()
+            headers["Content-Type"] = "application/json"
         client = await self.client()
         resp = await client.request(
-            method, self.cfg.api_url(path), params=params, content=body or None, headers=headers
+            method, url, params=params, content=body, headers=headers
         )
         if not resp.is_success:
             raise JumpServerError(f"{method} {path} -> {resp.status_code}: {resp.text[:500]}")
