@@ -378,8 +378,10 @@ async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
             "workspace": ws.name,
             "source": "push",
             "ok": res.ok,
+            # Push never applies `ref` in-container; `sha` (below) is the *local*
+            # tree's HEAD, which is why ref_pinned is always False here.
+            "ref_pinned": False,
             "sha": sha,
-            "ref_pinned": sha is not None,
             "stderr": res.stderr.strip()[:400],
         }
     cmd = ws.delivery_cmd(ref)
