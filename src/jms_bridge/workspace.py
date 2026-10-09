@@ -170,3 +170,30 @@ def parse_pytest_summary(output: str) -> dict[str, dict]:
             "message": message,
         }
     return summary
+
+
+def build_consistency_table(per_workspace: dict[str, dict[str, dict]]) -> dict:
+    """Align per-workspace test results into a chip-vs-chip consistency table.
+
+    ``per_workspace`` maps a workspace name to its :func:`parse_pytest_summary`
+    result. The table has one row per test id (union across workspaces, in
+    first-seen order); a row is ``consistent`` only when *every* workspace ran the
+    test and they all agree on the outcome. ``ok`` is true when no row diverges —
+    i.e. the change behaves identically on every chip.
+    """
+    columns = list(per_workspace)
+    test_ids: dict[str, None] = {}
+    for results in per_workspace.values():
+        for test_id in results:
+            test_ids.setdefault(test_id, None)
+
+    rows = []
+    for test_id in test_ids:
+        outcomes = {ws: per_workspace[ws].get(test_id) for ws in columns}
+        reported = [cell for cell in outcomes.values() if cell is not None]
+        consistent = len(reported) == len(columns) and len(
+            {cell["outcome"] for cell in reported}
+        ) == 1
+        rows.append({"test_id": test_id, "outcomes": outcomes, "consistent": consistent})
+
+    return {"ok": all(row["consistent"] for row in rows), "columns": columns, "rows": rows}

@@ -1,6 +1,11 @@
 import pytest
 
-from jms_bridge.workspace import Workspace, WorkspaceError, parse_pytest_summary
+from jms_bridge.workspace import (
+    Workspace,
+    WorkspaceError,
+    build_consistency_table,
+    parse_pytest_summary,
+)
 
 
 def test_workspace_defaults():
@@ -44,3 +49,18 @@ def test_parse_pytest_summary():
 
 def test_parse_pytest_summary_empty():
     assert parse_pytest_summary("no summary here") == {}
+
+
+def test_table_aligns_by_test_id_and_flags_divergence():
+    per_ws = {
+        "ascend": {"t_a": {"outcome": "PASS"}, "t_b": {"outcome": "FAIL", "message": "x"}},
+        "cuda": {"t_a": {"outcome": "PASS"}, "t_b": {"outcome": "PASS"}},
+        "maca": {"t_a": {"outcome": "SKIP"}},
+    }
+    table = build_consistency_table(per_ws)
+    rows = {r["test_id"]: r for r in table["rows"]}
+    assert rows["t_a"]["consistent"] is False          # PASS/PASS/SKIP
+    assert rows["t_b"]["consistent"] is False          # FAIL vs PASS
+    assert rows["t_b"]["outcomes"]["ascend"]["message"] == "x"
+    assert table["columns"] == ["ascend", "cuda", "maca"]
+    assert table["ok"] is False
