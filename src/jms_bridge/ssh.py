@@ -28,15 +28,20 @@ from pathlib import Path
 from .config import BastionConfig
 from .inventory import Host, InventoryError, wrap_command
 
-#: ssh options shared by every invocation. BatchMode keeps a missing key an error
-#: instead of an interactive prompt (nothing can answer one under an MCP server).
+#: ssh options shared by every invocation.
 _BASE_OPTS = [
-    "-o", "BatchMode=yes",
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ServerAliveInterval=30",
     "-o", "ServerAliveCountMax=6",
     "-o", "ConnectTimeout=30",
 ]
+
+#: Extra options for key/agent auth: keep a missing key an error instead of an
+#: interactive prompt that nothing can answer under an MCP server. Deliberately
+#: NOT applied when authenticating with a password — ``BatchMode=yes`` disables
+#: the password prompt *entirely*, so ``sshpass`` has nothing to feed and every
+#: password-auth connection dies with "Permission denied (password,publickey)".
+_BATCH_MODE = ["-o", "BatchMode=yes"]
 
 
 @dataclass
@@ -115,13 +120,17 @@ class SSHRunner:
 
     def _ssh_argv(self, host: Host, *, tty: bool = False) -> list[str]:
         control = str(self._sock(host))
+        password_auth = bool(self.cfg.ssh_password) and not host.is_direct
         argv = self._sshpass_prefix(host) + ["ssh", *_BASE_OPTS]
+        # Only suppress prompts when we are NOT relying on sshpass to answer one.
+        if not password_auth:
+            argv += _BATCH_MODE
         key = self.cfg.ssh_key
         if host.is_direct and host.ssh_user:
             argv += ["-l", host.ssh_user]
         if key:
             argv += ["-i", str(key), "-o", "IdentitiesOnly=yes"]
-        if self.cfg.ssh_password and not host.is_direct:
+        if password_auth:
             # Password auth to the bastion; the key, if any, may still be tried first.
             argv += ["-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password"]
         argv += [
