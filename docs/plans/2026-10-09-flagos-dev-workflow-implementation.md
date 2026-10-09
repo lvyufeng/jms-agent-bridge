@@ -753,3 +753,31 @@ table comes back with per-test rows, not an error.
 
 **Step 4:** Record what was learned (container name, repo path, UT duration vs the 200s
 TTFB) back into the design doc's "Open questions" section, and commit.
+
+---
+
+## Post-implementation fixes (authoritative)
+
+The task text above is the *original* plan; adversarial review of the shipped code found
+defects it did not anticipate. Where the two disagree, the code and this list win:
+
+- **Delivery pins the fetched commit.** `delivery_cmd` ends with
+  `git checkout -f --detach FETCH_HEAD`, not `git checkout <ref>`. A plain
+  `checkout <ref>` re-selects a *stale local branch* of the same name on every re-sync
+  (so chips test old code), and without `-f` a dirty working tree survives the checkout.
+  Both were silent `ok=true` stale-code holes.
+- **An empty result is not success.** `build_consistency_table` returns
+  `ok = bool(rows) and all(...)` — `all([])` is `True`, which had made a run where pytest
+  collected nothing (bad cwd, missing pytest, usage error) report green.
+- **Per-chip failure and revision are part of `ok`.** `jms_dev_run` fails the run when any
+  chip exits nonzero / times out (`failed_hosts`), or when any chip's revision could not be
+  read (`revisions_unverified`), or when chips disagree on the commit (`revisions`).
+  Revisions are captured by appending `&& git rev-parse HEAD` to the delivery command (one
+  round trip); the sha is validated against `^[0-9a-f]{7,40}$` so shell banners on stdout
+  are not mistaken for a revision.
+- **`container_cmd(command, with_proxy=False)`** is used for the UT run — the delivery
+  proxy must not leak into the test environment on proxy-git chips only.
+- **Container names are validated with `fullmatch`** (`re.match` + `$` accepts a trailing
+  newline).
+- **`ut_cmd` overrides must emit `-rA` summary lines** — the consistency table is parsed
+  from them, so a custom command that prints nothing parseable yields `ok=false`.

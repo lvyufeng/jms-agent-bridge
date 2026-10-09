@@ -123,7 +123,7 @@ claude mcp add jms-bridge -- jms-bridge serve
 
 ## Tools
 
-14 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
+17 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
 metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 
 | Tool | Plane | What it does |
@@ -139,8 +139,12 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free; estimates `world_size` |
 | `jms_cluster_plan` | SSH | Partition targets into backend-homogeneous **islands** (HCCL/NCCL) |
 | `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous |
+| `jms_dev_sync` | SSH | Deliver a git `ref` into every selected workspace's container (git / proxy-git / push) |
+| `jms_dev_run` | SSH | Deliver `ref`, run the UT suite in every container, return **one cross-chip consistency table** |
+| `jms_dev_logs` | SSH | Full traceback for one `test_id` on one workspace (drill into a FAIL) |
 
 Selectors accept host names, group names, or tags — `["cluster"]`, `["gpu"]`, `["all"]`.
+The `jms_dev_*` tools instead select **workspaces** by name, tag, or `all`.
 
 ## A Torch-FL run, end to end
 
@@ -206,6 +210,81 @@ The island *exchange* (all-reduce across islands, or a parameter server) is
 application logic you write in the training script; the bridge gives each island its
 launch and rendezvous. For a plain same-chip cluster this collapses to a single island
 and a normal `jms_cluster_submit` — no federation needed.
+
+## The flagos development loop
+
+Training is the *slow* loop (`jms_submit_job` / `jms_cluster_submit`). Development is
+the *fast* one: **write once, verify on every chip.** For a multi-backend plugin like
+Torch-FL, "it works" is only true when the *same* code path passes the *same* UT suite
+on every accelerator — so the loop's whole job is to make that one action and surface
+any cross-chip divergence at a glance.
+
+A **workspace** binds the four things that must agree across chips — host, container,
+repo, and how to run UT — and is declared in the inventory under a `workspaces:` key:
+
+```yaml
+workspaces:
+  fl-ascend:
+    host: ascend-910c
+    container: lvyufeng-torch-fl     # same container name on every host
+    repo: /work/Torch-FL             # path *inside* the container
+    source: git                      # git | proxy-git | push
+    tags: [ascend]
+
+  fl-4090:
+    host: node-4090-1
+    container: lvyufeng-torch-fl
+    repo: /work/Torch-FL
+    source: push                     # this host can't reach GitHub
+    mount: /srv/torch-fl             # host dir bind-mounted to `repo`
+    tags: [cuda]
+```
+
+Then the loop is three calls:
+
+```text
+jms_dev_sync(["flagos-cluster"], ref="feat/unify-softmax")   # deliver the ref
+jms_dev_run(["flagos-cluster"],  ref="feat/unify-softmax")   # → consistency table
+jms_dev_logs("fl-ascend", "tests/test_ops.py::test_layer_norm")  # full traceback on a FAIL
+```
+
+`jms_dev_run` returns one table, aligned by test id across every chip:
+
+```text
+test_id                  fl-ascend   fl-4090
+test_softmax             PASS        PASS
+test_layer_norm          PASS        FAIL   ← AssertionError: max diff 1e-3
+test_gemm_dtype          SKIP        PASS   ← divergence: skipped on one backend
+```
+
+A row is **consistent** only when *every* workspace ran the test and they all agree; a
+chip that skipped a case shows `SKIP`, not a silent omission. `ok` is true only when
+nothing diverged, no chip failed or timed out, and every chip is confirmed to be at the
+**same commit** (`revisions`). A FAIL carries a one-line assertion message inline — enough
+to decide whether to dig; use `jms_dev_logs` for the full traceback.
+
+Delivery is per-workspace because reachability differs (direct GitHub, behind a proxy,
+or offline); all three reduce to *"make the container's repo be at `ref`"*:
+
+| `source` | Action |
+|---|---|
+| `git` | in container: `git fetch origin <ref> --depth=1 && git checkout -f --detach FETCH_HEAD` |
+| `proxy-git` | same, with `http_proxy`/`https_proxy` injected into the *delivery* command |
+| `push` | the bridge rsyncs the local tree into the host `mount` (offline fallback) |
+
+Two things worth knowing:
+
+- **`ut_cmd` must emit pytest `-rA` lines.** The consistency table is parsed from
+  `PASSED/FAILED/ERROR/SKIPPED … <id> - <msg>` short-summary lines; a custom `ut_cmd`
+  that does not print them yields an empty table and `ok=false` (that is deliberate — an
+  empty result must never read as "everything passed").
+- **`push` cannot pin a revision in-container.** It has no git in the container, so its
+  reported `revisions` entry is the *local* tree's HEAD; `jms_dev_run` still checks that
+  every chip — push included — reported a revision, and fails the run if one did not.
+
+The git hub is your fork: the agent pushes to `lvyufeng/torch-fl` (the `ref` the
+containers fetch), and once the table is green all the way across, opens the PR to
+`flagos-ai/torch-fl`. Registers/indices never cross the bastion by hand.
 
 ## Design notes
 
