@@ -232,7 +232,12 @@ class Inventory:
 
         # Imported here rather than at module scope: workspace.py needs
         # shell_quote from this module, so a top-level import would be circular.
-        from .workspace import DEFAULT_UT_CMD, Workspace, WorkspaceError
+        from .workspace import (
+            DEFAULT_CONTAINER,
+            DEFAULT_UT_CMD,
+            Workspace,
+            WorkspaceError,
+        )
 
         raw_workspaces = data.get("workspaces") or {}
         workspaces: dict[str, Workspace] = {}
@@ -248,7 +253,7 @@ class Inventory:
                 workspaces[name] = Workspace(
                     name=name,
                     host=host,
-                    container=spec.get("container", "lvyufeng-torch-fl"),
+                    container=spec.get("container", DEFAULT_CONTAINER),
                     repo=spec.get("repo", ""),
                     source=spec.get("source", "git"),
                     proxy=spec.get("proxy"),

@@ -40,7 +40,7 @@ def test_mcp_server_lists_all_tools():
         "jms_probe", "jms_exec", "jms_sync_push", "jms_sync_pull",
         "jms_submit_job", "jms_job_status", "jms_job_logs", "jms_job_cancel",
         "jms_cluster_preflight", "jms_cluster_plan", "jms_cluster_submit",
-        "jms_dev_sync", "jms_dev_run", "jms_dev_logs",
+        "jms_dev_sync", "jms_dev_run", "jms_dev_logs", "jms_dev_discover",
     }
 
     async def run():
@@ -262,3 +262,73 @@ def test_dev_run_mixed_revisions_is_not_ok(monkeypatch):
     assert r["revisions"] == {"a": "abc1234", "b": "def4567"}
     assert r["revisions_consistent"] is False
     assert r["ok"] is False
+
+
+# --- jms_dev_discover ---------------------------------------------------------------
+
+_DISCOVERED = (
+    "JMSD container=lvyufeng-torch-fl\n"
+    "JMSD running=1\n"
+    "JMSD inner=1\n"
+    "JMSD python=/usr/local/python3.11.15/bin/python3|3.11.15|8.4.2\n"
+    "JMSD repo=/public-flash/lvyufeng/PyTorch-Plugin-FL\n"
+    "JMSD remote=git@github.com:lvyufeng/PyTorch-Plugin-FL.git\n"
+    "JMSD branch=flagos-plugin\n"
+    "JMSD sha=abc1234def5678\n"
+    "JMSD reachable=1\n"
+)
+
+
+def _install_hosts(monkeypatch, hosts, plan):
+    inv = Inventory(
+        hosts={h.name: h for h in hosts}, groups={}, workspaces={}
+    )
+    fake = _FakeSSH(plan)
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", fake)
+    return fake
+
+
+def test_dev_discover_emits_workspaces(monkeypatch):
+    from jms_bridge.inventory import Host
+
+    fake = _install_hosts(
+        monkeypatch,
+        [Host(name="ascend-910c-108", login="u", asset_id="A", tags=["ascend"])],
+        {"docker inspect": (0, _DISCOVERED, "")},
+    )
+    r = asyncio.run(S.jms_dev_discover(["all"]))
+    assert r["ok"] is True
+    assert r["workspaces"]["fl-ascend-910c-108"]["repo"] == \
+        "/public-flash/lvyufeng/PyTorch-Plugin-FL"
+    assert r["workspaces"]["fl-ascend-910c-108"]["tags"] == ["ascend"]
+    assert "workspaces:" in r["yaml"]
+    # discovery must not source the host env or cd into the host workdir
+    assert all(c["env_setup"] is False and c["workdir"] is False for c in fake.calls)
+
+
+def test_dev_discover_rejects_bad_container(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover(["all"], container="foo; id"))
+    assert r["ok"] is False
+    assert "invalid container" in r["error"]
+
+
+def test_dev_discover_rejects_bad_source(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover(["all"], source="ftp"))
+    assert r["ok"] is False
+    assert "source must be" in r["error"]
+
+
+def test_dev_discover_no_match_is_not_ok(monkeypatch):
+    from jms_bridge.inventory import Host
+
+    _install_hosts(
+        monkeypatch,
+        [Host(name="h1", login="u", asset_id="A")],
+        {"docker inspect": (0, "JMSD container_absent=1\n", "")},
+    )
+    r = asyncio.run(S.jms_dev_discover(["all"]))
+    assert r["ok"] is False
+    assert r["skipped"] == ["h1"]

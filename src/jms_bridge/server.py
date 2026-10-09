@@ -31,9 +31,11 @@ from .cluster import (
     resolve_rendezvous,
 )
 from .config import BastionConfig, load_config
+from .discover import DEFAULT_REPO_MATCH
 from .inventory import Host, Inventory, shell_quote
 from .jobs import JobManager
 from .ssh import SSHRunner
+from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
 log = logging.getLogger("jms_bridge.server")
 
@@ -571,6 +573,84 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
         "exit_code": res.exit_code,
         "output": res.stdout[-20000:],
         "stderr": res.stderr.strip()[:2000],
+    }
+
+
+@server.tool()
+async def jms_dev_discover(
+    targets: list[str],
+    container: str = DEFAULT_CONTAINER,
+    source: str = "git",
+    repo_match: str = DEFAULT_REPO_MATCH,
+    max_depth: int = 5,
+    timeout: float = 120.0,
+) -> dict:
+    """Inspect each host's container and emit a paste-ready `workspaces:` block.
+
+    This is the front door to the dev loop. `jms_dev_run` needs to know, per chip,
+    which container holds the repo, where the checkout lives inside it, and whether
+    the container can reach the git remote — and that is exactly the per-host
+    busywork worth automating. One call fans out `docker exec` discovery to every
+    host and returns the inventory YAML to paste into `hosts.yaml`.
+
+    `container` is normally the same name on every host (`lvyufeng-torch-fl`);
+    `source` seeds the `source:` field (git / proxy-git / push) and `repo_match` is
+    a case-insensitive substring a checkout path must contain. Every host's raw
+    findings are in `hosts`; anything the probe could not confirm is a `warnings`
+    entry (an unreachable origin, a missing pytest, a container that is not there)
+    and hosts without the container or without a match are listed in `skipped` —
+    `ok` is true only when at least one workspace was emitted.
+
+    The emitted `source` is a *guess* from reachability alone; confirm it (and add
+    `proxy` / `mount` / `local`) before relying on it.
+    """
+    from .discover import (
+        build_discovery_script,
+        parse_discovery,
+        render_workspaces_yaml,
+    )
+
+    if not CONTAINER_RE.fullmatch(container):
+        return {"ok": False, "error": f"invalid container name {container!r}"}
+    if source not in SOURCES:
+        return {"ok": False, "error": f"source must be one of {SOURCES}, got {source!r}"}
+
+    hosts = _resolve(targets)
+    script = build_discovery_script(container, repo_match=repo_match, max_depth=max_depth)
+    results = await asyncio.gather(
+        *(
+            # Discovery must not depend on the host toolchain (env_setup) nor the
+            # host workdir — it inspects a container, which is host-toolchain-free.
+            _ssh().exec_on(
+                h, script, timeout=timeout, workdir=False, env_setup=False
+            )
+            for h in hosts
+        )
+    )
+    reports = [
+        {
+            "host": res.host,
+            "exit_code": res.exit_code,
+            "report": parse_discovery(res.stdout),
+            "stderr": res.stderr.strip()[:400],
+        }
+        for res in results
+    ]
+    rendered = render_workspaces_yaml(
+        reports,
+        container=container,
+        source=source,
+        host_tags={h.name: h.tags for h in hosts},
+    )
+    return {
+        "ok": bool(rendered["workspaces"]),
+        "container": container,
+        "source": source,
+        "hosts": reports,
+        "skipped": rendered["skipped"],
+        "warnings": rendered["warnings"],
+        "workspaces": rendered["workspaces"],
+        "yaml": rendered["yaml"],
     }
 
 

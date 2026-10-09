@@ -123,7 +123,7 @@ claude mcp add jms-bridge -- jms-bridge serve
 
 ## Tools
 
-17 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
+18 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
 metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 
 | Tool | Plane | What it does |
@@ -139,6 +139,7 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free; estimates `world_size` |
 | `jms_cluster_plan` | SSH | Partition targets into backend-homogeneous **islands** (HCCL/NCCL) |
 | `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous |
+| `jms_dev_discover` | SSH | Inspect each host's container and emit a paste-ready `workspaces:` block |
 | `jms_dev_sync` | SSH | Deliver a git `ref` into every selected workspace's container (git / proxy-git / push) |
 | `jms_dev_run` | SSH | Deliver `ref`, run the UT suite in every container, return **one cross-chip consistency table** |
 | `jms_dev_logs` | SSH | Full traceback for one `test_id` on one workspace (drill into a FAIL) |
@@ -241,8 +242,25 @@ workspaces:
     tags: [cuda]
 ```
 
-Then the loop is three calls (workspaces are selected by name, by tag, or by `all` —
-unlike hosts they have no group concept):
+You rarely need to write that block by hand. `jms_dev_discover` inspects a whole host
+set and emits it for you — which container exists, where the checkout lives inside it,
+which python/pytest is there, and whether the container can reach its git remote:
+
+```text
+jms_dev_discover(["cluster"], container="lvyufeng-torch-fl")   # -> {workspaces:{...}, yaml:"..."}
+```
+
+It returns a `workspaces:` YAML fragment to paste into `hosts.yaml` (one workspace per
+host, `fl-<host>`, plus `fl-<host>-2` if a host has two checkouts), alongside the raw
+per-host findings in `hosts`. The emitted `source:` is a **guess from reachability
+alone**, so anything it could not confirm — a container it could not inspect, an
+unreachable origin, a missing pytest — comes back as a `warnings` entry, and a host
+without the container or without a matching checkout is listed in `skipped` rather than
+emitted as a half-formed entry. Confirm the guess (`source`, and any `proxy` / `mount` /
+`local`) before relying on it.
+
+Once the block is in the inventory, the loop is three calls (workspaces are selected by
+name, by tag, or by `all` — unlike hosts they have no group concept):
 
 ```text
 jms_dev_sync(["all"], ref="feat/unify-softmax")   # deliver the ref to every workspace
