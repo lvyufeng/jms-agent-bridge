@@ -40,7 +40,8 @@ def test_mcp_server_lists_all_tools():
         "jms_probe", "jms_exec", "jms_sync_push", "jms_sync_pull",
         "jms_submit_job", "jms_job_status", "jms_job_logs", "jms_job_cancel",
         "jms_cluster_preflight", "jms_cluster_plan", "jms_cluster_submit",
-        "jms_dev_sync", "jms_dev_run", "jms_dev_logs",
+        "jms_dev_sync", "jms_dev_run", "jms_dev_logs", "jms_dev_discover",
+        "jms_inventory_reload",
     }
 
     async def run():
@@ -81,7 +82,8 @@ class _FakeSSH:
             if key in command:
                 code, out, err = value
                 break
-        return ExecResult(host.name, code, out, err)
+        # Mirror the real runner: a timeout surfaces as exit 124 + timed_out=True.
+        return ExecResult(host.name, code, out, err, timed_out=(code == 124))
 
     async def rsync(self, host, local, remote, **kw):
         self.calls.append({"host": host.name, "rsync": (local, remote)})
@@ -105,10 +107,20 @@ def _ws(name="w1", host="h1"):
     return Workspace(name=name, host=host, container="c", repo="/work/Torch-FL", source="git")
 
 
+#: A UT stdout that also carries a *consistent* attestation record, so the default
+#: fixture behaves like a fleet of chips actually running the same code path.
+_UT_OK = (
+    "PASSED tests/t.py::test_x\n"
+    "1 passed\n"
+    "JMSA backends_read=1\n"
+    "JMSA backend=test_x = flaggems\n"
+)
+
+
 def test_dev_run_all_pass_is_ok(monkeypatch):
     fake = _install(monkeypatch, [_ws("a", "h1"), _ws("b", "h2")], {
         "git fetch": (0, "abc1234\n", ""),
-        "pytest": (0, "PASSED tests/t.py::test_x\n1 passed\n", ""),
+        "pytest": (0, _UT_OK, ""),
     })
     r = asyncio.run(S.jms_dev_run(["all"], "main"))
     assert r["ok"] is True
@@ -117,6 +129,35 @@ def test_dev_run_all_pass_is_ok(monkeypatch):
     # the UT run must not source the host env, and must be proxyless
     run_calls = [c for c in fake.calls if "pytest" in c["command"]]
     assert run_calls and all(c["env_setup"] is False for c in run_calls)
+
+
+def test_dev_run_command_carries_the_probe_and_preserves_exit(monkeypatch):
+    # The core wiring: the composed container command must (a) actually include the
+    # attestation probe, (b) capture the UT exit status and re-raise it, and (c) not
+    # let a repo path that begins with '-' be read as a `cd` option.
+    fake = _install(monkeypatch, [_ws("a", "h1")], {
+        "git fetch": (0, "abc1234\n", ""),
+        "pytest": (0, _UT_OK, ""),
+    })
+    asyncio.run(S.jms_dev_run(["all"], "main"))
+    ut = next(c["command"] for c in fake.calls if "pytest" in c["command"])
+    assert "set +eu +o pipefail" in ut           # the probe is present
+    assert "rc=$?" in ut and "exit $rc" in ut    # exit status is preserved
+    assert "set -o pipefail" in ut               # piped ut_cmd cannot mask a failure
+    assert "cd -- " in ut and "/work/Torch-FL" in ut  # end-of-options marker + repo
+    # the probe reads the build identity / code-path map, i.e. it is the real script
+    assert "torch_fl/_build_config.py" in ut and "torch_fl/backends.conf" in ut
+
+
+def test_dev_run_empty_ut_cmd_falls_back_to_default(monkeypatch):
+    # A `ut_cmd:` YAML null override must not build a `();` syntax error.
+    fake = _install(monkeypatch, [_ws("a", "h1")], {
+        "git fetch": (0, "abc1234\n", ""),
+        "pytest": (0, _UT_OK, ""),
+    })
+    asyncio.run(S.jms_dev_run(["all"], "main", ut_cmd=""))
+    ut = next(c["command"] for c in fake.calls if "pytest" in c["command"])
+    assert "(set -o pipefail; python -m pytest" in ut  # default used, no empty subshell
 
 
 def test_dev_run_nonzero_exit_is_not_ok(monkeypatch):
@@ -139,7 +180,7 @@ def test_dev_run_git_chip_without_sha_fails_delivery(monkeypatch):
             self.calls.append({"host": host.name, "command": command})
             if "git fetch" in command:
                 return ExecResult(host.name, 0, "Welcome to the container\n", "")
-            return ExecResult(host.name, 0, "PASSED tests/t.py::test_x\n", "")
+            return ExecResult(host.name, 0, _UT_OK, "")
 
     inv = Inventory(
         hosts={"h1": Host(name="h1", login="u", asset_id="A"),
@@ -152,8 +193,11 @@ def test_dev_run_git_chip_without_sha_fails_delivery(monkeypatch):
     r = asyncio.run(S.jms_dev_run(["all"], "main"))
     assert r["ok"] is False
     assert r["stage"] == "deliver"
-    # The failure shape stays readable by an agent that keys on `rows`.
-    for key in ("rows", "columns", "revisions", "failed_hosts"):
+    # The failure shape stays readable by an agent that keys on `rows`, and carries
+    # the same attestation keys as the success path so a uniform reader doesn't KeyError.
+    for key in ("rows", "columns", "revisions", "failed_hosts",
+                "attestation", "attestation_consistent", "attestation_diverged",
+                "attestation_unverified", "hosts"):
         assert key in r
     assert r["failed_hosts"] == ["a", "b"]
 
@@ -203,7 +247,7 @@ def test_dev_run_push_without_local_sha_is_unverified(monkeypatch):
     )
     fake = _FakeSSH({
         "git fetch": (0, "abc1234\n", ""),
-        "pytest": (0, "PASSED tests/t.py::test_x\n", ""),
+        "pytest": (0, _UT_OK, ""),
     })
     monkeypatch.setitem(S._state, "inv", inv)
     monkeypatch.setitem(S._state, "ssh", fake)
@@ -221,7 +265,7 @@ def test_dev_run_banner_after_sha_is_ignored(monkeypatch):
             self.calls.append({"host": host.name, "command": command})
             if "git fetch" in command:
                 return ExecResult(host.name, 0, "abc1234\nGoodbye, see you soon!\n", "")
-            return ExecResult(host.name, 0, "PASSED tests/t.py::test_x\n", "")
+            return ExecResult(host.name, 0, _UT_OK, "")
 
     inv = Inventory(
         hosts={"h1": Host(name="h1", login="u", asset_id="A"),
@@ -239,16 +283,13 @@ def test_dev_run_banner_after_sha_is_ignored(monkeypatch):
 def test_dev_run_mixed_revisions_is_not_ok(monkeypatch):
     # Two chips, one delivery pins a different commit -> not consistent even though
     # every parsed outcome agrees and both exited zero.
-    def plan_for(cmd):
-        return (0, "PASSED tests/t.py::test_x\n1 passed\n", "")
-
     class _RevSSH(_FakeSSH):
         async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
             self.calls.append({"host": host.name, "command": command})
             if "git fetch" in command:
                 sha = "abc1234" if host.name == "h1" else "def4567"
                 return ExecResult(host.name, 0, sha + "\n", "")
-            return ExecResult(host.name, 0, plan_for(command)[1], "")
+            return ExecResult(host.name, 0, _UT_OK, "")
 
     inv = Inventory(
         hosts={"h1": Host(name="h1", login="u", asset_id="A"),
@@ -262,3 +303,206 @@ def test_dev_run_mixed_revisions_is_not_ok(monkeypatch):
     assert r["revisions"] == {"a": "abc1234", "b": "def4567"}
     assert r["revisions_consistent"] is False
     assert r["ok"] is False
+
+
+def test_dev_run_same_sha_but_different_code_path_is_not_ok(monkeypatch):
+    # The whole point of attestation: two chips at the SAME commit, every test
+    # PASSing, but dispatching the op to a different backend. A sha-only check
+    # would read green; the run must be not-ok and name the divergence.
+    class _PathSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            self.calls.append({"host": host.name, "command": command})
+            if "git fetch" in command:
+                return ExecResult(host.name, 0, "abc1234\n", "")
+            backend = "flaggems" if host.name == "h1" else "flagos_python"
+            return ExecResult(host.name, 0, f"PASSED tests/t.py::test_x\n"
+                                            f"JMSA backends_read=1\n"
+                                            f"JMSA backend=softmax = {backend}\n", "")
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={},
+        workspaces={"a": _ws("a", "h1"), "b": _ws("b", "h2")},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _PathSSH({}))
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["revisions_consistent"] is True   # same commit...
+    assert r["attestation_consistent"] is False
+    assert "backend_map_hash" in r["attestation_diverged"]
+    assert r["ok"] is False
+
+
+def test_dev_run_unreadable_attestation_is_unverified_not_ok(monkeypatch):
+    # No attestation lines at all (an env where the probe could not run): the run
+    # must not claim the code paths agree.
+    _install(monkeypatch, [_ws("a", "h1"), _ws("b", "h2")], {
+        "git fetch": (0, "abc1234\n", ""),
+        "pytest": (0, "PASSED tests/t.py::test_x\n1 passed\n", ""),
+    })
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["attestation_consistent"] is False
+    assert sorted(r["attestation_unverified"]) == ["a", "b"]
+    assert r["ok"] is False
+
+
+# --- jms_dev_discover ---------------------------------------------------------------
+
+_DISCOVERED = (
+    "JMSD container=lvyufeng-torch-fl\n"
+    "JMSD running=1\n"
+    "JMSD inner=1\n"
+    "JMSD python=/usr/local/python3.11.15/bin/python3|3.11.15|8.4.2\n"
+    "JMSD repo=/public-flash/lvyufeng/PyTorch-Plugin-FL\n"
+    "JMSD remote=git@github.com:lvyufeng/PyTorch-Plugin-FL.git\n"
+    "JMSD branch=flagos-plugin\n"
+    "JMSD sha=abc1234def5678\n"
+    "JMSD reachable=ok\n"
+)
+
+
+def _install_hosts(monkeypatch, hosts, plan):
+    inv = Inventory(
+        hosts={h.name: h for h in hosts}, groups={}, workspaces={}
+    )
+    fake = _FakeSSH(plan)
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", fake)
+    return fake
+
+
+def test_dev_discover_emits_workspaces(monkeypatch):
+    from jms_bridge.inventory import Host
+
+    fake = _install_hosts(
+        monkeypatch,
+        [Host(name="ascend-910c-108", login="u", asset_id="A", tags=["ascend"])],
+        {"docker exec": (0, _DISCOVERED, "")},
+    )
+    r = asyncio.run(S.jms_dev_discover(["all"]))
+    assert r["ok"] is True
+    assert r["workspaces"]["fl-ascend-910c-108"]["repo"] == \
+        "/public-flash/lvyufeng/PyTorch-Plugin-FL"
+    assert r["workspaces"]["fl-ascend-910c-108"]["tags"] == ["ascend"]
+    assert "workspaces:" in r["yaml"]
+    # The command actually sent must be the real discovery script, not a stub.
+    sent = fake.calls[0]["command"]
+    assert "docker exec" in sent and "-print0" in sent and "PyTorch" not in sent
+    # discovery must not source the host env or cd into the host workdir
+    assert all(c["env_setup"] is False and c["workdir"] is False for c in fake.calls)
+
+
+def test_dev_discover_rejects_bad_container(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover(["all"], container="foo; id"))
+    assert r["ok"] is False
+    assert "invalid container" in r["error"]
+
+
+def test_dev_discover_rejects_bad_source(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover(["all"], source="ftp"))
+    assert r["ok"] is False
+    assert "source must be" in r["error"]
+
+
+def test_dev_discover_requires_proxy_for_proxy_git(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover(["all"], source="proxy-git"))
+    assert r["ok"] is False
+    assert "proxy" in r["error"]
+
+
+def test_dev_discover_requires_mount_and_local_for_push(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_dev_discover(["all"], source="push", mount="/srv/fl"))
+    assert r["ok"] is False
+    assert "mount" in r["error"] and "local" in r["error"]
+
+
+def test_dev_discover_no_match_is_not_ok(monkeypatch):
+    from jms_bridge.inventory import Host
+
+    _install_hosts(
+        monkeypatch,
+        [Host(name="h1", login="u", asset_id="A")],
+        {"docker exec": (0, "JMSD container_absent=1\n", "")},
+    )
+    r = asyncio.run(S.jms_dev_discover(["all"]))
+    assert r["ok"] is False
+    assert r["skipped"] == ["h1"]
+
+
+def test_dev_discover_partial_is_not_ok(monkeypatch):
+    from jms_bridge.inventory import Host
+
+    # one healthy host + one with the container absent -> ok must be False even
+    # though workspaces were emitted for the healthy one.
+    class _TwoSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            self.calls.append({"host": host.name, "command": command})
+            if host.name == "h2":
+                return ExecResult(host.name, 0, "JMSD container_absent=1\n", "")
+            return ExecResult(host.name, 0, _DISCOVERED, "")
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={}, workspaces={},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _TwoSSH({}))
+    r = asyncio.run(S.jms_dev_discover(["all"]))
+    assert r["ok"] is False
+    assert "fl-h1" in r["workspaces"]
+    assert r["skipped"] == ["h2"]
+
+
+def test_dev_discover_timeout_is_reported_as_timeout(monkeypatch):
+    from jms_bridge.inventory import Host
+
+    _install_hosts(
+        monkeypatch,
+        [Host(name="h1", login="u", asset_id="A")],
+        {"docker exec": (124, "", "timed out")},
+    )
+    r = asyncio.run(S.jms_dev_discover(["all"]))
+    assert r["ok"] is False
+    assert any("timed out" in w for w in r["warnings"])
+
+
+# --- jms_inventory_reload -----------------------------------------------------------
+
+
+def test_inventory_reload_rereads_and_summarises(monkeypatch):
+    # A cached inventory (from an earlier tool call) must be dropped and re-read, so a
+    # freshly pasted workspaces block is visible without an MCP restart.
+    monkeypatch.setitem(S._state, "inv", Inventory(hosts={}, groups={}, workspaces={}))
+
+    fresh = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A")},
+        groups={"cluster": ["h1"]},
+        workspaces={"fl-h1": _ws("fl-h1", "h1")},
+    )
+    monkeypatch.setattr(Inventory, "load", classmethod(lambda cls, path=None: fresh))
+
+    r = asyncio.run(S.jms_inventory_reload())
+    assert r["ok"] is True
+    assert r["hosts"] == ["h1"]
+    assert r["workspaces"] == ["fl-h1"]
+    assert r["groups"] == {"cluster": ["h1"]}
+    # the cache now holds the fresh inventory, not the stale empty one
+    assert S._state["inv"] is fresh
+
+
+def test_inventory_reload_surfaces_a_load_error(monkeypatch):
+    monkeypatch.setitem(S._state, "inv", Inventory(hosts={}, groups={}, workspaces={}))
+
+    def boom(cls, path=None):
+        raise RuntimeError("inventory /x/hosts.yaml has no 'hosts:' section")
+
+    monkeypatch.setattr(Inventory, "load", classmethod(boom))
+    r = asyncio.run(S.jms_inventory_reload())
+    assert r["ok"] is False
+    assert "no 'hosts:'" in r["error"]

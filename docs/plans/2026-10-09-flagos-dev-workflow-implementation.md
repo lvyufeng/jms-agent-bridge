@@ -781,3 +781,27 @@ defects it did not anticipate. Where the two disagree, the code and this list wi
   newline).
 - **`ut_cmd` overrides must emit `-rA` summary lines** — the consistency table is parsed
   from them, so a custom command that prints nothing parseable yields `ok=false`.
+---
+
+## Follow-up: `jms_dev_discover` (added 2026-10-10)
+
+The plan above treats "find the container name and the repo path per host" as Step 1–2 —
+manual, per host, exactly the busywork the bridge exists to remove. `jms_dev_discover`
+automates it: one call fans `docker exec` discovery across a host set and emits a
+paste-ready `workspaces:` block.
+
+- **`src/jms_bridge/discover.py`** — pure, testable core: `build_discovery_script`
+  (two shell layers: host wrapper relaxes `set -euo pipefail`, container script is
+  single-quoted via `shell_quote` so the host never expands the container's `$vars` —
+  the bug that made the hand-rolled version die with `R: unbound variable`),
+  `parse_discovery` (parses `JMSD `-prefixed lines), `render_workspaces_yaml`.
+- **The emitted `source:` is a guess from reachability alone** — every unconfirmed fact
+  (container not inspectable, unreachable origin, no pytest) is a `warnings` entry, and a
+  host without the container or without a matching checkout goes to `skipped`, never a
+  half-formed entry that only fails later at delivery time.
+- **Live-verified on `ascend-910c-108`**: found container `lvyufeng-torch-fl`, repo
+  `/public-flash/lvyufeng/PyTorch-Plugin-FL`, `source: git` (origin reachable, no
+  unreachable warning), and correctly flagged the known "no pytest" env gap.
+- `_CONTAINER_RE` was exported as `CONTAINER_RE` and `DEFAULT_CONTAINER` added to
+  `workspace.py`, so the tool validates a caller-supplied container against the same rule
+  instead of duplicating it.

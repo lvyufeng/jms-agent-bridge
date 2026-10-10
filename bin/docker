@@ -1,0 +1,2 @@
+#!/bin/bash
+case "$1" in ps) echo x;exit 0;; exec) shift;shift;exec "$@";; *) exit 0;; esac

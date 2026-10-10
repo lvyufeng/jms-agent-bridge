@@ -34,9 +34,14 @@ from .inventory import shell_quote
 #: How a workspace receives code.
 SOURCES = ("git", "proxy-git", "push")
 
+#: The container name used across the flagos fleet; the same name on every chip is
+#: what lets one tool call address "the repo" without per-host config.
+DEFAULT_CONTAINER = "lvyufeng-torch-fl"
+
 #: Docker container names: ``[a-zA-Z0-9][a-zA-Z0-9_.-]*`` (enforced below, since the
-#: name is interpolated into ``docker exec`` without quoting).
-_CONTAINER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+#: name is interpolated into ``docker exec`` without quoting). Public because the
+#: discover tool validates a caller-supplied container against the same rule.
+CONTAINER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
 
 #: Default unit-test command; overridable per workspace. Any override MUST emit
 #: pytest ``-rA`` short-summary lines (``PASSED/FAILED/ERROR/SKIPPED ... <id> - <msg>``)
@@ -70,7 +75,7 @@ class Workspace:
     tags: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if not _CONTAINER_RE.fullmatch(self.container):
+        if not CONTAINER_RE.fullmatch(self.container):
             raise WorkspaceError(
                 f"workspace {self.name!r}: invalid container {self.container!r} "
                 "(must match [a-zA-Z0-9][a-zA-Z0-9_.-]*)"

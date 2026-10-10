@@ -123,7 +123,7 @@ claude mcp add jms-bridge -- jms-bridge serve
 
 ## Tools
 
-17 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
+19 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
 metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 
 | Tool | Plane | What it does |
@@ -139,9 +139,11 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free; estimates `world_size` |
 | `jms_cluster_plan` | SSH | Partition targets into backend-homogeneous **islands** (HCCL/NCCL) |
 | `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous |
+| `jms_dev_discover` | SSH | Inspect each host's container and emit a paste-ready `workspaces:` block |
 | `jms_dev_sync` | SSH | Deliver a git `ref` into every selected workspace's container (git / proxy-git / push) |
 | `jms_dev_run` | SSH | Deliver `ref`, run the UT suite in every container, return **one cross-chip consistency table** |
 | `jms_dev_logs` | SSH | Full traceback for one `test_id` on one workspace (drill into a FAIL) |
+| `jms_inventory_reload` | — | Re-read `hosts.yaml` after editing it (drops the cached inventory; no restart) |
 
 Selectors accept host names, group names, or tags — `["cluster"]`, `["gpu"]`, `["all"]`.
 The `jms_dev_*` tools instead select **workspaces** by name, tag, or `all`.
@@ -241,13 +243,41 @@ workspaces:
     tags: [cuda]
 ```
 
-Then the loop is three calls (workspaces are selected by name, by tag, or by `all` —
-unlike hosts they have no group concept):
+You rarely need to write that block by hand. `jms_dev_discover` inspects a whole host
+set and emits it for you — which container exists, where the checkout lives inside it,
+which python/pytest is there, and whether the container can reach its git remote:
 
 ```text
+jms_dev_discover(["cluster"], container="lvyufeng-torch-fl")   # -> {workspaces:{...}, yaml:"..."}
+```
+
+It returns a `workspaces:` YAML fragment to paste into `hosts.yaml` (one workspace per
+host, `fl-<host>`, plus `fl-<host>-2` if a host has two checkouts), alongside the raw
+per-host findings in `hosts`. The emitted `source:` is a **guess from reachability
+alone**, so anything it could not confirm — a container it could not inspect, an
+unreachable origin, a missing pytest — comes back as a `warnings` entry, and a host
+without the container or without a matching checkout is listed in `skipped` rather than
+emitted as a half-formed entry. Confirm the guess (`source`, and any `proxy` / `mount` /
+`local`) before relying on it. `ok` is true only when every requested host produced at
+least one workspace — a skipped host means the picture is incomplete.
+
+Because the block must be *loadable*, the tool refuses a `source` it cannot complete:
+`proxy-git` requires `proxy`, and `push` requires both `mount` and `local`, so pass them
+(`jms_dev_discover(["all"], source="proxy-git", proxy="http://…:8080")`). The
+reachability probe distinguishes three outcomes rather than one bit — `ok`,
+`denied` (unreachable *or* unauthenticated) and `timeout` (could not tell) — because
+"retry" and "change `source`" are different fixes.
+
+Once the block is in the inventory, the loop is three calls (workspaces are selected by
+name, by tag, or by `all` — unlike hosts they have no group concept). After pasting the
+block, call `jms_inventory_reload` so the running server drops its cached inventory and
+sees the new workspaces — no MCP restart:
+
+```text
+jms_inventory_reload()                            # after editing hosts.yaml
 jms_dev_sync(["all"], ref="feat/unify-softmax")   # deliver the ref to every workspace
 # or a subset by tag:  ["ascend"]  /  ["ascend", "cuda"]
-jms_dev_run(["all"],  ref="feat/unify-softmax")   # → consistency table
+jms_dev_run(["all"],  ref="feat/unify-softmax")   # → consistency table (+ attestation)
 jms_dev_logs("fl-ascend", "tests/test_ops.py::test_layer_norm")  # full traceback on a FAIL
 ```
 
@@ -266,6 +296,38 @@ nothing diverged, no chip failed or timed out, and every chip is confirmed to be
 **same commit** (`revisions`). A FAIL carries a one-line assertion message inline — enough
 to decide whether to dig; use `jms_dev_logs` for the full traceback.
 
+#### The same sha is not the same code path
+
+Two chips at one commit can still run **different code**: a wheel built for `ascend` vs one
+built for `dcu`, or the plugin dispatching a given op to `flaggems` on chip A and
+`flagos_python` on chip B. Both PASS, and a sha-only check reads green — the exact
+divergence the loop exists to catch. So `jms_dev_run` also **attests what ran**.
+
+A probe rides the same SSH round trip as the UT run (no extra call) and reads, from inside
+the checkout: `torch_fl/_build_config.py` (`ACCELERATOR` — the build identity the
+maintainers generate to tell wheels apart), `torch_fl/backends.conf` (the `op -> backend`
+map — the code path), the `_C` extension's ABI tag vs the interpreter's, and a best-effort
+`import torch_fl`. Every field is reported per chip under `attestation`:
+
+```text
+"attestation": {
+  "fl-ascend": {"accelerator": "ascend", "backend_map": {"softmax": "flaggems"},
+                "backend_map_hash": "…", "abi_match": false,
+                "import_error": "ModuleNotFoundError: No module named 'torch_fl._C'"},
+  "fl-4090":   {"accelerator": "dcu",    "backend_map": {"softmax": "flagos_python"}, …}
+}
+```
+
+`ok` additionally requires **`attestation_consistent`**: the `op -> backend` map (and the
+plugin version, where readable) must agree across chips. A chip whose map could not be read
+is listed in `attestation_unverified`, never coerced into agreement — the same rule
+`revisions` follows. The build `accelerator`, the ABI and the installed `torch`
+legitimately differ per chip, so they are surfaced but **not** gated.
+
+The probe is layered precisely because the container often cannot import the plugin at all
+(the `_C` extension is built for one interpreter, the container ships another) — so a
+static read still attests, and "cannot import" is a first-class result, not a crash.
+
 Delivery is per-workspace because reachability differs (direct GitHub, behind a proxy,
 or offline); all three reduce to *"make the container's repo be at `ref`"*:
 
@@ -280,7 +342,9 @@ Two things worth knowing:
 - **`ut_cmd` must emit pytest `-rA` lines.** The consistency table is parsed from
   `PASSED/FAILED/ERROR/SKIPPED … <id> - <msg>` short-summary lines; a custom `ut_cmd`
   that does not print them yields an empty table and `ok=false` (that is deliberate — an
-  empty result must never read as "everything passed").
+  empty result must never read as "everything passed"). The command runs under
+  `set -o pipefail` *inside* the container, so a piped `ut_cmd` (`… | tee log`) cannot
+  mask pytest's failure behind `tee`'s zero exit.
 - **`push` cannot pin a revision in-container.** It has no git in the container, so its
   reported `revisions` entry is the *local* tree's HEAD; `jms_dev_run` still checks that
   every chip — push included — reported a revision, and fails the run if one did not.

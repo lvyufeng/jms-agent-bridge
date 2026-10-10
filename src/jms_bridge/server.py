@@ -31,9 +31,11 @@ from .cluster import (
     resolve_rendezvous,
 )
 from .config import BastionConfig, load_config
+from .discover import DEFAULT_REPO_MATCH
 from .inventory import Host, Inventory, shell_quote
 from .jobs import JobManager
 from .ssh import SSHRunner
+from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
 log = logging.getLogger("jms_bridge.server")
 
@@ -330,6 +332,30 @@ async def jms_job_cancel(host: str, job_id: str) -> dict:
 # --- dev loop: workspace sync / run / logs -----------------------------------------
 
 
+@server.tool()
+async def jms_inventory_reload() -> dict:
+    """Re-read `hosts.yaml` and drop the cached inventory.
+
+    The advertised dev loop is *emit YAML → paste into `hosts.yaml` → run*, but every
+    tool reads the inventory through a cache populated on first use. Without this the
+    paste step silently needs an MCP restart before the new hosts/workspaces appear.
+    Call this after editing the inventory; the next tool call re-reads from disk.
+
+    Returns the freshly loaded summary so the caller can confirm the paste landed.
+    """
+    _state.pop("inv", None)
+    try:
+        inv = _inv()
+    except Exception as exc:  # noqa: BLE001 - surface any load error to the agent
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "hosts": sorted(inv.hosts),
+        "workspaces": sorted(inv.workspaces),
+        "groups": {k: list(v) for k, v in inv.groups.items()},
+    }
+
+
 def _workspaces(selectors: list[str]):  # noqa: ANN202
     return _inv().resolve_workspaces(selectors)
 
@@ -462,10 +488,25 @@ async def jms_dev_run(
 
     Long training runs do NOT go here; use `jms_submit_job` / `jms_cluster_submit`.
     """
-    from .workspace import build_consistency_table, parse_pytest_summary
+    from .attest import (
+        build_attest_script,
+        check_attestation_parity,
+        parse_attestation,
+    )
+    from .workspace import DEFAULT_UT_CMD, build_consistency_table, parse_pytest_summary
 
     workspaces = _workspaces(targets)
     delivered = await asyncio.gather(*(_deliver(w, ref) for w in workspaces))
+    # The early returns carry the *same* keys as the success path (`attestation`, the
+    # `attestation_*` trio, `hosts` included) so a caller that reads any of them
+    # uniformly never KeyErrors on a delivery failure.
+    empty_attest = {
+        "attestation": {},
+        "attestation_consistent": False,
+        "attestation_diverged": [],
+        "attestation_unverified": [],
+        "hosts": {},
+    }
     if not delivered:
         # No workspace matched: report it the same shape as a normal run (empty
         # table) rather than a bare success, so the caller can always read `rows`.
@@ -481,6 +522,7 @@ async def jms_dev_run(
             "revisions_unverified": [],
             "failed_hosts": [],
             "results": [],
+            **empty_attest,
         }
     if not all(d["ok"] for d in delivered):
         return {
@@ -494,13 +536,29 @@ async def jms_dev_run(
             "revisions_unverified": [d["workspace"] for d in delivered if not d.get("sha")],
             "failed_hosts": [d["workspace"] for d in delivered if not d["ok"]],
             "results": list(delivered),
+            **empty_attest,
         }
 
     async def one(ws):  # noqa: ANN001, ANN202
         host = _host_of(ws)
         # Run the suite from inside the repo: the container's default cwd is not
         # the checkout, so `python -m pytest tests/` would not find the tests.
-        inner = f"cd {shell_quote(ws.repo)} && {ut_cmd or ws.ut_cmd}"
+        # `cd --` so a repo path beginning with `-` is not read as a cd option.
+        # `set -o pipefail` *inside the subshell* is essential: the inner runs under
+        # `docker exec ... bash -lc`, a fresh shell that inherits neither `-e` nor
+        # pipefail from the host wrapper, so a piped `ut_cmd` (`... | tee log`) would
+        # return tee's 0 and mask a fleet-wide failure.
+        # The attestation probe rides the same round trip, *after* the suite. It must
+        # never `exit` (it would clobber pytest's status), so the UT run's exit code is
+        # captured and re-raised explicitly — otherwise exit_code would always be the
+        # probe's and `failed` could never fire. An empty `ut_cmd` (a YAML null override)
+        # falls back to the default rather than yielding a `()` syntax error.
+        cmd = ut_cmd or ws.ut_cmd or DEFAULT_UT_CMD
+        inner = (
+            f"cd -- {shell_quote(ws.repo)} && {{ (set -o pipefail; {cmd}); rc=$?; "
+            + build_attest_script(ws.repo)
+            + "exit $rc; }"
+        )
         res = await _ssh().exec_on(
             host,
             # The UT run must not inherit the delivery proxy.
@@ -523,14 +581,31 @@ async def jms_dev_run(
     # unverified code.
     unverified = [d["workspace"] for d in delivered if not d.get("sha")]
     revisions_consistent = len(set(shas.values())) <= 1 and len(shas) == len(delivered)
+
+    # Attestation: the same sha is not the same *code path*. Parse each chip's record
+    # out of the UT stdout and require the op->backend map (and plugin version, where
+    # readable) to agree. A chip whose map could not be read is `unverified`, never
+    # coerced into agreement — the same rule `revisions` follows.
+    attestation = {name: parse_attestation(res.stdout) for name, res, _ in ran}
+    parity = check_attestation_parity(attestation)
+
     table.update(
         {
-            "ok": table["ok"] and not failed and revisions_consistent,
+            "ok": (
+                table["ok"]
+                and not failed
+                and revisions_consistent
+                and parity["consistent"]
+            ),
             "ref": ref,
             "failed_hosts": failed,
             "revisions": shas,
             "revisions_consistent": revisions_consistent,
             "revisions_unverified": unverified,
+            "attestation": attestation,
+            "attestation_consistent": parity["consistent"],
+            "attestation_diverged": parity["diverged"],
+            "attestation_unverified": parity["unverified"],
             "hosts": {
                 name: {
                     "ok": res.ok,
@@ -554,7 +629,7 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
     ws = _inv().resolve_workspaces([workspace])[0]
     host = _host_of(ws)
     inner = (
-        f"cd {shell_quote(ws.repo)} && python -m pytest "
+        f"cd -- {shell_quote(ws.repo)} && python -m pytest "
         f"{shell_quote(test_id)} -q --tb=long -rA"
     )
     res = await _ssh().exec_on(
@@ -571,6 +646,105 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
         "exit_code": res.exit_code,
         "output": res.stdout[-20000:],
         "stderr": res.stderr.strip()[:2000],
+    }
+
+
+@server.tool()
+async def jms_dev_discover(
+    targets: list[str],
+    container: str = DEFAULT_CONTAINER,
+    source: str = "git",
+    repo_match: str = DEFAULT_REPO_MATCH,
+    max_depth: int = 5,
+    proxy: str | None = None,
+    mount: str | None = None,
+    local: str | None = None,
+    timeout: float = 120.0,
+) -> dict:
+    """Inspect each host's container and emit a paste-ready `workspaces:` block.
+
+    This is the front door to the dev loop. `jms_dev_run` needs to know, per chip,
+    which container holds the repo, where the checkout lives inside it, and whether
+    the container can reach the git remote — and that is exactly the per-host
+    busywork worth automating. One call fans out `docker exec` discovery to every
+    host and returns the inventory YAML to paste into `hosts.yaml`.
+
+    `container` is normally the same name on every host (`lvyufeng-torch-fl`);
+    `source` seeds the `source:` field (git / proxy-git / push) and `repo_match` is
+    a case-insensitive substring a checkout path must contain. Because the emitted
+    block must be *loadable*, `source='proxy-git'` requires `proxy` and
+    `source='push'` requires `mount` + `local` — without them the pasted entry would
+    make `Inventory.load` reject the whole inventory, so this call refuses rather
+    than emit a block that cannot be pasted.
+
+    Every host's raw findings are in `hosts`; anything the probe could not confirm
+    is a `warnings` entry (a timed-out or unreachable origin, a missing pytest, a
+    missing docker, a container that is not there) and a host that could not be
+    inspected is listed in `skipped` — `ok` is true only when every requested host
+    produced at least one workspace.
+
+    The emitted `source` is a *guess* from reachability alone; confirm it before
+    relying on it.
+    """
+    from .discover import (
+        build_discovery_script,
+        parse_discovery,
+        render_workspaces_yaml,
+    )
+
+    if not CONTAINER_RE.fullmatch(container):
+        return {"ok": False, "error": f"invalid container name {container!r}"}
+    if source not in SOURCES:
+        return {"ok": False, "error": f"source must be one of {SOURCES}, got {source!r}"}
+    # The emitted block is advertised as paste-ready, so it must survive
+    # Inventory.load: Workspace rejects proxy-git without a proxy and push without
+    # both mount and local, and a single bad entry aborts the whole inventory.
+    if source == "proxy-git" and not proxy:
+        return {"ok": False, "error": "source 'proxy-git' requires a 'proxy' argument"}
+    if source == "push" and not (mount and local):
+        return {"ok": False, "error": "source 'push' requires both 'mount' and 'local'"}
+
+    hosts = _resolve(targets)
+    script = build_discovery_script(container, repo_match=repo_match, max_depth=max_depth)
+    results = await asyncio.gather(
+        *(
+            # Discovery must not depend on the host toolchain (env_setup) nor the
+            # host workdir — it inspects a container, which is host-toolchain-free.
+            _ssh().exec_on(
+                h, script, timeout=timeout, workdir=False, env_setup=False
+            )
+            for h in hosts
+        )
+    )
+    reports = [
+        {
+            "host": res.host,
+            "exit_code": res.exit_code,
+            "timed_out": res.timed_out,
+            "timeout": timeout,
+            "report": parse_discovery(res.stdout),
+            "stderr": res.stderr.strip()[:400],
+        }
+        for res in results
+    ]
+    rendered = render_workspaces_yaml(
+        reports,
+        container=container,
+        source=source,
+        proxy=proxy,
+        mount=mount,
+        local=local,
+        host_tags={h.name: h.tags for h in hosts},
+    )
+    return {
+        "ok": rendered["ok"],
+        "container": container,
+        "source": source,
+        "hosts": reports,
+        "skipped": rendered["skipped"],
+        "warnings": rendered["warnings"],
+        "workspaces": rendered["workspaces"],
+        "yaml": rendered["yaml"],
     }
 
 
