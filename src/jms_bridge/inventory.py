@@ -258,6 +258,7 @@ class Inventory:
                     source=spec.get("source", "git"),
                     proxy=spec.get("proxy"),
                     ut_cmd=spec.get("ut_cmd", DEFAULT_UT_CMD),
+                    env_setup=spec.get("env_setup"),
                     mount=spec.get("mount"),
                     local=spec.get("local"),
                     tags=list(spec.get("tags") or []),
