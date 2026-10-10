@@ -34,7 +34,10 @@ from .inventory import shell_quote
 #: Line prefix for every machine-readable attestation fact.
 MARKER = "JMSA "
 
-#: Interpreter the runtime layer uses inside the container.
+#: Interpreter the runtime layer uses inside the container. Resolved from
+#: ``PATH`` *after* the caller's ``env_setup`` has activated the conda env, so it
+#: points at that env's interpreter (a conda env provides both ``python`` and
+#: ``python3``); the container's bare ``python3`` may be a different ABI entirely.
 DEFAULT_PYTHON = "python3"
 
 #: ``ACCELERATOR = "ascend"`` as setup.py writes it into _build_config.py.

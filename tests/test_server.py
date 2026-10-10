@@ -149,6 +149,26 @@ def test_dev_run_command_carries_the_probe_and_preserves_exit(monkeypatch):
     assert "torch_fl/_build_config.py" in ut and "torch_fl/backends.conf" in ut
 
 
+def test_dev_run_activates_the_container_env_first(monkeypatch):
+    # The fleet convention activates a shared conda env *inside* the container;
+    # the UT command and the attest probe must both run under it (before the repo
+    # `cd`), else they use the wrong-ABI default interpreter.
+    ws = Workspace(
+        name="a", host="h1", container="c", repo="/work/Torch-FL", source="git",
+        env_setup="source /shared/env.sh && conda activate fl-env",
+    )
+    fake = _install(monkeypatch, [ws], {
+        "git fetch": (0, "abc1234\n", ""),
+        "pytest": (0, _UT_OK, ""),
+    })
+    asyncio.run(S.jms_dev_run(["all"], "main"))
+    ut = next(c["command"] for c in fake.calls if "pytest" in c["command"])
+    # activation precedes the repo cd, so both the UT cmd and the probe inherit it
+    assert "source /shared/env.sh && conda activate fl-env; " in ut
+    assert ut.index("conda activate fl-env") < ut.index("cd -- ")
+    assert ut.index("conda activate fl-env") < ut.index("torch_fl/_build_config.py")
+
+
 def test_dev_run_empty_ut_cmd_falls_back_to_default(monkeypatch):
     # A `ut_cmd:` YAML null override must not build a `();` syntax error.
     fake = _install(monkeypatch, [_ws("a", "h1")], {

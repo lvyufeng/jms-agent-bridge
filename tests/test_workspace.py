@@ -28,6 +28,23 @@ def test_workspace_bad_source_raises():
     with pytest.raises(WorkspaceError):
         Workspace(name="w", host="a", container="c", repo="/r", source="ftp")
 
+
+def test_workspace_env_setup_prefixes_the_delivery_cmd():
+    # The fleet convention activates a shared conda env *inside* the container;
+    # without it the checkout/fetch runs under the container's default interpreter.
+    w = Workspace(
+        name="w1", host="a", container="lvyufeng-torch-fl", repo="/work/Torch-FL",
+        env_setup="source /shared/env.sh && conda activate fl-env",
+    )
+    cmd = w.delivery_cmd("main")
+    assert cmd.startswith("source /shared/env.sh && conda activate fl-env; cd '/work/Torch-FL'")
+    assert w.to_dict()["env_setup"] == "source /shared/env.sh && conda activate fl-env"
+
+
+def test_workspace_no_env_setup_leaves_delivery_cmd_unprefixed():
+    w = Workspace(name="w1", host="a", container="lvyufeng-torch-fl", repo="/work/Torch-FL")
+    assert w.delivery_cmd("main").startswith("cd '/work/Torch-FL'")
+
 SAMPLE = """\
 =================== short test summary info ===================
 PASSED tests/test_ops.py::test_softmax

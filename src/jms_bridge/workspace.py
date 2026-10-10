@@ -68,6 +68,14 @@ class Workspace:
     #: Unit-test command; an override MUST emit pytest ``-rA`` short-summary lines
     #: (see :data:`DEFAULT_UT_CMD`) or the consistency table will have no rows.
     ut_cmd: str = DEFAULT_UT_CMD
+    #: Shell snippet run *inside the container* before the repo ``cd`` and the UT
+    #: command — the fleet convention is a shared conda install, activated per
+    #: container (``source <shared>/env.sh && conda activate <env>``). Without it the
+    #: run uses the container's default interpreter, which is the *wrong* ABI for the
+    #: built ``_C`` extension on most chips, so the import fails and every row is a
+    #: false negative. Passed verbatim (caller-controlled), like :attr:`repo`; it is
+    #: never built from untrusted argv.
+    env_setup: str | None = None
     #: Host-side directory bind-mounted into the container (``push``).
     mount: str | None = None
     #: Developer-side directory rsynced into ``mount`` (``push``).
@@ -137,9 +145,19 @@ class Workspace:
         # branch when one exists), so every re-sync of a branch would test old code.
         # FETCH_HEAD is written by the explicit-ref fetch above.
         return (
-            f"{self._proxy_prefix()}cd {q} && "
+            f"{self._proxy_prefix()}{self._env_prefix()}cd {q} && "
             f"git fetch origin {qref} --depth=1 && git checkout -f --detach FETCH_HEAD"
         )
+
+    def _env_prefix(self) -> str:
+        """``<env_setup>; `` when a container env is configured, else ``''``.
+
+        Runs before the repo ``cd`` so the activated interpreter (and any vendor
+        ``set_env.sh`` it sources) is in place for every in-container command.
+        """
+        if not self.env_setup:
+            return ""
+        return f"{self.env_setup}; "
 
     def to_dict(self) -> dict:
         return {
@@ -148,6 +166,7 @@ class Workspace:
             "container": self.container,
             "repo": self.repo,
             "source": self.source,
+            "env_setup": self.env_setup,
             "ut_cmd": self.ut_cmd,
             "tags": list(self.tags),
         }

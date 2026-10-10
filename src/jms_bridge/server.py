@@ -553,9 +553,15 @@ async def jms_dev_run(
         # captured and re-raised explicitly — otherwise exit_code would always be the
         # probe's and `failed` could never fire. An empty `ut_cmd` (a YAML null override)
         # falls back to the default rather than yielding a `()` syntax error.
+        # Activate the container's conda env *before* the repo `cd`, so the UT
+        # command and the attestation probe both use the interpreter the built
+        # `_C` extension was compiled for (the container default is the wrong ABI
+        # on most chips). `env_setup` is caller-controlled spec text, not argv.
         cmd = ut_cmd or ws.ut_cmd or DEFAULT_UT_CMD
+        env_prefix = f"{ws.env_setup}; " if ws.env_setup else ""
         inner = (
-            f"cd -- {shell_quote(ws.repo)} && {{ (set -o pipefail; {cmd}); rc=$?; "
+            env_prefix
+            + f"cd -- {shell_quote(ws.repo)} && {{ (set -o pipefail; {cmd}); rc=$?; "
             + build_attest_script(ws.repo)
             + "exit $rc; }"
         )
