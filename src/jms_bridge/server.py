@@ -332,6 +332,30 @@ async def jms_job_cancel(host: str, job_id: str) -> dict:
 # --- dev loop: workspace sync / run / logs -----------------------------------------
 
 
+@server.tool()
+async def jms_inventory_reload() -> dict:
+    """Re-read `hosts.yaml` and drop the cached inventory.
+
+    The advertised dev loop is *emit YAML → paste into `hosts.yaml` → run*, but every
+    tool reads the inventory through a cache populated on first use. Without this the
+    paste step silently needs an MCP restart before the new hosts/workspaces appear.
+    Call this after editing the inventory; the next tool call re-reads from disk.
+
+    Returns the freshly loaded summary so the caller can confirm the paste landed.
+    """
+    _state.pop("inv", None)
+    try:
+        inv = _inv()
+    except Exception as exc:  # noqa: BLE001 - surface any load error to the agent
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "hosts": sorted(inv.hosts),
+        "workspaces": sorted(inv.workspaces),
+        "groups": {k: list(v) for k, v in inv.groups.items()},
+    }
+
+
 def _workspaces(selectors: list[str]):  # noqa: ANN202
     return _inv().resolve_workspaces(selectors)
 
@@ -464,10 +488,25 @@ async def jms_dev_run(
 
     Long training runs do NOT go here; use `jms_submit_job` / `jms_cluster_submit`.
     """
-    from .workspace import build_consistency_table, parse_pytest_summary
+    from .attest import (
+        build_attest_script,
+        check_attestation_parity,
+        parse_attestation,
+    )
+    from .workspace import DEFAULT_UT_CMD, build_consistency_table, parse_pytest_summary
 
     workspaces = _workspaces(targets)
     delivered = await asyncio.gather(*(_deliver(w, ref) for w in workspaces))
+    # The early returns carry the *same* keys as the success path (`attestation`, the
+    # `attestation_*` trio, `hosts` included) so a caller that reads any of them
+    # uniformly never KeyErrors on a delivery failure.
+    empty_attest = {
+        "attestation": {},
+        "attestation_consistent": False,
+        "attestation_diverged": [],
+        "attestation_unverified": [],
+        "hosts": {},
+    }
     if not delivered:
         # No workspace matched: report it the same shape as a normal run (empty
         # table) rather than a bare success, so the caller can always read `rows`.
@@ -483,6 +522,7 @@ async def jms_dev_run(
             "revisions_unverified": [],
             "failed_hosts": [],
             "results": [],
+            **empty_attest,
         }
     if not all(d["ok"] for d in delivered):
         return {
@@ -496,13 +536,29 @@ async def jms_dev_run(
             "revisions_unverified": [d["workspace"] for d in delivered if not d.get("sha")],
             "failed_hosts": [d["workspace"] for d in delivered if not d["ok"]],
             "results": list(delivered),
+            **empty_attest,
         }
 
     async def one(ws):  # noqa: ANN001, ANN202
         host = _host_of(ws)
         # Run the suite from inside the repo: the container's default cwd is not
         # the checkout, so `python -m pytest tests/` would not find the tests.
-        inner = f"cd {shell_quote(ws.repo)} && {ut_cmd or ws.ut_cmd}"
+        # `cd --` so a repo path beginning with `-` is not read as a cd option.
+        # `set -o pipefail` *inside the subshell* is essential: the inner runs under
+        # `docker exec ... bash -lc`, a fresh shell that inherits neither `-e` nor
+        # pipefail from the host wrapper, so a piped `ut_cmd` (`... | tee log`) would
+        # return tee's 0 and mask a fleet-wide failure.
+        # The attestation probe rides the same round trip, *after* the suite. It must
+        # never `exit` (it would clobber pytest's status), so the UT run's exit code is
+        # captured and re-raised explicitly — otherwise exit_code would always be the
+        # probe's and `failed` could never fire. An empty `ut_cmd` (a YAML null override)
+        # falls back to the default rather than yielding a `()` syntax error.
+        cmd = ut_cmd or ws.ut_cmd or DEFAULT_UT_CMD
+        inner = (
+            f"cd -- {shell_quote(ws.repo)} && {{ (set -o pipefail; {cmd}); rc=$?; "
+            + build_attest_script(ws.repo)
+            + "exit $rc; }"
+        )
         res = await _ssh().exec_on(
             host,
             # The UT run must not inherit the delivery proxy.
@@ -525,14 +581,31 @@ async def jms_dev_run(
     # unverified code.
     unverified = [d["workspace"] for d in delivered if not d.get("sha")]
     revisions_consistent = len(set(shas.values())) <= 1 and len(shas) == len(delivered)
+
+    # Attestation: the same sha is not the same *code path*. Parse each chip's record
+    # out of the UT stdout and require the op->backend map (and plugin version, where
+    # readable) to agree. A chip whose map could not be read is `unverified`, never
+    # coerced into agreement — the same rule `revisions` follows.
+    attestation = {name: parse_attestation(res.stdout) for name, res, _ in ran}
+    parity = check_attestation_parity(attestation)
+
     table.update(
         {
-            "ok": table["ok"] and not failed and revisions_consistent,
+            "ok": (
+                table["ok"]
+                and not failed
+                and revisions_consistent
+                and parity["consistent"]
+            ),
             "ref": ref,
             "failed_hosts": failed,
             "revisions": shas,
             "revisions_consistent": revisions_consistent,
             "revisions_unverified": unverified,
+            "attestation": attestation,
+            "attestation_consistent": parity["consistent"],
+            "attestation_diverged": parity["diverged"],
+            "attestation_unverified": parity["unverified"],
             "hosts": {
                 name: {
                     "ok": res.ok,
@@ -556,7 +629,7 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
     ws = _inv().resolve_workspaces([workspace])[0]
     host = _host_of(ws)
     inner = (
-        f"cd {shell_quote(ws.repo)} && python -m pytest "
+        f"cd -- {shell_quote(ws.repo)} && python -m pytest "
         f"{shell_quote(test_id)} -q --tb=long -rA"
     )
     res = await _ssh().exec_on(
