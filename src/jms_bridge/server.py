@@ -37,7 +37,7 @@ from .config import BastionConfig, ConfigError, load_config
 from .discover import DEFAULT_REPO_MATCH
 from .inventory import Host, Inventory, InventoryError, shell_quote
 from .jobs import JobManager
-from .ssh import SSHRunner
+from .ssh import ExecResult, SSHRunner
 from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
 log = logging.getLogger("jms_bridge.server")
@@ -356,7 +356,7 @@ async def jms_job_status(targets: list[str], job_id: str) -> dict:
 async def jms_job_logs(
     host: str, job_id: str, offset: int = 0, max_bytes: int = 65536
 ) -> dict:
-    """Read a job's log from `offset` onward. Poll with the returned `size` as the next offset."""
+    """Read a job's log from `offset` onward. Poll with the returned `next_offset`."""
     h = _inv().resolve([host])[0]
     return {"ok": True, **(await _jobs().logs(h, job_id, offset=offset, max_bytes=max_bytes))}
 
@@ -452,6 +452,28 @@ def _last_sha(stdout: str) -> str | None:
 
 
 async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
+    """Deliver ``ref`` to one workspace, never raising.
+
+    The fan-out over workspaces is a ``gather``: an uncaught raise from one workspace
+    (a workspace naming a host the inventory no longer has, a transport error) would
+    discard every other workspace's result and reach the agent as an opaque tool error.
+    Converting it into this workspace's failure record keeps the per-chip picture
+    intact and names the workspace that broke.
+    """
+    try:
+        return await _deliver_one(ws, ref)
+    except Exception as exc:  # noqa: BLE001 - isolating one workspace is the point
+        return {
+            "workspace": ws.name,
+            "source": getattr(ws, "source", "?"),
+            "ok": False,
+            "sha": None,
+            "ref_pinned": False,
+            "stderr": f"delivery raised: {exc}",
+        }
+
+
+async def _deliver_one(ws, ref: str) -> dict:  # noqa: ANN001
     """Put the workspace's repo at ``ref`` using its configured source.
 
     Returns the delivered commit under ``sha`` (best-effort) so a caller can spot
@@ -461,8 +483,16 @@ async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
     """
     host = _host_of(ws)
     if ws.source == "push":
+        # `local:` is commonly `~/...` (the shipped example uses it), and rsync runs
+        # via exec with no shell, so `~` would stay literal and the whole delivery
+        # would silently push a path named `~`. `_local_sha` expands it for the same
+        # reason; the path that actually reaches rsync must match.
         res = await _ssh().rsync(
-            host, ws.local, ws.mount, direction="push", excludes=_DEFAULT_EXCLUDES
+            host,
+            os.path.expanduser(ws.local),
+            ws.mount,
+            direction="push",
+            excludes=_DEFAULT_EXCLUDES,
         )
         sha = await asyncio.to_thread(_local_sha, ws.local)
         return {
@@ -586,7 +616,7 @@ async def jms_dev_run(
             **empty_attest,
         }
 
-    async def one(ws):  # noqa: ANN001, ANN202
+    async def _run_one(ws):  # noqa: ANN001, ANN202
         host = _host_of(ws)
         # Run the suite from inside the repo: the container's default cwd is not
         # the checkout, so `python -m pytest tests/unit` would not find the tests.
@@ -622,7 +652,20 @@ async def jms_dev_run(
         )
         return ws.name, res, parse_pytest_summary(res.stdout)
 
-    ran = await asyncio.gather(*(one(w) for w in workspaces))
+    async def _one(ws):  # noqa: ANN001, ANN202
+        """Run one chip, turning a raise into *that chip's* failure.
+
+        A raise before a result exists (a workspace naming a host the inventory no
+        longer has, a transport error) would otherwise escape the fan-out `gather` and
+        replace the whole cross-chip table — this tool's entire product — with an
+        opaque tool error. Here the chip is reported as failed and the table survives.
+        """
+        try:
+            return await _run_one(ws)
+        except Exception as exc:  # noqa: BLE001 - isolating one chip is the point
+            return ws.name, ExecResult(ws.name, 1, "", f"run failed: {exc}"), {}
+
+    ran = await asyncio.gather(*(_one(w) for w in workspaces))
     per_ws = {name: parsed for name, _, parsed in ran}
     table = build_consistency_table(per_ws)
     # A chip that timed out or exited nonzero (often with empty stdout, hence no
@@ -681,9 +724,15 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
     """
     ws = _inv().resolve_workspaces([workspace])[0]
     host = _host_of(ws)
+    # Activate the container env *before* the repo `cd`, exactly as jms_dev_run does.
+    # The whole point of this tool is to say why a test failed on a chip; re-running
+    # it under the container's default interpreter (the wrong ABI on most chips)
+    # would report the cause of a failure that is not the one the fleet run hit.
+    env_prefix = f"{ws.env_setup}; " if ws.env_setup else ""
     inner = (
-        f"cd -- {shell_quote(ws.repo)} && python -m pytest "
-        f"{shell_quote(test_id)} -q --tb=long -rA"
+        env_prefix
+        + f"cd -- {shell_quote(ws.repo)} && python -m pytest "
+        + f"{shell_quote(test_id)} -q --tb=long -rA"
     )
     res = await _ssh().exec_on(
         host,
@@ -886,7 +935,9 @@ async def jms_cluster_submit(
                  train.py --rounds 100
 
     `targets` order defines rank order; each host contributes one rank node whose
-    `JMS_NPROC` is its accelerator count. Poll with `jms_job_status` / `jms_job_logs`.
+    `JMS_NPROC` is its accelerator count. Every target is preflighted first and an
+    unreachable host (or one holding a stale rendezvous `port`) fails the call rather
+    than being handed a rank no one can join. Poll with `jms_job_status` / `jms_job_logs`.
     """
     if _looks_dangerous(command):
         return {"ok": False, "error": "command matched the safety denylist", "command": command}
@@ -912,6 +963,30 @@ async def jms_cluster_submit(
     rdv = resolve_rendezvous(hosts, master=master, port=port)
 
     health = {h.host: h for h in await preflight(_ssh(), hosts, port=port)}
+    # Refuse before assigning ranks, rather than quietly shrinking the collective. An
+    # unreachable host reports no `device_count` yet still contributed `nproc=1` to the
+    # world size below, so every launched rank was told a world size larger than the set
+    # that could join it — the job hangs in rendezvous, or the survivors silently train a
+    # different-width collective than the caller asked for. A host with a stale rendezvous
+    # port is equally unlaunchable: its rank cannot bind. Same readiness test as
+    # `jms_cluster_preflight`, so the two tools never disagree about a target set.
+    unready = [h for h in hosts if not health[h.name].ok]
+    if unready:
+        return {
+            "ok": False,
+            "error": (
+                f"{len(unready)} of {len(hosts)} targets are not ready to join a collective "
+                f"({', '.join(h.name for h in unready)}); assigning a rank to a host that "
+                "cannot join leaves every other rank waiting on a rendezvous that never "
+                "completes."
+            ),
+            "unready": [health[h.name].to_dict() for h in unready],
+            "ready_targets": [h.name for h in hosts if health[h.name].ok],
+            "hint": (
+                "fix the hosts above, or submit the ready subset by name — "
+                "jms_cluster_submit needs at least 2 hosts"
+            ),
+        }
     assignments = [(h, max(1, health[h.name].device_count or 1)) for h in hosts]
     world_size = sum(n for _, n in assignments)
 

@@ -170,7 +170,7 @@ jms_sync_push(["cluster"], "./fl", "~/torch-fl")# same code on every node
 jms_submit_job(["cluster"], "torchrun --nproc_per_node=8 train.py --rounds 100")
 jms_job_status(["cluster"], "<job-id>")         # poll
 jms_job_logs("ascend-910c", "<job-id>", offset=0)
-jms_job_logs("ascend-910c", "<job-id>", offset=<size>)   # incremental
+jms_job_logs("ascend-910c", "<job-id>", offset=<next_offset>)   # incremental
 jms_sync_pull(["cluster"], "~/torch-fl/checkpoints", "./results")
 jms_audit_query()                                # confirm the trail in JumpServer
 ```

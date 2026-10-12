@@ -1,6 +1,10 @@
+import asyncio
+
 import pytest
 
-from jms_bridge.jobs import _validate_job_id, build_runner_script
+from jms_bridge.inventory import Host
+from jms_bridge.jobs import JobManager, _validate_job_id, build_runner_script
+from jms_bridge.ssh import ExecResult
 
 
 def test_runner_exports_rank_wiring_for_collab():
@@ -58,12 +62,139 @@ def test_runner_isolates_command_exit_in_subshell():
     assert script.index("code=$?") > script.index("exit 7")
 
 
+def test_runner_relaxes_nounset_around_env_setup_only():
+    """Vendor env scripts (CANN's set_env.sh, conda hooks) read possibly-unset vars,
+    and this script runs under `set -u` — without the guard one unset var aborts the
+    job before the command ever starts. The relaxation must bracket only env_setup."""
+    script = build_runner_script("abcd1234", "python train.py", "source /opt/cann/set_env.sh")
+    assert "set +u\nsource /opt/cann/set_env.sh\nset -u" in script
+    # `set -u` is back on by the time the command runs
+    assert script.index("set -u\n") < script.index("python train.py")
+    # no env_setup -> nothing to relax, and `-u` stays on throughout
+    assert "set +u" not in build_runner_script("abcd1234", "echo hi", None)
+
+
 def test_validate_job_id_accepts_8_hex():
     _validate_job_id("deadbeef")
     _validate_job_id("0123abcd")
+
+
+# --- coordinated launch (ranks) -----------------------------------------------------
+
+
+class _CollabRunner:
+    """Records each launch; a named rank may raise instead of returning a result."""
+
+    def __init__(self, explode="_none_"):
+        self.explode = explode
+        self.launched = []
+        self.commands = {}
+
+    async def exec_on(self, host, command, *, timeout=90, workdir=False):
+        self.launched.append(host.name)
+        self.commands[host.name] = command
+        if host.name == self.explode:
+            raise RuntimeError("ssh binary vanished")
+        return ExecResult(host.name, 0, "LAUNCHER=tmux", "")
+
+
+def test_collab_launch_isolates_one_rank_that_raises():
+    """One rank raising must not discard every other rank's launch result.
+
+    An unguarded gather lets a single rank's transport error surface the whole
+    collective as an opaque tool error, hiding which nodes actually came up.
+    """
+    runner = _CollabRunner(explode="b")
+    hosts = [Host(name=n, login="u", asset_id="A") for n in ("a", "b", "c")]
+    handles, results = asyncio.run(
+        JobManager(runner).submit_collab(
+            [(h, 2) for h in hosts],
+            "torchrun train.py",
+            master_addr="10.0.0.1",
+            port=29400,
+            world_size=6,
+        )
+    )
+    # every rank produced a result; only the healthy ones produced a job handle
+    assert [r.host for r in results] == ["a", "b", "c"]
+    assert [h.host for h in handles] == ["a", "c"]
+    failed = results[1]
+    assert failed.ok is False and "launch failed" in failed.stderr
+
+
+def test_collab_assigns_ranks_in_order_over_nproc():
+    runner = _CollabRunner()
+    hosts = [Host(name=n, login="u", asset_id="A") for n in ("a", "b")]
+    asyncio.run(
+        JobManager(runner).submit_collab(
+            [(hosts[0], 8), (hosts[1], 2)],
+            "torchrun train.py",
+            master_addr="10.0.0.1",
+            port=29400,
+            world_size=10,
+        )
+    )
+    assert runner.launched == ["a", "b"]
+    # ranks advance by nproc, and every rank is told the same world size
+    assert "export JMS_RANK='0'" in runner.commands["a"]
+    assert "export JMS_RANK='8'" in runner.commands["b"]
+    assert "export JMS_NPROC='2'" in runner.commands["b"]
+    assert "export JMS_WORLD_SIZE='10'" in runner.commands["b"]
 
 
 @pytest.mark.parametrize("bad", ["", "xyz", "deadbeef00", "../etc", "ABCD1234", "a;b"])
 def test_validate_job_id_rejects_bad(bad):
     with pytest.raises(ValueError):
         _validate_job_id(bad)
+
+
+# --- incremental log polling --------------------------------------------------------
+
+
+class _LogsRunner:
+    """Stands in for the SSHRunner: replays one canned `size=<n>\\n<body>` response."""
+
+    def __init__(self, stdout):
+        self.stdout = stdout
+        self.commands = []
+
+    async def exec_on(self, host, command, *, timeout=60, workdir=True):
+        self.commands.append(command)
+        return ExecResult(host.name, 0, self.stdout, "")
+
+
+def _job_logs(stdout, *, offset=0, max_bytes=65536):
+    runner = _LogsRunner(stdout)
+    host = Host(name="h1", login="u", asset_id="A")
+    out = asyncio.run(JobManager(runner).logs(host, "deadbeef", offset=offset, max_bytes=max_bytes))
+    return out, runner
+
+
+def test_job_logs_clipped_read_does_not_skip_the_unread_middle():
+    # A training log dwarfs the 64 KiB cap, so the read is clipped. `size` is the whole
+    # file; resuming the next poll at `size` would silently drop everything between the
+    # clip and EOF. `next_offset` is where this read actually stopped.
+    out, _ = _job_logs("size=100000\n" + "x" * 10, offset=0, max_bytes=10)
+    assert out["size"] == 100000
+    assert out["next_offset"] == 10
+    assert out["offset"] == 0
+    assert len(out["log"]) == 10
+
+
+def test_job_logs_clipped_read_advances_from_a_mid_file_offset():
+    out, runner = _job_logs("size=100000\n" + "y" * 2048, offset=40, max_bytes=2048)
+    assert out["next_offset"] == 40 + 2048
+    # the remote must resume at the caller's offset, not at the start of the file
+    assert "tail -c +41" in runner.commands[0]
+
+
+def test_job_logs_next_offset_reaches_eof_when_the_rest_fits():
+    out, _ = _job_logs("size=120\n" + "z" * 80, offset=40, max_bytes=65536)
+    assert out["next_offset"] == 120 == out["size"]
+
+
+def test_job_logs_missing_file_advances_nowhere():
+    out, _ = _job_logs("size=0\n", offset=0, max_bytes=65536)
+    assert out["log"] == ""
+    assert out["size"] == 0
+    assert out["next_offset"] == 0
