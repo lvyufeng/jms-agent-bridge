@@ -25,8 +25,21 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import BastionConfig
+from .config import BastionConfig, ConfigError
 from .inventory import Host, InventoryError, wrap_command
+
+
+def _require_tool(binary: str, hint: str) -> None:
+    """Fail with an actionable ``ConfigError`` when a local tool is missing.
+
+    ``create_subprocess_exec`` raises a bare ``FileNotFoundError`` for an absent
+    binary, which the SDK shows the agent as the opaque ``Error executing tool <name>``.
+    A freshly-cloned machine is exactly where this happens, so it has to say what to
+    install; ``ConfigError`` is what the tool wrapper turns into that text.
+    """
+    if shutil.which(binary) is None:
+        raise ConfigError(f"`{binary}` is not installed — {hint}")
+
 
 #: ssh options shared by every invocation.
 _BASE_OPTS = [
@@ -98,7 +111,7 @@ class SSHRunner:
         if host.is_direct or not self.cfg.ssh_password:
             return []
         if shutil.which("sshpass") is None:
-            raise RuntimeError(
+            raise ConfigError(
                 "bastion ssh_password is set but `sshpass` is not installed "
                 "(apt/brew install sshpass), or register an SSH key instead"
             )
@@ -154,6 +167,7 @@ class SSHRunner:
     async def _run_script(
         self, host: Host, script: str, timeout: float, *, tty: bool = False
     ) -> ExecResult:
+        _require_tool("ssh", "install an SSH client (apt/brew install openssh)")
         async with self._sem:
             proc = await asyncio.create_subprocess_exec(
                 *self._ssh_argv(host, tty=tty),
@@ -231,6 +245,7 @@ class SSHRunner:
         timeout: float = 900.0,
     ) -> ExecResult:
         """Push or pull a path via rsync over the multiplexed SSH connection."""
+        _require_tool("rsync", "install rsync (apt/brew install rsync)")
         target, port = self._host_port(host)
         ssh_parts = [
             *self._sshpass_prefix(host),

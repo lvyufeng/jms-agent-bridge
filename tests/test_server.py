@@ -2,6 +2,7 @@ import asyncio
 
 import jms_bridge.server as S
 from jms_bridge.inventory import Host, Inventory
+from jms_bridge.jobs import JobHandle
 from jms_bridge.server import _looks_dangerous
 from jms_bridge.ssh import ExecResult
 from jms_bridge.workspace import Workspace
@@ -220,6 +221,64 @@ def test_dev_run_git_chip_without_sha_fails_delivery(monkeypatch):
                 "attestation_unverified", "hosts"):
         assert key in r
     assert r["failed_hosts"] == ["a", "b"]
+
+
+def test_dev_sync_isolates_one_workspace_whose_delivery_raises(monkeypatch):
+    # A workspace whose delivery *raises* (a transport error, a host the inventory no
+    # longer has) must not discard the others through the fan-out `gather` — that
+    # would surface the whole delivery as an opaque tool error and lose the per-chip
+    # picture. The raise becomes that workspace's failure record.
+    class _BoomSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            if host.name == "h2":
+                raise RuntimeError("ssh binary vanished")
+            return await super().exec_on(
+                host, command, timeout=timeout, workdir=workdir, env_setup=env_setup
+            )
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={},
+        workspaces={"a": _ws("a", "h1"), "b": _ws("b", "h2")},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _BoomSSH({"git fetch": (0, "abc1234\n", "")}))
+    r = asyncio.run(S.jms_dev_sync(["all"], "main"))
+    assert r["ok"] is False
+    # both workspaces still report; only the raising one is marked failed
+    assert [x["workspace"] for x in r["results"]] == ["a", "b"]
+    broke = r["results"][1]
+    assert broke["ok"] is False and "delivery raised" in broke["stderr"]
+
+
+def test_dev_run_isolates_one_chip_whose_run_raises(monkeypatch):
+    # Same isolation for the run stage: one chip's raise must leave the cross-chip
+    # table (aligned rows from the healthy chips) intact.
+    class _BoomSSH(_FakeSSH):
+        async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+            if host.name == "h2" and "pytest" in command:
+                raise RuntimeError("ssh binary vanished")
+            return await super().exec_on(
+                host, command, timeout=timeout, workdir=workdir, env_setup=env_setup
+            )
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A"),
+               "h2": Host(name="h2", login="u", asset_id="A")},
+        groups={},
+        workspaces={"a": _ws("a", "h1"), "b": _ws("b", "h2")},
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _BoomSSH({
+        "git fetch": (0, "abc1234\n", ""),
+        "pytest": (0, _UT_OK, ""),
+    }))
+    r = asyncio.run(S.jms_dev_run(["all"], "main"))
+    assert r["ok"] is False
+    assert r["failed_hosts"] == ["b"]
+    # the healthy chip's rows survive the other chip's raise
+    assert any(row["test_id"] == "tests/t.py::test_x" for row in r["rows"])
 
 
 def test_dev_sync_empty_selector_is_not_ok(monkeypatch):
@@ -591,6 +650,113 @@ def test_dev_discover_timeout_is_reported_as_timeout(monkeypatch):
     r = asyncio.run(S.jms_dev_discover(["all"]))
     assert r["ok"] is False
     assert any("timed out" in w for w in r["warnings"])
+
+
+# --- jms_cluster_submit: preflight gates the rank assignment ------------------------
+
+
+#: A preflight reply for an Ascend host showing two healthy chips and a free port.
+_NPU_READY = (
+    "===PROBE===\n"
+    "| 0     910C   | OK | 45   0 / 0 |\n"
+    "| 0     0      | 0000:01:00.0 | 0 / 65536 |\n"
+    "| 1     910C   | OK | 44   0 / 0 |\n"
+    "| 1     0      | 0000:02:00.0 | 0 / 65536 |\n"
+    "===PORT===\nPORT_FREE\n===END===\n"
+)
+
+
+class _PreflightSSH(_FakeSSH):
+    """Replies to the preflight probe per host; anything else succeeds."""
+
+    def __init__(self, by_host):
+        super().__init__({})
+        self.by_host = by_host
+
+    async def exec_on(self, host, command, *, timeout=60.0, workdir=True, env_setup=True):
+        self.calls.append({"host": host.name, "command": command})
+        if "===PROBE===" in command:
+            return self.by_host.get(host.name, ExecResult(host.name, 0, _NPU_READY, ""))
+        return ExecResult(host.name, 0, "", "")
+
+
+class _FakeJobs:
+    """Records the collab assignments the tool hands to the job manager."""
+
+    def __init__(self):
+        self.collab = []
+
+    async def submit_collab(self, assignments, command, *, master_addr, port, world_size):
+        self.collab.append(
+            {
+                "assignments": [(h.name, n) for h, n in assignments],
+                "command": command,
+                "master_addr": master_addr,
+                "port": port,
+                "world_size": world_size,
+            }
+        )
+        handles = [
+            JobHandle(f"{i:08x}", h.name, f"jms-{i:08x}", "tmux")
+            for i, (h, _) in enumerate(assignments)
+        ]
+        results = [ExecResult(h.name, 0, "LAUNCHER=tmux", "") for h, _ in assignments]
+        return handles, results
+
+
+def _cluster_install(monkeypatch, names, by_host):
+    hosts = [
+        Host(name=n, login="u", asset_id="A", platform="ascend-910c", address=f"10.0.0.{i + 1}")
+        for i, n in enumerate(names)
+    ]
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    fake = _PreflightSSH(by_host)
+    jobs = _FakeJobs()
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", fake)
+    monkeypatch.setitem(S._state, "jobs", jobs)
+    return fake, jobs
+
+
+def test_cluster_submit_ranks_every_ready_host(monkeypatch):
+    _, jobs = _cluster_install(monkeypatch, ["a", "b"], {})
+    r = asyncio.run(S.jms_cluster_submit(["a", "b"], "torchrun train.py"))
+    assert r["ok"] is True
+    assert r["world_size"] == 4  # 2 chips on each of 2 hosts
+    assert [x["host"] for x in r["ranks"]] == ["a", "b"]
+    assert all(x["launched"] and x["nproc"] == 2 for x in r["ranks"])
+    assert jobs.collab[0]["assignments"] == [("a", 2), ("b", 2)]
+    assert jobs.collab[0]["world_size"] == 4
+
+
+def test_cluster_submit_refuses_to_rank_an_unreachable_host(monkeypatch):
+    # An unreachable host reports no device_count, yet it used to be handed a rank with
+    # nproc=1 — so every rank was told a world size larger than the set that could join
+    # it. The job cannot rendezvous; the call must refuse instead of launching it.
+    _, jobs = _cluster_install(
+        monkeypatch,
+        ["a", "b"],
+        {"b": ExecResult("b", 255, "", "ssh: connect to host b port 2222: refused")},
+    )
+    r = asyncio.run(S.jms_cluster_submit(["a", "b"], "torchrun train.py"))
+    assert r["ok"] is False
+    assert "not ready" in r["error"] and "b" in r["error"]
+    assert [u["host"] for u in r["unready"]] == ["b"]
+    assert r["ready_targets"] == ["a"]
+    assert jobs.collab == []  # nothing launched at the wrong world size
+
+
+def test_cluster_submit_refuses_a_host_holding_the_rendezvous_port(monkeypatch):
+    # A stale run still bound to the rendezvous port makes that rank unlaunchable, even
+    # though the host is reachable and its accelerator probe is fine.
+    busy = _NPU_READY.replace("PORT_FREE", "PORT_BUSY")
+    _, jobs = _cluster_install(
+        monkeypatch, ["a", "b"], {"b": ExecResult("b", 0, busy, "")}
+    )
+    r = asyncio.run(S.jms_cluster_submit(["a", "b"], "torchrun train.py"))
+    assert r["ok"] is False
+    assert r["unready"][0]["port_free"] is False
+    assert jobs.collab == []
 
 
 # --- jms_inventory_reload -----------------------------------------------------------

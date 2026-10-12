@@ -50,6 +50,23 @@
 
 ### Fixed
 
+- **`jms_cluster_submit` assigned ranks to hosts that could never join.** An unreachable
+  host reports no device count and the tool still gave it `nproc=1`, so every launched
+  rank was told a `JMS_WORLD_SIZE` larger than the set that could actually rendezvous —
+  the job hangs, or the survivors train a collective of the wrong width. Every target is
+  now preflighted first (the same readiness test `jms_cluster_preflight` reports, so the
+  two tools never disagree) and an unreachable host, or one holding a stale rendezvous
+  `port`, fails the call and names itself instead of being ranked.
+- **One rank's failure discarded every other rank's launch result.** A raise before a
+  result exists (a missing local tool, a transport error) escaped the fan-out `gather`
+  and surfaced the whole coordinated launch as an opaque tool error, hiding which nodes
+  came up. Each rank is now isolated, so the rest of the batch reports normally. The same
+  applies to `jms_dev_sync` / `jms_dev_run`: a workspace whose delivery or UT run raises
+  is recorded as *that workspace's* failure instead of losing the cross-chip table.
+- **A missing local tool reached the agent as an opaque message.** A fresh machine with no
+  `ssh`, `rsync` or `sshpass` produced a bare `FileNotFoundError`, shown as
+  `Error executing tool <name>`. Each now raises `ConfigError` naming the binary and what
+  to install.
 - **An incremental job-log poll could silently skip output.** `jms_job_logs` returned the
   file's *total* size while the read was clipped at `max_bytes`, and polling with it (as
   both the tool and the README instructed) skipped everything between the clip and EOF —

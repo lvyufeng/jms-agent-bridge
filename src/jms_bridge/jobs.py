@@ -210,6 +210,20 @@ class JobManager:
             return JobHandle(job_id, host.name, session, _launcher_of(res.stdout)), res
         return None, res
 
+    async def _launch(self, host: Host, launch: str) -> ExecResult:
+        """Launch one rank, turning an unexpected raise into *that rank's* failure.
+
+        A launch can raise before any result exists (a missing local tool, a transport
+        error). Unguarded, one such rank would discard every other rank's result and
+        surface the whole collective as an opaque tool error; here each rank gets a
+        result, so the caller still sees which nodes came up. ``CancelledError`` is a
+        ``BaseException``, so a real cancellation still propagates.
+        """
+        try:
+            return await self.runner.exec_on(host, launch, timeout=90, workdir=False)
+        except Exception as exc:  # noqa: BLE001 - isolating one rank is the whole point
+            return ExecResult(host.name, 1, "", f"launch failed: {exc}")
+
     async def submit_collab(
         self,
         assignments: list[tuple[Host, int]],
@@ -253,10 +267,7 @@ class JobManager:
             rank += nproc
 
         launched = await asyncio.gather(
-            *(
-                self.runner.exec_on(host, launch, timeout=90, workdir=False)
-                for host, _, _, launch in pending
-            )
+            *(self._launch(host, launch) for host, _, _, launch in pending)
         )
         for (host, job_id, session, _), res in zip(pending, launched, strict=True):
             results.append(res)

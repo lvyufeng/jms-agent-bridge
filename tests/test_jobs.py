@@ -79,6 +79,69 @@ def test_validate_job_id_accepts_8_hex():
     _validate_job_id("0123abcd")
 
 
+# --- coordinated launch (ranks) -----------------------------------------------------
+
+
+class _CollabRunner:
+    """Records each launch; a named rank may raise instead of returning a result."""
+
+    def __init__(self, explode="_none_"):
+        self.explode = explode
+        self.launched = []
+        self.commands = {}
+
+    async def exec_on(self, host, command, *, timeout=90, workdir=False):
+        self.launched.append(host.name)
+        self.commands[host.name] = command
+        if host.name == self.explode:
+            raise RuntimeError("ssh binary vanished")
+        return ExecResult(host.name, 0, "LAUNCHER=tmux", "")
+
+
+def test_collab_launch_isolates_one_rank_that_raises():
+    """One rank raising must not discard every other rank's launch result.
+
+    An unguarded gather lets a single rank's transport error surface the whole
+    collective as an opaque tool error, hiding which nodes actually came up.
+    """
+    runner = _CollabRunner(explode="b")
+    hosts = [Host(name=n, login="u", asset_id="A") for n in ("a", "b", "c")]
+    handles, results = asyncio.run(
+        JobManager(runner).submit_collab(
+            [(h, 2) for h in hosts],
+            "torchrun train.py",
+            master_addr="10.0.0.1",
+            port=29400,
+            world_size=6,
+        )
+    )
+    # every rank produced a result; only the healthy ones produced a job handle
+    assert [r.host for r in results] == ["a", "b", "c"]
+    assert [h.host for h in handles] == ["a", "c"]
+    failed = results[1]
+    assert failed.ok is False and "launch failed" in failed.stderr
+
+
+def test_collab_assigns_ranks_in_order_over_nproc():
+    runner = _CollabRunner()
+    hosts = [Host(name=n, login="u", asset_id="A") for n in ("a", "b")]
+    asyncio.run(
+        JobManager(runner).submit_collab(
+            [(hosts[0], 8), (hosts[1], 2)],
+            "torchrun train.py",
+            master_addr="10.0.0.1",
+            port=29400,
+            world_size=10,
+        )
+    )
+    assert runner.launched == ["a", "b"]
+    # ranks advance by nproc, and every rank is told the same world size
+    assert "export JMS_RANK='0'" in runner.commands["a"]
+    assert "export JMS_RANK='8'" in runner.commands["b"]
+    assert "export JMS_NPROC='2'" in runner.commands["b"]
+    assert "export JMS_WORLD_SIZE='10'" in runner.commands["b"]
+
+
 @pytest.mark.parametrize("bad", ["", "xyz", "deadbeef00", "../etc", "ABCD1234", "a;b"])
 def test_validate_job_id_rejects_bad(bad):
     with pytest.raises(ValueError):

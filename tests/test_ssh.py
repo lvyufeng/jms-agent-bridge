@@ -1,4 +1,8 @@
-from jms_bridge.config import BastionConfig
+import asyncio
+
+import pytest
+
+from jms_bridge.config import BastionConfig, ConfigError
 from jms_bridge.inventory import Host
 from jms_bridge.ssh import ExecResult, SSHRunner
 
@@ -99,3 +103,45 @@ def test_exec_on_env_setup_false_omits_source_line():
 
     asyncio.run(r.exec_on(h, "echo hi", env_setup=True, workdir=False))
     assert "source /opt/cann/set_env.sh" in captured["script"]
+
+
+# --- a missing local tool must say what to install ----------------------------------
+
+
+def _hide_tool(monkeypatch, *binaries):
+    """Pretend ``binaries`` are absent, leaving every other tool alone."""
+    import shutil
+
+    real = shutil.which
+
+    def which(name, *a, **kw):
+        return None if name in binaries else real(name, *a, **kw)
+
+    monkeypatch.setattr("jms_bridge.ssh.shutil.which", which)
+
+
+def test_missing_ssh_says_what_to_install(monkeypatch):
+    # `create_subprocess_exec` would raise a bare FileNotFoundError, which the MCP SDK
+    # shows the agent as "Error executing tool <name>" — useless on a fresh clone.
+    _hide_tool(monkeypatch, "ssh")
+    r = make_runner()
+    with pytest.raises(ConfigError) as e:
+        asyncio.run(r.exec_on(Host(name="a", login="u", asset_id="A"), "echo hi"))
+    assert "`ssh` is not installed" in str(e.value)
+
+
+def test_missing_rsync_says_what_to_install(monkeypatch):
+    _hide_tool(monkeypatch, "rsync")
+    r = make_runner()
+    host = Host(name="a", login="u", asset_id="A")
+    with pytest.raises(ConfigError) as e:
+        asyncio.run(r.rsync(host, "/local", "/remote"))
+    assert "`rsync` is not installed" in str(e.value)
+
+
+def test_missing_sshpass_is_a_config_error(monkeypatch):
+    _hide_tool(monkeypatch, "sshpass")
+    r = make_runner(ssh_password="s3cret")
+    with pytest.raises(ConfigError) as e:
+        r._ssh_argv(Host(name="a", login="u", asset_id="A"))
+    assert "sshpass" in str(e.value) and "install" in str(e.value)
