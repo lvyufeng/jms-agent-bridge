@@ -50,6 +50,23 @@
 
 ### Fixed
 
+- **An incremental job-log poll could silently skip output.** `jms_job_logs` returned the
+  file's *total* size while the read was clipped at `max_bytes`, and polling with it (as
+  both the tool and the README instructed) skipped everything between the clip and EOF —
+  routine for a training log. The result now carries `next_offset`, where the read
+  actually stopped, and the docs point at it.
+- **`jms_dev_logs` re-ran the drill-in under the wrong interpreter.** It ignored the
+  workspace's `env_setup`, so a failing test was re-run under the container's default
+  interpreter — the wrong ABI on most chips — and reported the cause of a failure the
+  fleet run never hit. Activation now precedes the repo `cd`, exactly as `jms_dev_run`.
+- **A `push` workspace with `local: ~/...` delivered a directory literally named `~`.**
+  rsync runs through `exec` with no shell, so `~` was never expanded and the chip could
+  run stale code while the run still looked green; `local` is now `expanduser`-ed, the
+  same way `_local_sha` already did.
+- **A job could abort before its command ever started when `env_setup` read an unset
+  variable.** `jms_submit_job`'s runner script runs under `set -u`, and vendor env
+  scripts (CANN's `set_env.sh`, many conda hooks) reference variables that may be unset;
+  the runner now relaxes `-u` around `env_setup`, matching `wrap_command`.
 - **Declare `tomli` for Python 3.10.** `config.py` falls back to `tomli` when
   `tomllib` is absent, but `tomli` was not a declared dependency, so an install on 3.10
   crashed at import. Now a conditional dependency.

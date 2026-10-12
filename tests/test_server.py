@@ -367,6 +367,107 @@ def test_dev_run_unreadable_attestation_is_unverified_not_ok(monkeypatch):
     assert r["ok"] is False
 
 
+# --- jms_dev_logs and the delivery path (git / push) --------------------------------
+
+
+def test_dev_logs_reruns_under_the_container_env(monkeypatch):
+    # The point of this tool is to say why a test failed on a chip, so it must re-run
+    # under the very interpreter the fleet run used — activation before the repo cd.
+    ws = Workspace(
+        name="a", host="h1", container="c", repo="/work/Torch-FL", source="git",
+        env_setup="source /shared/env.sh && conda activate fl-env",
+    )
+    fake = _install(monkeypatch, [ws], {"pytest": (0, "1 failed", "")})
+    r = asyncio.run(S.jms_dev_logs("a", "tests/unit/test_softmax.py::test_x"))
+    assert r["ok"] is True
+    sent = fake.calls[0]["command"]
+    assert "conda activate fl-env; cd -- " in sent
+    assert "tests/unit/test_softmax.py::test_x" in sent
+    assert "-q --tb=long -rA" in sent          # drill-in needs the full traceback
+    assert sent.index("conda activate fl-env") < sent.index("cd -- ")
+    # env_setup is inlined in-container; the *host* env must stay untouched
+    assert fake.calls[0]["env_setup"] is False
+
+
+def test_dev_logs_without_env_setup_cds_straight_into_the_repo(monkeypatch):
+    fake = _install(monkeypatch, [_ws("a", "h1")], {"pytest": (0, "1 passed", "")})
+    asyncio.run(S.jms_dev_logs("a", "tests/unit/test_softmax.py::test_x"))
+    inner = fake.calls[0]["command"].split("bash -lc ")[1]
+    # no env_setup -> no `; ` (not even an empty one) leading into the cd
+    assert inner.startswith("'cd -- ")
+    assert "/work/Torch-FL" in inner
+
+
+def test_dev_sync_git_reports_the_sha_the_container_landed_on(monkeypatch):
+    fake = _install(monkeypatch, [_ws("a", "h1")], {"git fetch": (0, "abc1234\n", "")})
+    r = asyncio.run(S.jms_dev_sync(["all"], "main"))
+    assert r["ok"] is True
+    assert r["results"][0]["sha"] == "abc1234"
+    assert r["results"][0]["ref_pinned"] is True
+    sent = fake.calls[0]["command"]
+    assert "git fetch origin " in sent and "main" in sent and "--depth=1" in sent
+    # the ref is pinned by explicit fetch + detached checkout, not a bare `checkout`
+    assert "git checkout -f --detach FETCH_HEAD" in sent
+    assert "git rev-parse HEAD" in sent                    # which commit actually landed
+    assert fake.calls[0]["env_setup"] is False
+
+
+def test_dev_sync_git_without_a_sha_is_a_failed_delivery(monkeypatch):
+    # A chip whose rev-parse yields no sha-shaped line cannot prove which code it
+    # holds; delivering "something" is not the same as delivering `ref`.
+    _install(monkeypatch, [_ws("a", "h1")], {"git fetch": (0, "Welcome\n", "")})
+    r = asyncio.run(S.jms_dev_sync(["all"], "main"))
+    assert r["ok"] is False
+    assert r["results"][0]["sha"] is None
+
+
+def test_dev_sync_push_rsyncs_the_expanded_local_tree(monkeypatch, tmp_path):
+    # `local:` is commonly `~/...` and rsync is exec'd with no shell, so a literal `~`
+    # would push a directory *named* `~`: every chip would run stale code and the run
+    # would still look green.
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    push = Workspace(
+        name="p", host="h2", container="c", repo="/work/Torch-FL", source="push",
+        mount="/srv/fl", local="~/tree",
+    )
+    inv = Inventory(
+        hosts={"h2": Host(name="h2", login="u", asset_id="A")},
+        groups={}, workspaces={"p": push},
+    )
+    fake = _FakeSSH({})
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", fake)
+    r = asyncio.run(S.jms_dev_sync(["all"], "main"))
+    assert r["ok"] is True
+    puts = [c for c in fake.calls if "rsync" in c]
+    assert puts, "push delivery must go through rsync"
+    assert puts[0]["rsync"] == (str(tree), "/srv/fl")   # expanded, not "~/tree"
+    # push never applies `ref` in-container
+    assert r["results"][0]["ref_pinned"] is False
+
+
+def test_job_logs_tool_surfaces_the_next_offset(monkeypatch):
+    # The MCP tool is where the byte-offset contract reaches the agent: it must hand
+    # back the resume point, not just the file size.
+    from jms_bridge.jobs import JobManager
+
+    class _LogRunner:
+        async def exec_on(self, host, command, *, timeout=60, workdir=True):
+            return ExecResult(host.name, 0, "size=100000\n" + "x" * 10, "")
+
+    inv = Inventory(
+        hosts={"h1": Host(name="h1", login="u", asset_id="A")}, groups={}, workspaces={}
+    )
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "jobs", JobManager(_LogRunner()))
+    r = asyncio.run(S.jms_job_logs("h1", "deadbeef", offset=0, max_bytes=10))
+    assert r["ok"] is True
+    assert r["size"] == 100000
+    assert r["next_offset"] == 10
+
+
 # --- jms_dev_discover ---------------------------------------------------------------
 
 _DISCOVERED = (

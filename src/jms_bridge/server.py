@@ -356,7 +356,7 @@ async def jms_job_status(targets: list[str], job_id: str) -> dict:
 async def jms_job_logs(
     host: str, job_id: str, offset: int = 0, max_bytes: int = 65536
 ) -> dict:
-    """Read a job's log from `offset` onward. Poll with the returned `size` as the next offset."""
+    """Read a job's log from `offset` onward. Poll with the returned `next_offset`."""
     h = _inv().resolve([host])[0]
     return {"ok": True, **(await _jobs().logs(h, job_id, offset=offset, max_bytes=max_bytes))}
 
@@ -461,8 +461,16 @@ async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
     """
     host = _host_of(ws)
     if ws.source == "push":
+        # `local:` is commonly `~/...` (the shipped example uses it), and rsync runs
+        # via exec with no shell, so `~` would stay literal and the whole delivery
+        # would silently push a path named `~`. `_local_sha` expands it for the same
+        # reason; the path that actually reaches rsync must match.
         res = await _ssh().rsync(
-            host, ws.local, ws.mount, direction="push", excludes=_DEFAULT_EXCLUDES
+            host,
+            os.path.expanduser(ws.local),
+            ws.mount,
+            direction="push",
+            excludes=_DEFAULT_EXCLUDES,
         )
         sha = await asyncio.to_thread(_local_sha, ws.local)
         return {
@@ -681,9 +689,15 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
     """
     ws = _inv().resolve_workspaces([workspace])[0]
     host = _host_of(ws)
+    # Activate the container env *before* the repo `cd`, exactly as jms_dev_run does.
+    # The whole point of this tool is to say why a test failed on a chip; re-running
+    # it under the container's default interpreter (the wrong ABI on most chips)
+    # would report the cause of a failure that is not the one the fleet run hit.
+    env_prefix = f"{ws.env_setup}; " if ws.env_setup else ""
     inner = (
-        f"cd -- {shell_quote(ws.repo)} && python -m pytest "
-        f"{shell_quote(test_id)} -q --tb=long -rA"
+        env_prefix
+        + f"cd -- {shell_quote(ws.repo)} && python -m pytest "
+        + f"{shell_quote(test_id)} -q --tb=long -rA"
     )
     res = await _ssh().exec_on(
         host,

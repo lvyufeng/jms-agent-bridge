@@ -1,6 +1,10 @@
+import asyncio
+
 import pytest
 
-from jms_bridge.jobs import _validate_job_id, build_runner_script
+from jms_bridge.inventory import Host
+from jms_bridge.jobs import JobManager, _validate_job_id, build_runner_script
+from jms_bridge.ssh import ExecResult
 
 
 def test_runner_exports_rank_wiring_for_collab():
@@ -58,6 +62,18 @@ def test_runner_isolates_command_exit_in_subshell():
     assert script.index("code=$?") > script.index("exit 7")
 
 
+def test_runner_relaxes_nounset_around_env_setup_only():
+    """Vendor env scripts (CANN's set_env.sh, conda hooks) read possibly-unset vars,
+    and this script runs under `set -u` — without the guard one unset var aborts the
+    job before the command ever starts. The relaxation must bracket only env_setup."""
+    script = build_runner_script("abcd1234", "python train.py", "source /opt/cann/set_env.sh")
+    assert "set +u\nsource /opt/cann/set_env.sh\nset -u" in script
+    # `set -u` is back on by the time the command runs
+    assert script.index("set -u\n") < script.index("python train.py")
+    # no env_setup -> nothing to relax, and `-u` stays on throughout
+    assert "set +u" not in build_runner_script("abcd1234", "echo hi", None)
+
+
 def test_validate_job_id_accepts_8_hex():
     _validate_job_id("deadbeef")
     _validate_job_id("0123abcd")
@@ -67,3 +83,55 @@ def test_validate_job_id_accepts_8_hex():
 def test_validate_job_id_rejects_bad(bad):
     with pytest.raises(ValueError):
         _validate_job_id(bad)
+
+
+# --- incremental log polling --------------------------------------------------------
+
+
+class _LogsRunner:
+    """Stands in for the SSHRunner: replays one canned `size=<n>\\n<body>` response."""
+
+    def __init__(self, stdout):
+        self.stdout = stdout
+        self.commands = []
+
+    async def exec_on(self, host, command, *, timeout=60, workdir=True):
+        self.commands.append(command)
+        return ExecResult(host.name, 0, self.stdout, "")
+
+
+def _job_logs(stdout, *, offset=0, max_bytes=65536):
+    runner = _LogsRunner(stdout)
+    host = Host(name="h1", login="u", asset_id="A")
+    out = asyncio.run(JobManager(runner).logs(host, "deadbeef", offset=offset, max_bytes=max_bytes))
+    return out, runner
+
+
+def test_job_logs_clipped_read_does_not_skip_the_unread_middle():
+    # A training log dwarfs the 64 KiB cap, so the read is clipped. `size` is the whole
+    # file; resuming the next poll at `size` would silently drop everything between the
+    # clip and EOF. `next_offset` is where this read actually stopped.
+    out, _ = _job_logs("size=100000\n" + "x" * 10, offset=0, max_bytes=10)
+    assert out["size"] == 100000
+    assert out["next_offset"] == 10
+    assert out["offset"] == 0
+    assert len(out["log"]) == 10
+
+
+def test_job_logs_clipped_read_advances_from_a_mid_file_offset():
+    out, runner = _job_logs("size=100000\n" + "y" * 2048, offset=40, max_bytes=2048)
+    assert out["next_offset"] == 40 + 2048
+    # the remote must resume at the caller's offset, not at the start of the file
+    assert "tail -c +41" in runner.commands[0]
+
+
+def test_job_logs_next_offset_reaches_eof_when_the_rest_fits():
+    out, _ = _job_logs("size=120\n" + "z" * 80, offset=40, max_bytes=65536)
+    assert out["next_offset"] == 120 == out["size"]
+
+
+def test_job_logs_missing_file_advances_nowhere():
+    out, _ = _job_logs("size=0\n", offset=0, max_bytes=65536)
+    assert out["log"] == ""
+    assert out["size"] == 0
+    assert out["next_offset"] == 0

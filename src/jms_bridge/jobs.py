@@ -86,7 +86,11 @@ def build_runner_script(
         'R="$(cd "$(dirname "$0")" && pwd)"',
     ]
     if env_setup:
-        lines.append(env_setup)
+        # Vendor env scripts (CANN's set_env.sh, conda hooks) reference variables that
+        # may be unset, and this script runs under `set -u` — without relaxing it a
+        # single unset variable would abort the job before the command ever starts.
+        # Same guard as :func:`~jms_bridge.inventory.wrap_command`.
+        lines += ["set +u", env_setup, "set -u"]
     wd = _workdir_expr(workdir)
     if wd:
         # Run in the host workdir when it exists, else stay in the job dir.
@@ -298,7 +302,14 @@ class JobManager:
     async def logs(
         self, host: Host, job_id: str, *, offset: int = 0, max_bytes: int = 65536
     ) -> dict:
-        """Return log bytes from ``offset`` onward (for incremental polling)."""
+        """Return log bytes from ``offset`` onward (for incremental polling).
+
+        The caller continues from ``next_offset``, *not* from ``size``. ``size`` is the
+        whole file, while the read is ``tail -c +offset+1 | head -c max_bytes`` — so
+        when more than ``max_bytes`` is outstanding (routine for a training log) the
+        bytes past the cap are still unread, and resuming at ``size`` would skip them.
+        ``next_offset`` is where this read actually stopped.
+        """
         _validate_job_id(job_id)
         log_path = f"{_job_root(host, job_id)}/stdout.log"
         cmd = (
@@ -318,7 +329,22 @@ class JobManager:
             except ValueError:
                 size = 0
             body = rest
-        return {"host": host.name, "job_id": job_id, "offset": offset, "size": size, "log": body}
+        # Bytes this read actually delivered. `tail -c +N | head -c M` is a byte-faithful
+        # pipe, so the count is arithmetic: min(M, unread-at-the-time-`stat`-ran). Note
+        # it is *not* `len(body.encode())` — a clip mid-UTF-8-sequence decodes to one
+        # replacement char that re-encodes wider than the bytes behind it, and that
+        # overshoot would skip data, the very thing this field exists to prevent.
+        # `size` is read before `tail`, so a log growing in between only under-advances
+        # (the next poll re-reads a few bytes); the alternative loses them outright.
+        consumed = max(0, min(int(max_bytes), size - int(offset)))
+        return {
+            "host": host.name,
+            "job_id": job_id,
+            "offset": offset,
+            "size": size,
+            "next_offset": int(offset) + consumed,
+            "log": body,
+        }
 
     async def cancel(self, host: Host, job_id: str) -> dict:
         _validate_job_id(job_id)
