@@ -14,13 +14,16 @@ use so that ``import`` never fails just because the inventory is not written yet
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import re
 import subprocess
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from .api import JumpServerAPI, JumpServerError
 from .cluster import (
@@ -30,9 +33,9 @@ from .cluster import (
     preflight,
     resolve_rendezvous,
 )
-from .config import BastionConfig, load_config
+from .config import BastionConfig, ConfigError, load_config
 from .discover import DEFAULT_REPO_MATCH
-from .inventory import Host, Inventory, shell_quote
+from .inventory import Host, Inventory, InventoryError, shell_quote
 from .jobs import JobManager
 from .ssh import SSHRunner
 from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
@@ -40,6 +43,35 @@ from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 log = logging.getLogger("jms_bridge.server")
 
 server = MCPServer("jms-agent-bridge")
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _tool() -> Callable[[_F], _F]:
+    """``@server.tool()``, with setup failures turned into a readable ``ToolError``.
+
+    ``ConfigError`` (no bastion URL, unreadable config) and ``InventoryError``
+    (missing/malformed ``hosts.yaml``, or a selector that matched nothing) are raised
+    from the lazy state helpers and from ``resolve()`` inside almost every tool. The
+    SDK forwards the *text* of a ``ToolError`` to the client; anything else reaches the
+    agent as the opaque ``Error executing tool <name>`` — which is exactly, and
+    uselessly, what a freshly-cloned-but-unconfigured checkout would see. Translating
+    keeps the actionable message ("No inventory at …; create one or set
+    JMS_BRIDGE_INVENTORY") in front of the agent.
+    """
+
+    def decorate(fn: _F) -> _F:
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await fn(*args, **kwargs)
+            except (ConfigError, InventoryError) as exc:
+                raise ToolError(str(exc)) from exc
+
+        return server.tool()(wrapper)  # type: ignore[return-value]
+
+    return decorate
+
 
 # --- lazily-initialised singletons ------------------------------------------------
 
@@ -83,12 +115,15 @@ def _resolve(selectors: list[str]) -> list[Host]:
 # --- control plane: discovery / audit / tickets -----------------------------------
 
 
-@server.tool()
+@_tool()
 async def jms_list_assets(search: str | None = None) -> dict:
-    """List assets this account can reach in JumpServer, with their bound accounts.
+    """List the assets this account can reach in JumpServer.
 
-    Use this to discover asset ids for the inventory. Returns assets (id, name, ip,
-    platform) and, for the first page, each asset's system-user accounts.
+    Use this to discover the ``asset_id`` values the inventory needs. Returns each
+    asset's id, name, address and platform. Bound accounts are *not* included — this
+    call is one REST request, and enumerating the ``#account`` part of every login
+    would be one request per asset. For a single asset, either read it from the
+    JumpServer UI or use the asset's detail endpoint.
     """
     api = _api()
     try:
@@ -110,7 +145,7 @@ async def jms_list_assets(search: str | None = None) -> dict:
     return {"ok": True, "count": len(out), "assets": out}
 
 
-@server.tool()
+@_tool()
 async def jms_audit_query(
     asset_id: str | None = None, user: str | None = None, days: int = 5, limit: int = 30
 ) -> dict:
@@ -144,7 +179,7 @@ async def jms_audit_query(
     }
 
 
-@server.tool()
+@_tool()
 async def jms_create_ticket(
     title: str,
     ticket_type: str = "login_asset_confirm",
@@ -178,7 +213,7 @@ async def jms_create_ticket(
 # --- data plane: probe / exec -----------------------------------------------------
 
 
-@server.tool()
+@_tool()
 async def jms_probe(targets: list[str]) -> dict:
     """Probe hosts for liveness, accelerator type and driver/runtime version.
 
@@ -205,7 +240,7 @@ async def jms_probe(targets: list[str]) -> dict:
     return {"ok": all(r["ok"] for r in results), "hosts": results}
 
 
-@server.tool()
+@_tool()
 async def jms_exec(
     targets: list[str], command: str, timeout: float = 60.0, allow_dangerous: bool = False
 ) -> dict:
@@ -229,7 +264,7 @@ async def jms_exec(
 # --- data plane: file sync --------------------------------------------------------
 
 
-@server.tool()
+@_tool()
 async def jms_sync_push(
     targets: list[str],
     local: str,
@@ -248,7 +283,7 @@ async def jms_sync_push(
     return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
 
 
-@server.tool()
+@_tool()
 async def jms_sync_pull(
     targets: list[str], remote: str, local: str, excludes: list[str] | None = None
 ) -> dict:
@@ -279,16 +314,20 @@ async def _gather_rsync(hosts, local, remote, direction, excludes, delete):  # n
 # --- data plane: jobs -------------------------------------------------------------
 
 
-@server.tool()
-async def jms_submit_job(targets: list[str], command: str) -> dict:
+@_tool()
+async def jms_submit_job(targets: list[str], command: str, allow_dangerous: bool = False) -> dict:
     """Launch a long-running command (e.g. Torch-FL training) detached on each host.
 
     Returns immediately with a job id per host. The command runs inside a tmux
     session with its env activated, writing to a log you poll with `jms_job_logs`.
     Use this — never `jms_exec` — for anything that outlives a tool call.
     """
-    if _looks_dangerous(command):
-        return {"ok": False, "error": "command matched the safety denylist", "command": command}
+    if _looks_dangerous(command) and not allow_dangerous:
+        return {
+            "ok": False,
+            "error": "command matched the safety denylist; pass allow_dangerous=true to override",
+            "command": command,
+        }
     hosts = _resolve(targets)
     jobs = _jobs()
     out = []
@@ -305,7 +344,7 @@ async def jms_submit_job(targets: list[str], command: str) -> dict:
     return {"ok": all(o["launched"] for o in out), "jobs": out}
 
 
-@server.tool()
+@_tool()
 async def jms_job_status(targets: list[str], job_id: str) -> dict:
     """Check a job's status on each targeted host (status, exit code, log size, alive)."""
     hosts = _resolve(targets)
@@ -313,7 +352,7 @@ async def jms_job_status(targets: list[str], job_id: str) -> dict:
     return {"ok": True, "status": list(results)}
 
 
-@server.tool()
+@_tool()
 async def jms_job_logs(
     host: str, job_id: str, offset: int = 0, max_bytes: int = 65536
 ) -> dict:
@@ -322,7 +361,7 @@ async def jms_job_logs(
     return {"ok": True, **(await _jobs().logs(h, job_id, offset=offset, max_bytes=max_bytes))}
 
 
-@server.tool()
+@_tool()
 async def jms_job_cancel(host: str, job_id: str) -> dict:
     """Kill a running job on one host."""
     h = _inv().resolve([host])[0]
@@ -332,18 +371,26 @@ async def jms_job_cancel(host: str, job_id: str) -> dict:
 # --- dev loop: workspace sync / run / logs -----------------------------------------
 
 
-@server.tool()
+@_tool()
 async def jms_inventory_reload() -> dict:
-    """Re-read `hosts.yaml` and drop the cached inventory.
+    """Re-read `hosts.yaml` (and the config) and drop everything cached from them.
 
     The advertised dev loop is *emit YAML → paste into `hosts.yaml` → run*, but every
     tool reads the inventory through a cache populated on first use. Without this the
     paste step silently needs an MCP restart before the new hosts/workspaces appear.
     Call this after editing the inventory; the next tool call re-reads from disk.
 
+    The config is dropped too, and for the same reason: `jms-bridge login` caches a
+    session token *into the config file*, so a server started before logging in would
+    otherwise hold a credential-less config until it was restarted.
+
     Returns the freshly loaded summary so the caller can confirm the paste landed.
     """
-    _state.pop("inv", None)
+    stale_ssh = _state.pop("ssh", None)
+    if stale_ssh is not None:
+        await stale_ssh.close()  # else each reload leaks a ControlMaster socket dir
+    for key in ("inv", "cfg", "jobs", "api"):
+        _state.pop(key, None)
     try:
         inv = _inv()
     except Exception as exc:  # noqa: BLE001 - surface any load error to the agent
@@ -450,7 +497,7 @@ async def _deliver(ws, ref: str) -> dict:  # noqa: ANN001
     }
 
 
-@server.tool()
+@_tool()
 async def jms_dev_sync(targets: list[str], ref: str) -> dict:
     """Deliver a git `ref` to every selected workspace's container.
 
@@ -469,7 +516,7 @@ async def jms_dev_sync(targets: list[str], ref: str) -> dict:
     }
 
 
-@server.tool()
+@_tool()
 async def jms_dev_run(
     targets: list[str], ref: str, timeout: float = 600.0, ut_cmd: str | None = None
 ) -> dict:
@@ -542,7 +589,7 @@ async def jms_dev_run(
     async def one(ws):  # noqa: ANN001, ANN202
         host = _host_of(ws)
         # Run the suite from inside the repo: the container's default cwd is not
-        # the checkout, so `python -m pytest tests/` would not find the tests.
+        # the checkout, so `python -m pytest tests/unit` would not find the tests.
         # `cd --` so a repo path beginning with `-` is not read as a cd option.
         # `set -o pipefail` *inside the subshell* is essential: the inner runs under
         # `docker exec ... bash -lc`, a fresh shell that inherits neither `-e` nor
@@ -625,7 +672,7 @@ async def jms_dev_run(
     return table
 
 
-@server.tool()
+@_tool()
 async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> dict:
     """Full output for one `test_id` on one `workspace` (drill into a FAIL).
 
@@ -655,7 +702,7 @@ async def jms_dev_logs(workspace: str, test_id: str, timeout: float = 300.0) -> 
     }
 
 
-@server.tool()
+@_tool()
 async def jms_dev_discover(
     targets: list[str],
     container: str = DEFAULT_CONTAINER,
@@ -757,7 +804,7 @@ async def jms_dev_discover(
 # --- cluster: preflight + coordinated launch ---------------------------------------
 
 
-@server.tool()
+@_tool()
 async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_PORT) -> dict:
     """Check a cluster is ready for a distributed run, host by host.
 
@@ -781,7 +828,7 @@ async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_POR
     }
 
 
-@server.tool()
+@_tool()
 async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) -> dict:
     """Plan a federated layout for a target set, grouped by communication backend.
 
@@ -816,7 +863,7 @@ async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) ->
     }
 
 
-@server.tool()
+@_tool()
 async def jms_cluster_submit(
     targets: list[str],
     command: str,

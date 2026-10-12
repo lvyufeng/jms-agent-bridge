@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
+import os
 import shutil
 import sys
 from pathlib import Path
 
+import httpx
+
+from . import secrets
 from .api import JumpServerAPI, JumpServerError
-from .config import ConfigError, load_config
+from .config import ConfigError, config_path, inventory_path, load_config
 from .inventory import Inventory, InventoryError
 from .platforms import PLATFORMS
 from .ssh import SSHRunner
@@ -68,11 +73,14 @@ groups:
 
 
 def _config_path() -> Path:
-    return Path("~/.config/jms-bridge/config.toml").expanduser()
+    # Delegates to config.config_path so the CLI and the config loader agree on
+    # precedence (JMS_BRIDGE_CONFIG wins) — otherwise `login` would cache a token in
+    # the default file while the server read a different one.
+    return config_path()
 
 
 def _inventory_path() -> Path:
-    return Path("~/.config/jms-bridge/hosts.yaml").expanduser()
+    return inventory_path()
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -83,35 +91,58 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"exists, skipping (use --force to overwrite): {path}")
             continue
         path.write_text(template)
+        # The config holds (or will hold) credentials; keep it owner-only from the
+        # start rather than relying on a later `login` to tighten it.
+        if path == cfg_path:
+            os.chmod(path, 0o600)
         print(f"wrote {path}")
     print(
         "\nNext:\n"
         "  1. edit both files (bastion url, login_user, asset ids, workdirs)\n"
-        "  2. export JMS_BRIDGE_ACCESS_KEY_ID / JMS_BRIDGE_ACCESS_KEY_SECRET "
-        "(or JMS_BRIDGE_PRIVATE_TOKEN)\n"
+        "  2. jms-bridge login --save-password\n"
+        "     (prompts for the password; stores it in the OS keyring, else a 0600 file,\n"
+        "      so later logins need no secret — or export JMS_BRIDGE_PASSWORD instead)\n"
+        "     (if your deployment issues API keys:\n"
+        "      export JMS_BRIDGE_ACCESS_KEY_ID / JMS_BRIDGE_ACCESS_KEY_SECRET,\n"
+        "      or JMS_BRIDGE_PRIVATE_TOKEN)\n"
         "  3. jms-bridge doctor"
     )
     return 0
 
 
 async def cmd_login(args: argparse.Namespace) -> int:
-    """Exchange username+password for a private token and cache it in the config.
+    """Exchange username+password for a session token and cache it in the config.
 
     JumpServer's API is authenticated with a long-lived token, but the credential a
     person actually has is a username/password. This logs in once and writes the
     resulting token into the config file, so subsequent runs (and the MCP server) need
     no password. The token is not echoed to the terminal.
+
+    The password is read from ``--password``, then ``JMS_BRIDGE_PASSWORD``, then a
+    previously saved copy (keyring, else the 0600 credentials file), and only then
+    prompted for. ``--save-password`` stores it for next time; ``--forget`` deletes it.
     """
-    import os
     import re
+
+    if getattr(args, "forget", False):
+        cleared = secrets.forget_password()
+        print(
+            "forgot the saved password (" + ", ".join(cleared) + ")"
+            if cleared
+            else "no saved password to forget"
+        )
+        return 0
 
     cfg = load_config()
     username = args.username or cfg.login_user
-    password = args.password or os.environ.get("JMS_BRIDGE_PASSWORD")
+    password = args.password or secrets.get_password()
+    if not password and sys.stdin.isatty():
+        password = getpass.getpass(f"JumpServer password for {username or 'login'}: ")
     if not username or not password:
         print(
-            "error: need a username and password "
-            "(pass --username/--password, or set JMS_BRIDGE_PASSWORD)",
+            "error: need a username and password (pass --username/--password, set "
+            "JMS_BRIDGE_PASSWORD, or run `jms-bridge login --save-password` once to "
+            "store it for later logins)",
             file=sys.stderr,
         )
         return 2
@@ -119,13 +150,24 @@ async def cmd_login(args: argparse.Namespace) -> int:
     api = JumpServerAPI(cfg)
     try:
         token = await api.login_with_password(username, password)
-    except JumpServerError as exc:
+    except (JumpServerError, httpx.HTTPError) as exc:
+        # httpx failures (DNS, refused connection, TLS, timeout) are the *expected*
+        # first-run outcome for a mistyped bastion URL; report them as a message
+        # rather than a traceback.
         print(f"login failed: {exc}", file=sys.stderr)
         return 1
     finally:
         await api.aclose()
 
     path = _config_path()
+    if not path.exists():
+        print(
+            f"error: no config at {path}.\n"
+            "Run `jms-bridge init` first (or set JMS_BRIDGE_CONFIG to your config file), "
+            "then edit `bastion.url` before logging in.",
+            file=sys.stderr,
+        )
+        return 2
     text = path.read_text()
     line = f'session_token = "{token}"'
     if re.search(r"(?m)^\s*session_token\s*=", text):
@@ -137,6 +179,8 @@ async def cmd_login(args: argparse.Namespace) -> int:
     path.write_text(text)
     os.chmod(path, 0o600)
     print(f"logged in as {username}; token cached in {path} (mode 600)")
+    if getattr(args, "save_password", False):
+        print(f"saved the password to {secrets.save_password(password)}")
     return 0
 
 
@@ -167,6 +211,13 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
     except InventoryError as exc:
         print(f"  inventory FAIL {exc}")
         return 1
+
+    print("== credentials ==")
+    print(f"  JMS_BRIDGE_PASSWORD  {'set' if os.environ.get('JMS_BRIDGE_PASSWORD') else 'unset'}")
+    saved = secrets.stored_password_source()
+    print(f"  saved password       {saved or 'none (store: jms-bridge login --save-password)'}")
+    backend = secrets.keyring_backend() or f"unavailable ({secrets.KEYRING_HINT})"
+    print(f"  keyring backend      {backend}")
 
     print("== control plane ==")
     api = JumpServerAPI(cfg)
@@ -233,10 +284,20 @@ def main(argv: list[str] | None = None) -> int:
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(func=lambda a: asyncio.run(_sync(cmd_init, a)))
 
-    p_login = sub.add_parser("login", help="log in and cache a private token in the config")
+    p_login = sub.add_parser(
+        "login", help="log in with username/password and cache a session token in the config"
+    )
     p_login.add_argument("--username", help="defaults to bastion.login_user")
     p_login.add_argument(
         "--password", help="prefer JMS_BRIDGE_PASSWORD over argv (argv leaks to ps)"
+    )
+    p_login.add_argument(
+        "--save-password",
+        action="store_true",
+        help="store the password (OS keyring, else a 0600 file) so later logins need no secret",
+    )
+    p_login.add_argument(
+        "--forget", action="store_true", help="delete the saved password and exit"
     )
     p_login.set_defaults(func=lambda a: asyncio.run(cmd_login(a)))
 

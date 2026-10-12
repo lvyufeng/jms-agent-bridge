@@ -43,11 +43,20 @@ DEFAULT_CONTAINER = "lvyufeng-torch-fl"
 #: discover tool validates a caller-supplied container against the same rule.
 CONTAINER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
 
-#: Default unit-test command; overridable per workspace. Any override MUST emit
-#: pytest ``-rA`` short-summary lines (``PASSED/FAILED/ERROR/SKIPPED ... <id> - <msg>``)
-#: — the cross-chip consistency table is built from them, so a command that does not
-#: emit them yields zero rows and the run is reported as not-ok.
-DEFAULT_UT_CMD = "python -m pytest tests/ -q --tb=line -rA"
+#: Default unit-test command; overridable per workspace. Scoped to ``tests/unit`` rather
+#: than a bare ``tests/``, because that is the *target repo*'s canonical agnostic suite
+#: (its CI runs an explicit job over ``tests/unit/test_*.py``, never the whole tree) —
+#: and because a bare ``tests/`` collection is not portability-safe anyway:
+#: ``tests/manual/**`` and ``tests/perf/**`` are
+#: hardware-bound dev scripts, not part of any suite — some even parse ``sys.argv`` at
+#: import (``tests/manual/metax/test_qwen3_fsdp2_metax.py`` does), which aborts collection
+#: with an argparse ``SystemExit(2)`` because pytest's argv is what gets parsed.
+#: ``tests/integration/**`` needs models and datasets, so it stays a separate explicit
+#: run. Any override MUST emit pytest ``-rA`` short-summary lines
+#: (``PASSED/FAILED/ERROR/SKIPPED ... <id> - <msg>``) — the cross-chip consistency table
+#: is built from them, so a command that does not emit them yields zero rows and the run
+#: is reported as not-ok.
+DEFAULT_UT_CMD = "python -m pytest tests/unit -q --tb=line -rA"
 
 
 class WorkspaceError(RuntimeError):

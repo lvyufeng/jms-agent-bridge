@@ -15,5 +15,6 @@ venv/
 # Anchored to the repo root so `examples/` (scrubbed, placeholder-only) stays tracked.
 /config.toml
 /hosts.yaml
+/credentials.toml
 *.local.toml
 *.local.yaml

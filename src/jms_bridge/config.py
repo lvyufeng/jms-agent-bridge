@@ -3,6 +3,12 @@
 Config lives at ``~/.config/jms-bridge/config.toml`` (overridable with the
 ``JMS_BRIDGE_CONFIG`` env var). Secrets are never required to be in this file:
 every value can be supplied or overridden from the environment.
+
+``jms-bridge login`` may also *persist* credentials, and it keeps them in a separate
+``~/.config/jms-bridge/credentials.toml`` (mode 600, overridable with
+``JMS_BRIDGE_CREDENTIALS``) rather than in ``config.toml``. The split is deliberate:
+``config.toml`` is hand-written and safe to share or keep in a dotfiles repo, while the
+credentials file is machine-written, secret, and deletable with ``rm`` to revoke.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - 3.10 fallback
 
 DEFAULT_CONFIG_PATH = "~/.config/jms-bridge/config.toml"
 DEFAULT_INVENTORY_PATH = "~/.config/jms-bridge/hosts.yaml"
+DEFAULT_CREDENTIALS_PATH = "~/.config/jms-bridge/credentials.toml"
 
 
 @dataclass
@@ -70,24 +77,56 @@ def _env(name: str) -> str | None:
     return v if v else None
 
 
+def config_path(path: str | Path | None = None) -> Path:
+    """Resolve the config file path: env override, then explicit arg, then default.
+
+    The single source of truth for that order — :func:`load_config` and the CLI
+    both go through here, so ``jms-bridge login`` writes the same file the server
+    later reads even when ``JMS_BRIDGE_CONFIG`` points somewhere non-default.
+    """
+    if env := _env("JMS_BRIDGE_CONFIG"):
+        return Path(env).expanduser()
+    if path:
+        return Path(_expand(str(path))).expanduser()
+    return Path(_expand(str(DEFAULT_CONFIG_PATH)))
+
+
+def credentials_path(path: str | Path | None = None) -> Path:
+    """Resolve the credentials file path: env override, then explicit arg, then default.
+
+    The sibling of :func:`config_path` for the machine-written secret file, so the CLI
+    and :mod:`jms_bridge.secrets` agree on where a saved password lives
+    (``JMS_BRIDGE_CREDENTIALS`` wins over everything).
+    """
+    if env := _env("JMS_BRIDGE_CREDENTIALS"):
+        return Path(env).expanduser()
+    if path:
+        return Path(_expand(str(path))).expanduser()
+    return Path(_expand(str(DEFAULT_CREDENTIALS_PATH)))
+
+
+def read_toml(path: Path) -> dict:
+    """Parse a TOML file into a dict, returning ``{}`` when it does not exist."""
+    if not path.exists():
+        return {}
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
+
+
 def load_config(path: str | Path | None = None) -> BastionConfig:
     """Load config from TOML, then let environment variables override.
 
     Environment overrides (useful for CI and for keeping secrets out of the file)::
 
-        JMS_BRIDGE_URL, JMS_BRIDGE_SSH_PORT, JMS_BRIDGE_LOGIN_USER,
-        JMS_BRIDGE_SSH_KEY, JMS_BRIDGE_ACCESS_KEY_ID, JMS_BRIDGE_ACCESS_KEY_SECRET,
-        JMS_BRIDGE_PRIVATE_TOKEN, JMS_BRIDGE_ORG_ID, JMS_BRIDGE_VERIFY_TLS
+        JMS_BRIDGE_CONFIG, JMS_BRIDGE_URL, JMS_BRIDGE_SSH_PORT, JMS_BRIDGE_LOGIN_USER,
+        JMS_BRIDGE_SSH_KEY, JMS_BRIDGE_SSH_PASSWORD, JMS_BRIDGE_ACCESS_KEY_ID,
+        JMS_BRIDGE_ACCESS_KEY_SECRET, JMS_BRIDGE_PRIVATE_TOKEN,
+        JMS_BRIDGE_SESSION_TOKEN, JMS_BRIDGE_ORG_ID, JMS_BRIDGE_VERIFY_TLS
     """
 
-    cfg_path = Path(_expand(str(path)) if path else _expand(str(DEFAULT_CONFIG_PATH)))
-    if cfg_path_or_env := _env("JMS_BRIDGE_CONFIG"):
-        cfg_path = Path(cfg_path_or_env).expanduser()
+    cfg_path = config_path(path)
 
-    data: dict = {}
-    if cfg_path.exists():
-        with cfg_path.open("rb") as fh:
-            data = tomllib.load(fh)
+    data = read_toml(cfg_path)
 
     bastion = data.get("bastion", {})
 

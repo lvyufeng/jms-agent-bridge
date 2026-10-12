@@ -1,13 +1,26 @@
 # Example jms-agent-bridge config.
 # Copy to ~/.config/jms-bridge/config.toml and adjust.
 #
-# Secrets are intentionally NOT here — pass them via the environment so they never
-# land in a dotfile you might sync or share:
+# Control-plane credentials: the easy path is `jms-bridge login`, which exchanges your
+# username/password for a session token ONCE and caches it in this file (chmod 600).
+#     jms-bridge login --save-password   # prompts; also stores the password itself —
+#                                        # OS keyring, else ~/.config/jms-bridge/credentials.toml (600)
+#     jms-bridge login                   # later runs reuse the saved password; no secret needed
+# (JMS_BRIDGE_PASSWORD='...' jms-bridge login still works for scripted setups, and
+#  JMS_BRIDGE_CREDENTIALS overrides where the saved password is kept. `login --forget`
+#  deletes it.)
+# If your deployment issues API keys instead, pass those via the environment so they
+# never land in a dotfile you might sync or share:
 #
 #   export JMS_BRIDGE_ACCESS_KEY_ID=...
 #   export JMS_BRIDGE_ACCESS_KEY_SECRET=...
 #   # or, for deployments that use a private token:
 #   export JMS_BRIDGE_PRIVATE_TOKEN=...
+#
+# Data-plane (KoKo SSH gateway) credentials: register an SSH key with JumpServer and
+# point `ssh_key` below at it — that is the recommended setup. Before the key is
+# registered, KoKo also accepts password auth: `export JMS_BRIDGE_SSH_PASSWORD=...`
+# (used via sshpass, installed locally, never on the remote host).
 
 [bastion]
 url = "https://bastion.example.com"

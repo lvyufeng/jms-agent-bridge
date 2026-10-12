@@ -2,7 +2,7 @@ import textwrap
 
 import pytest
 
-from jms_bridge.config import BastionConfig, ConfigError, load_config
+from jms_bridge.config import BastionConfig, ConfigError, credentials_path, load_config
 
 
 def test_env_overrides_file(tmp_path, monkeypatch):
@@ -44,3 +44,10 @@ def test_api_url_joining():
     cfg = BastionConfig(url="https://x/", api_base="/api/v1")
     assert cfg.api_url("assets/assets/") == "https://x/api/v1/assets/assets/"
     assert cfg.api_url("/accounts/accounts/") == "https://x/api/v1/accounts/accounts/"
+
+
+def test_credentials_path_precedence(tmp_path, monkeypatch):
+    monkeypatch.delenv("JMS_BRIDGE_CREDENTIALS", raising=False)
+    assert credentials_path(tmp_path / "a.toml") == tmp_path / "a.toml"
+    monkeypatch.setenv("JMS_BRIDGE_CREDENTIALS", str(tmp_path / "b.toml"))
+    assert credentials_path(tmp_path / "a.toml") == tmp_path / "b.toml"

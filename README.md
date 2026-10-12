@@ -39,10 +39,11 @@ needs:
 
 ```bash
 pip install -e .            # or: pipx install .
+pip install -e ".[keyring]" # optional: keep a saved password in the OS keyring
 ```
 
-Requires `ssh` and `rsync` on PATH (the bridge shells out to them and inherits your key
-agent).
+Requires Python 3.10+ and `ssh` + `rsync` on PATH (the bridge shells out to them and
+inherits your key agent).
 
 ## Configure
 
@@ -93,15 +94,19 @@ groups:
 Authenticate the control plane, then check it end to end:
 
 ```bash
-export JMS_BRIDGE_PASSWORD='...'   # your JumpServer password
-jms-bridge login                   # caches a session token in the config (mode 600)
+jms-bridge login --save-password   # prompts for your JumpServer password
 jms-bridge doctor                  # tooling → config → API → SSH, layer by layer
 jms-bridge probe cluster           # accelerator + driver/CANN version per host
 ```
 
 `login` exchanges your username/password for a token once, so the MCP server itself
-never handles a password. If your deployment issues API keys instead, skip `login`
-and set `JMS_BRIDGE_ACCESS_KEY_ID` / `JMS_BRIDGE_ACCESS_KEY_SECRET` or
+never handles a password. `JMS_BRIDGE_PASSWORD='...' jms-bridge login` still works for
+scripted setups. `--save-password` also **stores** the password — in the OS keyring
+when the `[keyring]` extra is installed, otherwise a mode-600
+`~/.config/jms-bridge/credentials.toml` — so later logins (a new shell, a token
+expiry) need no secret; `jms-bridge login --forget` deletes it and `jms-bridge doctor`
+reports what is stored and where. If your deployment issues API keys instead, skip
+`login` and set `JMS_BRIDGE_ACCESS_KEY_ID` / `JMS_BRIDGE_ACCESS_KEY_SECRET` or
 `JMS_BRIDGE_PRIVATE_TOKEN`.
 
 The **data plane** authenticates to the KoKo SSH gateway. Register an SSH key with
@@ -121,6 +126,15 @@ jms-bridge doctor
 claude mcp add jms-bridge -- jms-bridge serve
 ```
 
+The server reads your config file, so nothing else is needed once `jms-bridge login`
+has cached a token and `ssh_key` is set. If you are still on the password path, note
+that a shell `export` is **not** what the server sees — pass the variable explicitly
+(and add `--scope user` if you want it available from every directory):
+
+```bash
+claude mcp add jms-bridge --scope user -e JMS_BRIDGE_SSH_PASSWORD='...' -- jms-bridge serve
+```
+
 ## Tools
 
 19 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
@@ -128,7 +142,7 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 
 | Tool | Plane | What it does |
 |---|---|---|
-| `jms_list_assets` | REST | Assets + accounts this account can reach (for building the inventory) |
+| `jms_list_assets` | REST | Assets this account can reach (id, name, address, platform) — for building the inventory |
 | `jms_audit_query` | REST | Recent command records — "what did the agent run?" |
 | `jms_create_ticket` | REST | Raise an approval ticket when policy gates an action |
 | `jms_probe` | SSH | Liveness + accelerator + version across a host set |
@@ -143,7 +157,7 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_dev_sync` | SSH | Deliver a git `ref` into every selected workspace's container (git / proxy-git / push) |
 | `jms_dev_run` | SSH | Deliver `ref`, run the UT suite in every container, return **one cross-chip consistency table** |
 | `jms_dev_logs` | SSH | Full traceback for one `test_id` on one workspace (drill into a FAIL) |
-| `jms_inventory_reload` | — | Re-read `hosts.yaml` after editing it (drops the cached inventory; no restart) |
+| `jms_inventory_reload` | — | Re-read `hosts.yaml` **and the config** after editing either (drops the cached inventory, credentials and SSH connections; no restart) |
 
 Selectors accept host names, group names, or tags — `["cluster"]`, `["gpu"]`, `["all"]`.
 The `jms_dev_*` tools instead select **workspaces** by name, tag, or `all`.
@@ -231,6 +245,10 @@ workspaces:
     container: lvyufeng-torch-fl     # same container name on every host
     repo: /work/Torch-FL             # path *inside* the container
     source: git                      # git | proxy-git | push
+    # run *inside the container* before the `cd` and the UT command. Optional, but on
+    # most chips it is what makes the run real: the built `_C` extension targets one
+    # interpreter's ABI, and the container's default python is usually the wrong one.
+    env_setup: "source /shared/miniconda3/etc/profile.d/conda.sh && conda activate fl"
     tags: [ascend]
 
   fl-4090:
@@ -382,7 +400,11 @@ containers fetch), and once the table is green all the way across, opens the PR 
   (`rm -rf /`, `mkfs`, `dd if=`, fork bombs), overridable with `allow_dangerous=true`.
   This is a *typo guard*, not a security boundary — JumpServer's command blacklist and
   permission model are the real controls.
-- Secrets are read from env/config and never logged.
+- Secrets are read from env/config and never logged. A password saved with
+  `login --save-password` goes to the OS keyring when the `[keyring]` extra is present,
+  otherwise to a mode-600 `~/.config/jms-bridge/credentials.toml` (delete that file, or
+  run `login --forget`, to revoke); the session token `login` mints lives in
+  `config.toml`, also mode 600.
 
 ## License
 
