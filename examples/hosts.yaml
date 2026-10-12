@@ -41,7 +41,7 @@ hosts:
   rdk-board:
     login: your-login
     account: root
-    asset_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+    asset_id: 99999999-aaaa-bbbb-cccc-dddddddddddd
     platform: aarch64
     env_setup: "source ~/miniconda3/etc/profile.d/conda.sh && conda activate fl"
     workdir: ~/torch-fl
@@ -60,6 +60,8 @@ groups:
 #   source     git | proxy-git | push   (how `ref` reaches the container)
 #   proxy      required for proxy-git: HTTP proxy the container uses to reach GitHub
 #   mount/local required for push: host dir bind-mounted to `repo`, and the local tree to rsync
+#   env_setup  shell snippet run *inside the container* before the `cd` and the UT command —
+#              on most chips this is what puts the interpreter matching the built `_C` on PATH
 #   ut_cmd     must emit pytest -rA short-summary lines (the default already does)
 #   tags       free-form; usable as selectors, like host tags
 #
@@ -71,6 +73,7 @@ workspaces:
     container: lvyufeng-torch-fl
     repo: /work/Torch-FL
     source: git
+    env_setup: "source /usr/local/Ascend/ascend-toolkit/set_env.sh && conda activate fl"
     tags: [ascend]
 
   fl-4090:

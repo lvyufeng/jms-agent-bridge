@@ -80,6 +80,9 @@ class SSHRunner:
 
     def _sock(self, host: Host) -> Path:
         """A short, collision-free control-socket path for a host."""
+        # Re-created on demand: close() removes the directory, and a runner that is
+        # used again afterwards must still be able to open a control socket.
+        self._cmi_dir.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(host.name.encode()).hexdigest()[:12]
         return self._cmi_dir / f"{digest}.sock"
 
@@ -169,7 +172,7 @@ class SSHRunner:
                     stdout=out.decode(errors="replace"),
                     stderr=err.decode(errors="replace"),
                 )
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 proc.kill()
                 await proc.wait()
                 return ExecResult(
@@ -246,7 +249,10 @@ class SSHRunner:
             *(["-p", str(port)] if port != 22 else []),
         ]
         ssh_cmd = " ".join(shlex.quote(a) for a in ssh_parts)
-        argv = ["rsync", "-az", "--info=stats1", "-e", ssh_cmd]
+        # ``--stats``/``--info=*`` are GNU-rsync extensions; the macOS built-in is
+        # openrsync, which rejects them. The exit code is the contract here, so the
+        # transfer is run without them and works with either implementation.
+        argv = ["rsync", "-az", "-e", ssh_cmd]
         if delete:
             argv.append("--delete")
         for pat in excludes or []:
@@ -267,7 +273,7 @@ class SSHRunner:
             )
             try:
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 proc.kill()
                 await proc.wait()
                 return ExecResult(host.name, 124, "", f"rsync timed out after {timeout}s", True)
@@ -295,6 +301,10 @@ class SSHRunner:
                 pass
         for sock in self._cmi_dir.glob("*.sock"):
             sock.unlink(missing_ok=True)
+        # Drop the (now empty) short socket dir too: the runner is rebuilt on every
+        # inventory/config reload, so leaving it behind would leak one /tmp/jmsb-*
+        # directory per reload.
+        shutil.rmtree(self._cmi_dir, ignore_errors=True)
 
 
 def require_login(host: Host, default_login: str | None) -> None:
