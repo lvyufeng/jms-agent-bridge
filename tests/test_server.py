@@ -2,7 +2,7 @@ import asyncio
 
 import jms_bridge.server as S
 from jms_bridge.inventory import Host, Inventory
-from jms_bridge.jobs import JobHandle
+from jms_bridge.jobs import TERMINAL_STATUS, JobHandle
 from jms_bridge.server import _looks_dangerous
 from jms_bridge.ssh import ExecResult
 from jms_bridge.workspace import Workspace
@@ -39,8 +39,11 @@ def test_mcp_server_lists_all_tools():
     expected = {
         "jms_list_assets", "jms_audit_query", "jms_create_ticket",
         "jms_probe", "jms_exec", "jms_sync_push", "jms_sync_pull",
+        "jms_pull_artifacts",
         "jms_submit_job", "jms_job_status", "jms_job_logs", "jms_job_cancel",
+        "jms_job_wait", "jms_job_list",
         "jms_cluster_preflight", "jms_cluster_plan", "jms_cluster_submit",
+        "jms_cluster_cancel",
         "jms_dev_sync", "jms_dev_run", "jms_dev_logs", "jms_dev_discover",
         "jms_inventory_reload",
     }
@@ -793,3 +796,269 @@ def test_inventory_reload_surfaces_a_load_error(monkeypatch):
     r = asyncio.run(S.jms_inventory_reload())
     assert r["ok"] is False
     assert "no 'hosts:'" in r["error"]
+
+
+# --- job lifecycle tools: wait / list / cluster_cancel ------------------------------
+
+
+class _FakeJobManager:
+    """A JobManager stand-in for the lifecycle tools (no SSH, no tmux).
+
+    ``statuses`` drives `wait` (a host with no scripted status reports `done`); ``jobs``
+    drives `list_jobs`; ``killed`` names the hosts whose cancel reports a kill and
+    ``raises`` the hosts whose cancel fails outright.
+    """
+
+    def __init__(self, *, statuses=None, jobs=None, killed=(), raises=(), list_raises=()):
+        self.statuses = statuses or {}
+        self.jobs = jobs or {}
+        self.killed = set(killed)
+        self.raises = set(raises)
+        self.list_raises = set(list_raises)
+        self.calls = []
+
+    async def wait(self, pairs, *, timeout=150.0, interval=2.0):
+        self.calls.append(("wait", [(h.name, j) for h, j in pairs], timeout))
+        latest = [
+            {"host": h.name, "job_id": j, "status": self.statuses.get(h.name, "done")}
+            for h, j in pairs
+        ]
+        return latest, all(s["status"] in TERMINAL_STATUS for s in latest)
+
+    async def list_jobs(self, host):
+        if host.name in self.list_raises:
+            raise RuntimeError("tmux: command not found")
+        return list(self.jobs.get(host.name, []))
+
+    async def cancel_many(self, pairs):
+        self.calls.append(("cancel", [(h.name, j) for h, j in pairs]))
+        out = []
+        for h, j in pairs:
+            if h.name in self.raises:
+                out.append(
+                    {"host": h.name, "job_id": j, "killed": False, "ok": False, "error": "boom"}
+                )
+            else:
+                out.append(
+                    {"host": h.name, "job_id": j, "ok": True, "killed": h.name in self.killed}
+                )
+        return out
+
+
+def _lifecycle_install(monkeypatch, names, **kw):
+    hosts = [Host(name=n, login="u", asset_id="A") for n in names]
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    jobs = _FakeJobManager(**kw)
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "jobs", jobs)
+    return jobs
+
+
+def test_job_wait_reports_finished_once_every_host_is_terminal(monkeypatch):
+    jobs = _lifecycle_install(monkeypatch, ["a", "b"], statuses={"a": "done", "b": "failed"})
+    r = asyncio.run(S.jms_job_wait(["a", "b"], "abcd1234", timeout=5))
+    assert r["ok"] is True and r["finished"] is True
+    assert [s["host"] for s in r["status"]] == ["a", "b"]
+    # the one shared collab id reaches every target, and the caller's timeout is used
+    assert jobs.calls == [("wait", [("a", "abcd1234"), ("b", "abcd1234")], 5)]
+
+
+def test_job_wait_timeout_is_not_a_failure(monkeypatch):
+    # A bounded wait that runs out must say so, not error: the job is still running, and
+    # the caller is free to wait again or cancel.
+    jobs = _lifecycle_install(monkeypatch, ["a"], statuses={"a": "running"})
+    r = asyncio.run(S.jms_job_wait(["a"], "abcd1234", timeout=0.1))
+    assert r["ok"] is False and r["finished"] is False
+    assert r["status"][0]["status"] == "running"
+    # ...and it cancels nothing.
+    assert all(c[0] != "cancel" for c in jobs.calls)
+
+
+def test_job_wait_rejects_a_malformed_id_without_polling(monkeypatch):
+    jobs = _lifecycle_install(monkeypatch, ["a"])
+    r = asyncio.run(S.jms_job_wait(["a"], "not-an-id"))
+    assert r["ok"] is False and "invalid job id" in r["error"]
+    assert jobs.calls == []
+
+
+def test_job_list_is_per_host(monkeypatch):
+    _lifecycle_install(monkeypatch, ["a", "b"], jobs={"a": ["deadbeef"], "b": []})
+    r = asyncio.run(S.jms_job_list(["a", "b"]))
+    assert r["ok"] is True
+    assert r["hosts"] == [
+        {"host": "a", "job_ids": ["deadbeef"]},
+        {"host": "b", "job_ids": []},
+    ]
+
+
+def test_job_list_on_an_empty_selection_is_not_success(monkeypatch):
+    # `resolve([])` returns [] without raising, so `all()` over nothing would be True.
+    _lifecycle_install(monkeypatch, [])
+    r = asyncio.run(S.jms_job_list([]))
+    assert r["ok"] is False and r["hosts"] == []
+
+
+def test_job_list_isolates_a_host_that_fails(monkeypatch):
+    _lifecycle_install(monkeypatch, ["a", "b"], jobs={"a": ["deadbeef"]}, list_raises={"b"})
+    r = asyncio.run(S.jms_job_list(["a", "b"]))
+    assert r["ok"] is False  # a host that could not be asked is not "no jobs"
+    # one host's tmux being missing must not discard the ids found on the others
+    assert r["hosts"][0] == {"host": "a", "job_ids": ["deadbeef"]}
+    assert r["hosts"][1]["job_ids"] is None and "tmux" in r["hosts"][1]["error"]
+
+
+def test_cluster_cancel_stops_every_rank_with_one_id(monkeypatch):
+    jobs = _lifecycle_install(monkeypatch, ["a", "b"], killed={"a", "b"})
+    r = asyncio.run(S.jms_cluster_cancel(["a", "b"], "abcd1234"))
+    assert r["ok"] is True
+    assert r["job_id"] == "abcd1234"
+    assert [c["host"] for c in r["cancelled"]] == ["a", "b"]
+    assert jobs.calls == [("cancel", [("a", "abcd1234"), ("b", "abcd1234")])]
+
+
+def test_cluster_cancel_reports_a_rank_that_did_not_stop(monkeypatch):
+    # A host where nothing was killed is not an error (it may simply have finished), but
+    # a host whose cancel failed must not be reported as a clean sweep.
+    _lifecycle_install(monkeypatch, ["a", "b"], killed={"a"}, raises={"b"})
+    r = asyncio.run(S.jms_cluster_cancel(["a", "b"], "abcd1234"))
+    assert r["ok"] is False
+    assert [c["host"] for c in r["cancelled"]] == ["a"]
+    assert r["results"][1]["ok"] is False
+
+
+def test_cluster_cancel_on_an_empty_selection_is_not_success(monkeypatch):
+    # `resolve([])` is empty without raising and `all()` over nothing is True, so a
+    # cancel that reached no host must not come back green.
+    jobs = _lifecycle_install(monkeypatch, ["a"])
+    r = asyncio.run(S.jms_cluster_cancel([], "abcd1234"))
+    assert r["ok"] is False
+    assert "nothing was cancelled" in r["error"]
+    assert jobs.calls == []
+
+
+def test_cluster_cancel_rejects_a_malformed_id(monkeypatch):
+    jobs = _lifecycle_install(monkeypatch, ["a"])
+    r = asyncio.run(S.jms_cluster_cancel(["a"], "nope"))
+    assert r["ok"] is False and "invalid job id" in r["error"]
+    assert jobs.calls == []
+
+
+# --- jms_pull_artifacts: one directory per host, no path escape ----------------------
+
+
+def test_pull_artifacts_gives_each_host_its_own_directory(monkeypatch):
+    fake = _install_hosts(
+        monkeypatch,
+        [Host(name="a", login="u", asset_id="A"), Host(name="b", login="u", asset_id="A")],
+        {},
+    )
+    r = asyncio.run(S.jms_pull_artifacts(["a", "b"], "runs/ckpt", local="/tmp/arts"))
+    assert r["ok"] is True
+    assert r["root"] == "/tmp/arts"
+    assert [x["local"] for x in r["results"]] == ["/tmp/arts/a", "/tmp/arts/b"]
+    # every transfer is a pull of the same relative artifact, each to its own directory
+    assert [c["host"] for c in fake.calls] == ["a", "b"]
+    assert all("rsync" in c for c in fake.calls)
+    assert all(c["rsync"][1] == "runs/ckpt" for c in fake.calls)
+
+
+def test_pull_artifacts_sanitises_a_host_name(monkeypatch):
+    # A host name is operator-supplied and may carry path separators; one directory per
+    # host is what keeps same-named files from different nodes from colliding.
+    _install_hosts(monkeypatch, [Host(name="../evil", login="u", asset_id="A")], {})
+    r = asyncio.run(S.jms_pull_artifacts(["../evil"], "log", local="/tmp/arts"))
+    assert r["results"][0]["local"] == "/tmp/arts/_evil"
+
+
+def test_pull_artifacts_rejects_paths_that_escape_the_workdir(monkeypatch):
+    fake = _install_hosts(monkeypatch, [Host(name="a", login="u", asset_id="A")], {})
+    for remote in ["/etc", "~/.ssh", "../../etc", "", "  ", "a/../../b"]:
+        r = asyncio.run(S.jms_pull_artifacts(["a"], remote, local="/tmp/arts"))
+        assert r["ok"] is False, remote
+        assert "remote" in r["error"]
+    assert fake.calls == []  # nothing was ever transferred
+
+
+def test_pull_artifacts_isolates_one_host_failure(monkeypatch):
+    class _RsyncBoom(_FakeSSH):
+        async def rsync(self, host, local, remote, **kw):
+            self.calls.append({"host": host.name, "rsync": (local, remote)})
+            if host.name == "b":
+                raise RuntimeError("ssh: connection closed")
+            return ExecResult(host.name, 0, "", "")
+
+    hosts = [Host(name="a", login="u", asset_id="A"), Host(name="b", login="u", asset_id="A")]
+    inv = Inventory(hosts={h.name: h for h in hosts}, groups={}, workspaces={})
+    monkeypatch.setitem(S._state, "inv", inv)
+    monkeypatch.setitem(S._state, "ssh", _RsyncBoom({}))
+
+    r = asyncio.run(S.jms_pull_artifacts(["a", "b"], "runs", local="/tmp/arts"))
+    assert r["ok"] is False  # the batch is not green...
+    assert r["results"][0]["ok"] is True  # ...but a's artifacts did come back
+    assert r["results"][1]["ok"] is False and "connection closed" in r["results"][1]["error"]
+
+
+def test_artifact_subdir_falls_back_for_a_name_with_nothing_usable():
+    from jms_bridge.server import _artifact_subdir
+
+    assert _artifact_subdir("ascend-910c-108") == "ascend-910c-108"
+    assert _artifact_subdir("a/b c") == "a_b_c"
+    assert _artifact_subdir("..") == "host"
+    assert _artifact_subdir("") == "host"
+
+
+# --- occupancy gates the cluster tools ----------------------------------------------
+
+
+#: The ready reply with one card already holding a process spliced in before the port.
+_NPU_BUSY_CARD = _NPU_READY.replace(
+    "===PORT===\n",
+    "===OCCUPANCY===\n"
+    "NPU ID  Chip ID  Process id  Name  Mem\n"
+    "0  0  777  python  1024\n"
+    "===PORT===\n",
+)
+
+
+def test_cluster_preflight_flags_busy_hosts_and_leaves_unknown_alone(monkeypatch):
+    _cluster_install(monkeypatch, ["a", "b"], {"a": ExecResult("a", 0, _NPU_BUSY_CARD, "")})
+    r = asyncio.run(S.jms_cluster_preflight(["a", "b"]))
+    by_host = {h["host"]: h for h in r["hosts"]}
+    assert by_host["a"]["busy_devices"] == 1 and by_host["a"]["busy"] is True
+    # b sent no occupancy section: unknown, which is *not* busy and does not block.
+    assert by_host["b"]["busy_devices"] is None and by_host["b"]["busy"] is False
+    assert by_host["b"]["reachable"] is True and by_host["b"]["port_free"] is True
+    assert r["ok"] is False  # the set as a whole is not launchable by default
+    assert r["busy_hosts"] == ["a"]
+
+
+def test_cluster_submit_refuses_to_share_occupied_cards(monkeypatch):
+    _, jobs = _cluster_install(
+        monkeypatch, ["a", "b"], {"a": ExecResult("a", 0, _NPU_BUSY_CARD, "")}
+    )
+    r = asyncio.run(S.jms_cluster_submit(["a", "b"], "torchrun train.py"))
+    assert r["ok"] is False
+    assert "already have accelerators in use" in r["error"]
+    assert [b["host"] for b in r["busy"]] == ["a"]
+    assert r["ready_targets"] == ["b"]
+    assert jobs.collab == []  # nothing was launched onto the busy card
+
+
+def test_cluster_submit_allow_busy_overrides_the_gate(monkeypatch):
+    # The common honest reason a card is busy is this caller's own job, so a legitimate
+    # relaunch must remain possible.
+    _, jobs = _cluster_install(
+        monkeypatch, ["a", "b"], {"a": ExecResult("a", 0, _NPU_BUSY_CARD, "")}
+    )
+    r = asyncio.run(S.jms_cluster_submit(["a", "b"], "torchrun train.py", allow_busy=True))
+    assert r["ok"] is True
+    assert r["world_size"] == 4
+    assert jobs.collab[0]["assignments"] == [("a", 2), ("b", 2)]
+
+
+def test_preflight_world_size_matches_what_submit_would_launch(monkeypatch):
+    # The estimate exists to predict the submit; the two drifted apart once already.
+    _cluster_install(monkeypatch, ["a", "b"], {})
+    pf = asyncio.run(S.jms_cluster_preflight(["a", "b"]))
+    sub = asyncio.run(S.jms_cluster_submit(["a", "b"], "torchrun train.py"))
+    assert pf["world_size_estimate"] == sub["world_size"] == 4

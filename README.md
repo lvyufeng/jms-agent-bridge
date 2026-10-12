@@ -31,7 +31,8 @@ needs:
   `npu-smi` vs `nvidia-smi` vs `uname` is the tool's problem, not the agent's.
 - **Non-blocking jobs.** A training run takes hours; the gateway buffers responses for
   ~200s. Every long action is launched detached in `tmux` and polled, so no tool call
-  ever blocks.
+  that *starts* work ever blocks. `jms_job_wait` is the one deliberate exception, and it
+  is bounded well under that buffer — it stops *watching* on timeout, never the job.
 - **Parallel fan-out with audited identity.** Commands run against many hosts at once,
   each under the per-asset login string, so JumpServer attributes every one.
 
@@ -137,7 +138,7 @@ claude mcp add jms-bridge --scope user -e JMS_BRIDGE_SSH_PASSWORD='...' -- jms-b
 
 ## Tools
 
-19 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
+23 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
 metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 
 | Tool | Plane | What it does |
@@ -148,11 +149,15 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_probe` | SSH | Liveness + accelerator + version across a host set |
 | `jms_exec` | SSH | Short command on one or many hosts, in parallel |
 | `jms_sync_push` / `jms_sync_pull` | rsync | Move code and artifacts across hosts |
+| `jms_pull_artifacts` | rsync | Pull a per-host subdirectory of one remote path into one local dir (no host-name collisions) |
 | `jms_submit_job` | SSH | Launch a long command detached (tmux/setsid) → job id |
 | `jms_job_status` / `jms_job_logs` / `jms_job_cancel` | SSH | Non-blocking job lifecycle |
-| `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free; estimates `world_size` |
+| `jms_job_wait` | SSH | Bounded blocking wait: poll until every job is terminal or the timeout elapses, then return |
+| `jms_job_list` | SSH | Every job the bridge has launched on a host |
+| `jms_cluster_cancel` | SSH | Stop **every rank** of one coordinated launch under its shared job id |
+| `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free, **cards free**; estimates `world_size` |
 | `jms_cluster_plan` | SSH | Partition targets into backend-homogeneous **islands** (HCCL/NCCL) |
-| `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous |
+| `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous (refuses occupied cards unless `allow_busy=true`) |
 | `jms_dev_discover` | SSH | Inspect each host's container and emit a paste-ready `workspaces:` block |
 | `jms_dev_sync` | SSH | Deliver a git `ref` into every selected workspace's container (git / proxy-git / push) |
 | `jms_dev_run` | SSH | Deliver `ref`, run the UT suite in every container, return **one cross-chip consistency table** |
@@ -168,10 +173,11 @@ The `jms_dev_*` tools instead select **workspaces** by name, tag, or `all`.
 jms_probe(["cluster"])                          # who is up, what accelerator, which CANN/CUDA
 jms_sync_push(["cluster"], "./fl", "~/torch-fl")# same code on every node
 jms_submit_job(["cluster"], "torchrun --nproc_per_node=8 train.py --rounds 100")
-jms_job_status(["cluster"], "<job-id>")         # poll
+jms_job_wait(["cluster"], "<job-id>", timeout=150)   # bounded: returns either way
+jms_job_status(["cluster"], "<job-id>")             # or poll, if it needs longer
 jms_job_logs("ascend-910c", "<job-id>", offset=0)
 jms_job_logs("ascend-910c", "<job-id>", offset=<next_offset>)   # incremental
-jms_sync_pull(["cluster"], "~/torch-fl/checkpoints", "./results")
+jms_pull_artifacts(["cluster"], "~/torch-fl/checkpoints", "./results")  # -> ./results/<host>/
 jms_audit_query()                                # confirm the trail in JumpServer
 ```
 
@@ -183,15 +189,28 @@ every host is a rank node given the same rendezvous, so a distributed launcher
 (`torchrun`, etc.) forms a single `world_size=N` job.
 
 ```text
-jms_cluster_preflight(["cluster"])              # ready? world_size estimate, port free?
+jms_cluster_preflight(["cluster"])              # ready? world_size estimate, port free, cards free?
 jms_cluster_submit(
   ["ascend-910c", "node-4090-1", "node-4090-2"],
   "torchrun --nnodes=$JMS_WORLD_SIZE --node_rank=$JMS_RANK "
   "--nproc_per_node=$JMS_NPROC "
   "--rdzv_endpoint=$JMS_MASTER_ADDR:$JMS_MASTER_PORT train.py --rounds 100",
 )
-# -> {job_id per host, rendezvous, world_size, ranks:[...]}
+# -> {job_id, rendezvous, world_size, ranks:[...]}   (one id for every rank)
+jms_cluster_cancel(["ascend-910c", "node-4090-1", "node-4090-2"], "<job-id>")
 ```
+
+`jms_cluster_preflight` also reports how many cards each host already has busy. That
+count is **advisory**: it only ever raises the flag on a *positive* parse, so an
+unrecognized vendor format (or a host with no occupancy probe at all) stays "unknown"
+and blocks nothing — it never gets read as "the cards are free". `jms_cluster_submit`
+refuses to launch onto a host with occupied cards unless you pass `allow_busy=true`;
+the usual honest reason a card is busy is your *own* previous run, which is why the
+override exists.
+
+All ranks of one `jms_cluster_submit` share a **single job id**, so `jms_job_status`,
+`jms_job_wait`, `jms_job_logs` and `jms_cluster_cancel` each take that one id rather
+than a rank-to-host pairing.
 
 Each rank gets `JMS_RANK`, `JMS_LOCAL_RANK`, `JMS_NPROC`, `JMS_WORLD_SIZE`,
 `JMS_MASTER_ADDR`, `JMS_MASTER_PORT` exported before its command. The bridge supplies

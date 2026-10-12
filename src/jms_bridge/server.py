@@ -36,7 +36,7 @@ from .cluster import (
 from .config import BastionConfig, ConfigError, load_config
 from .discover import DEFAULT_REPO_MATCH
 from .inventory import Host, Inventory, InventoryError, shell_quote
-from .jobs import JobManager
+from .jobs import JobManager, validate_job_id
 from .ssh import ExecResult, SSHRunner
 from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
@@ -311,6 +311,118 @@ async def _gather_rsync(hosts, local, remote, direction, excludes, delete):  # n
     )
 
 
+#: Where `jms_pull_artifacts` puts what it pulls, one directory per host.
+_ARTIFACT_ROOT = "~/.jms-bridge/artifacts"
+
+#: Artifacts are checkpoints and can be gigabytes, so the fan-out is bounded far below
+#: the SSHRunner's own cap: a handful of concurrent transfers keeps a shared uplink
+#: usable for everyone else on the cluster.
+_ARTIFACT_PARALLELISM = 4
+
+#: Machine-generated noise, not artifacts. Deliberately *not* `_DEFAULT_EXCLUDES` — that
+#: list drops whole directories, and pulling a run's output directory must not silently
+#: skip a `.git`- or cache-named subdirectory the run actually wrote.
+_ARTIFACT_EXCLUDES = ["*.pyc", "__pycache__", ".pytest_cache"]
+
+
+def _artifact_remote_error(remote: str) -> str | None:
+    """Reject a remote path that could reach outside the host workdir.
+
+    The path is agent-supplied and the pull runs as the asset's account, so an absolute
+    path or a `..` segment would rsync something like `/etc` back to the workstation.
+    Artifacts belong under the run's workdir, so require a relative, `..`-free path; if
+    a run wrote elsewhere, this is the point to say so rather than to guess.
+    """
+    if not remote.strip():
+        return "remote is empty"
+    if remote.startswith(("/", "~")):
+        return "remote must be relative to the host workdir (no leading '/' or '~')"
+    if ".." in remote.replace("\\", "/").split("/"):
+        return "remote must not contain a '..' segment"
+    return None
+
+
+def _artifact_subdir(name: str) -> str:
+    """A filesystem-safe directory name for one host.
+
+    Host names are operator-supplied and may contain characters that mean something to
+    a path (or be `.`/`..`). One directory per host is what stops same-named files from
+    different hosts overwriting each other on the way back.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip(".")
+    return safe or "host"
+
+
+@_tool()
+async def jms_pull_artifacts(
+    targets: list[str],
+    remote: str,
+    local: str | None = None,
+    excludes: list[str] | None = None,
+) -> dict:
+    """rsync one artifact path from every targeted host into its own local directory.
+
+    `jms_sync_pull` sends every host to the *same* local path, so pulling the same
+    relative path off ten nodes means ten transfers into one directory and nine silent
+    overwrites. This gives each host its own subdirectory instead —
+    `~/.jms-bridge/artifacts/<host>/` by default, or `<local>/<host>/` — so a
+    per-node checkpoint, log or metric dump survives the trip back.
+
+    `remote` must be relative to the host workdir (no leading `/` or `~`, no `..`): the
+    copy runs as the asset's account, and an absolute path would pull arbitrary system
+    files off the cluster. `excludes` defaults to machine-generated noise only — a
+    checkpoint pull should not also drag back a run's caches. Transfers are capped at
+    four at a time and a host that fails is reported on its own, not at the expense of
+    the others.
+    """
+    hosts = _resolve(targets)
+    bad = _artifact_remote_error(remote)
+    if bad:
+        return {"ok": False, "error": bad, "remote": remote}
+    root = os.path.expanduser(local or _ARTIFACT_ROOT)
+    excludes = _ARTIFACT_EXCLUDES if excludes is None else excludes
+    sem = asyncio.Semaphore(_ARTIFACT_PARALLELISM)
+
+    async def one(host: Host) -> dict:
+        dest = os.path.join(root, _artifact_subdir(host.name))
+        async with sem:
+            try:
+                res = await _ssh().rsync(host, dest, remote, direction="pull", excludes=excludes)
+            except Exception as exc:  # noqa: BLE001 - one host must not hide the rest
+                return {"host": host.name, "local": dest, "ok": False, "error": str(exc)}
+        return {
+            "host": host.name,
+            "local": dest,
+            "ok": res.ok,
+            "stderr": res.stderr.strip()[:400] if not res.ok else "",
+        }
+
+    results = list(await asyncio.gather(*(one(h) for h in hosts)))
+    return {
+        "ok": bool(results) and all(r["ok"] for r in results),
+        "remote": remote,
+        "root": root,
+        "results": results,
+    }
+
+
+async def _per_host(hosts: list[Host], fn: Callable[..., Any], *, key: str) -> list[dict]:
+    """Run ``fn(host)`` on every host; one host's failure becomes that host's entry.
+
+    A plain ``gather`` lets a single unreachable host raise and erase every other host's
+    result — on a 40-node cluster one bad node hides the other 39. ``CancelledError`` is
+    a ``BaseException``, so a real cancellation still propagates.
+    """
+
+    async def one(host: Host) -> dict:
+        try:
+            return {"host": host.name, key: await fn(host)}
+        except Exception as exc:  # noqa: BLE001 - isolating one host is the whole point
+            return {"host": host.name, key: None, "error": f"{type(exc).__name__}: {exc}"}
+
+    return list(await asyncio.gather(*(one(h) for h in hosts)))
+
+
 # --- data plane: jobs -------------------------------------------------------------
 
 
@@ -366,6 +478,91 @@ async def jms_job_cancel(host: str, job_id: str) -> dict:
     """Kill a running job on one host."""
     h = _inv().resolve([host])[0]
     return {"ok": True, **(await _jobs().cancel(h, job_id))}
+
+
+@_tool()
+async def jms_job_wait(
+    targets: list[str], job_id: str, timeout: float = 150.0, interval: float = 2.0
+) -> dict:
+    """Block until a job has stopped on every targeted host, or `timeout` elapses.
+
+    Polls `jms_job_status` for you and returns the moment every targeted host reports a
+    terminal status (`done` / `failed` / `missing`) — the same job id on each host, which
+    is what a coordinated `jms_cluster_submit` hands out. `finished` says whether they
+    all stopped; a timeout is not a failure and **kills nothing**, so on `finished=false`
+    the jobs are still running and you can call this again or keep polling manually.
+
+    Keep `timeout` under ~200s: the gateway buffers a non-streaming response, so a tool
+    call that runs longer is cut off by the transport rather than by this timeout.
+    """
+    hosts = _resolve(targets)
+    bad = validate_job_id(job_id)
+    if bad:
+        return {"ok": False, "error": bad}
+    latest, finished = await _jobs().wait(
+        [(h, job_id) for h in hosts], timeout=timeout, interval=interval
+    )
+    return {"ok": finished, "finished": finished, "job_id": job_id, "status": latest}
+
+
+@_tool()
+async def jms_job_list(targets: list[str]) -> dict:
+    """List the job ids currently running on each targeted host.
+
+    Answers "what did I leave running on this cluster?" — useful after a lost session,
+    when the job ids you were handed are gone but the tmux sessions are not.
+
+    Reads `tmux ls`, so it sees jobs launched by `tmux` only: a host that fell back to
+    `setsid` (no tmux installed) or a job nested inside a container is invisible here,
+    and a job is only listed while its tmux session lives — a finished job is gone from
+    this list even though its `status` file and logs remain readable. Pass the ids you
+    find to `jms_job_status` / `jms_job_wait` / `jms_job_cancel`.
+    """
+    hosts = _resolve(targets)
+    per_host = await _per_host(hosts, _jobs().list_jobs, key="job_ids")
+    return {
+        # A host that could not be asked reports its own error; that must not read as
+        # "this host has no jobs". An empty selection is likewise not a green listing.
+        "ok": bool(per_host) and all("error" not in entry for entry in per_host),
+        "hosts": per_host,
+        "note": (
+            "tmux-launched jobs only; a host with no tmux falls back to setsid and lists nothing"
+        ),
+    }
+
+
+@_tool()
+async def jms_cluster_cancel(targets: list[str], job_id: str) -> dict:
+    """Stop every rank of one coordinated launch.
+
+    A `jms_cluster_submit` hands every rank the *same* job id (on a different host each),
+    so one cancel per host is what actually stops a collective — and doing that by hand
+    from the per-rank reply is easy to get half-right, leaving a rank alive still holding
+    the rendezvous port and the cards. Pass the same `targets` you submitted with and the
+    one job id. Hosts are cancelled in parallel and independently; a host where nothing
+    was killed reports `killed=false` rather than failing the batch.
+    """
+    hosts = _resolve(targets)
+    bad = validate_job_id(job_id)
+    if bad:
+        return {"ok": False, "error": bad}
+    if not hosts:
+        # `resolve([])` is empty without raising, and `all()` over nothing is True — a
+        # cancel that reached no host must not report success.
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "error": "no hosts matched the selection; nothing was cancelled",
+            "cancelled": [],
+            "results": [],
+        }
+    results = await _jobs().cancel_many([(h, job_id) for h in hosts])
+    return {
+        "ok": all(r.get("ok") for r in results),
+        "job_id": job_id,
+        "cancelled": [r for r in results if r.get("killed")],
+        "results": results,
+    }
 
 
 # --- dev loop: workspace sync / run / logs -----------------------------------------
@@ -858,22 +1055,41 @@ async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_POR
     """Check a cluster is ready for a distributed run, host by host.
 
     For every host: reachability, accelerator visibility and version (via the
-    platform probe), and whether the rendezvous `port` is already bound (a stale
-    previous run). Returns an estimated `world_size` and a suggested rendezvous.
-    Run this before `jms_cluster_submit`.
+    platform probe), whether the rendezvous `port` is already bound (a stale previous
+    run), and how many accelerators already hold a compute process. Returns an
+    estimated `world_size` and a suggested rendezvous. Run this before
+    `jms_cluster_submit`.
+
+    `ok` is false when a host is unreachable, holds the rendezvous port, **or** already
+    has accelerators in use — i.e. exactly when a default `jms_cluster_submit` would
+    refuse. `busy_devices` is `null` when occupancy is unknown: a platform with no
+    occupancy probe, or a host whose driver tool did not answer. Unknown is never
+    reported as busy, so a probe gap degrades to the old behaviour instead of blocking
+    a launch. Set `allow_busy=true` on the submit to override the busy gate.
     """
     hosts = _resolve(targets)
     health = await preflight(_ssh(), hosts, port=port)
-    ranks = sum(h.device_count or 1 for h in health if h.reachable and h.device_count)
+    # Match `jms_cluster_submit` exactly: a reachable host with no device count still gets
+    # `nproc=1` there, so it must count 1 here. Counting 0 under-reported the world size
+    # the submit would really launch, which is the number this estimate exists to predict.
+    ranks = sum(max(1, h.device_count or 1) for h in health if h.reachable)
     rdv = resolve_rendezvous(hosts, port=port)
+    busy = [h for h in health if h.busy]
     return {
-        "ok": all(h.ok for h in health),
+        "ok": all(h.ok for h in health) and not busy,
         "world_size_estimate": ranks,
         "rendezvous": rdv.to_dict(),
         "heterogeneous": is_heterogeneous(hosts),
         "islands": [i.to_dict() for i in plan_islands(hosts)],
         "hosts": [h.to_dict() for h in health],
         "platforms": sorted({h.platform for h in health}),
+        "busy_hosts": [h.host for h in busy],
+        "note": (
+            f"{len(busy)} host(s) already have accelerators in use; jms_cluster_submit "
+            "refuses a set containing them unless you pass allow_busy=true"
+        )
+        if busy
+        else "",
     }
 
 
@@ -918,6 +1134,7 @@ async def jms_cluster_submit(
     command: str,
     master: str | None = None,
     port: int = DEFAULT_RDZV_PORT,
+    allow_busy: bool = False,
 ) -> dict:
     """Launch ONE coordinated distributed job across a heterogeneous cluster.
 
@@ -925,7 +1142,9 @@ async def jms_cluster_submit(
     this assigns every host a rank and gives them a shared rendezvous, exporting
     `JMS_RANK`, `JMS_LOCAL_RANK`, `JMS_NPROC`, `JMS_WORLD_SIZE`, `JMS_MASTER_ADDR`
     and `JMS_MASTER_PORT` before `command` runs. All ranks launch concurrently and
-    the call returns immediately with a job id per host.
+    the call returns immediately with **one** job id, shared by every rank — pass it
+    (and the same `targets`) to `jms_job_status` / `jms_job_wait` / `jms_job_logs` /
+    `jms_cluster_cancel`.
 
     `command` is your per-node launcher; wire it with the exported env. For torchrun:
 
@@ -935,9 +1154,14 @@ async def jms_cluster_submit(
                  train.py --rounds 100
 
     `targets` order defines rank order; each host contributes one rank node whose
-    `JMS_NPROC` is its accelerator count. Every target is preflighted first and an
-    unreachable host (or one holding a stale rendezvous `port`) fails the call rather
-    than being handed a rank no one can join. Poll with `jms_job_status` / `jms_job_logs`.
+    `JMS_NPROC` is its accelerator count. Every target is preflighted first, and a host
+    that is unreachable, holding a stale rendezvous `port`, or already running work on
+    its accelerators fails the call rather than being handed a rank. The busy gate is
+    what stops a second training being co-scheduled onto cards that are already in use;
+    pass `allow_busy=true` to launch anyway — e.g. to resume a run whose previous job is
+    still winding down. Occupancy the probe could not determine is not treated as busy,
+    so a missing driver tool never blocks a launch on its own. `jms_cluster_preflight`
+    reports the same busy hosts before you get here.
     """
     if _looks_dangerous(command):
         return {"ok": False, "error": "command matched the safety denylist", "command": command}
@@ -987,6 +1211,24 @@ async def jms_cluster_submit(
                 "jms_cluster_submit needs at least 2 hosts"
             ),
         }
+    # Busy is a *separate* gate from `ok`, and it is the one that keeps two trainings off
+    # the same cards. It stays out of `HostHealth.ok` because the two failures need
+    # different answers, and it is overridable because the most common honest reason a
+    # card is busy is this caller's own job: refusing outright would make a legitimate
+    # relaunch impossible. Unknown occupancy (`busy_devices` is None) is not busy.
+    busy = [h for h in hosts if health[h.name].busy]
+    if busy and not allow_busy:
+        return {
+            "ok": False,
+            "error": (
+                f"{len(busy)} of {len(hosts)} targets already have accelerators in use "
+                f"({', '.join(h.name for h in busy)}); launching now would co-schedule a "
+                "second training onto occupied cards."
+            ),
+            "busy": [health[h.name].to_dict() for h in busy],
+            "ready_targets": [h.name for h in hosts if not health[h.name].busy],
+            "hint": "pass allow_busy=true to launch anyway (e.g. resuming an unfinished job)",
+        }
     assignments = [(h, max(1, health[h.name].device_count or 1)) for h in hosts]
     world_size = sum(n for _, n in assignments)
 
@@ -998,6 +1240,9 @@ async def jms_cluster_submit(
         "ok": len(handles) == len(hosts),
         "rendezvous": rdv.to_dict(),
         "world_size": world_size,
+        # Every rank shares one job id (`submit_collab`), so it is hoisted out of the
+        # per-rank entries and repeated here for convenience.
+        "job_id": handles[0].job_id if handles else None,
         "ranks": [
             {
                 "host": h.name,
