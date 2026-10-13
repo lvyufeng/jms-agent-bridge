@@ -85,8 +85,11 @@ class SSHRunner:
 
     def __init__(self, cfg: BastionConfig, *, max_parallel: int = 8):
         self.cfg = cfg
-        self.max_parallel = max_parallel
-        self._sem = asyncio.Semaphore(max_parallel)
+        # A cap of 0 would build a Semaphore that no task can ever acquire — a hang,
+        # which is the worst way for a fan-out to fail. The loader rejects it too; this
+        # covers a directly-constructed runner (tests, embedders).
+        self.max_parallel = max(1, max_parallel)
+        self._sem = asyncio.Semaphore(self.max_parallel)
         # A short socket dir: the full ControlPath must fit in a Unix-domain socket
         # path (104 bytes on macOS), so a long temp dir + long host name overflows.
         self._cmi_dir = Path(tempfile.mkdtemp(prefix="jmsb-", dir="/tmp"))
@@ -117,10 +120,17 @@ class SSHRunner:
             )
         return ["sshpass", "-e"]  # password read from the SSHPASS env var
 
-    def _subproc_env(self) -> dict[str, str]:
-        """Environment for a spawned ssh/rsync, carrying SSHPASS when in use."""
+    def _subproc_env(self, host: Host | None = None) -> dict[str, str]:
+        """Environment for a spawned ssh/rsync, carrying ``SSHPASS`` only when needed.
+
+        The password is handed to the child that will actually run under ``sshpass`` —
+        a bastion host with password auth — and to nothing else. A direct host is
+        key-based, so giving it the bastion password serves no purpose, and ``close()``'s
+        ``ssh -O exit`` talks to the existing control socket rather than authenticating,
+        so it needs none either.
+        """
         env = {**os.environ, "TERM": os.environ.get("TERM", "dumb")}
-        if self.cfg.ssh_password:
+        if host is not None and not host.is_direct and self.cfg.ssh_password:
             env["SSHPASS"] = self.cfg.ssh_password
         return env
 
@@ -174,7 +184,7 @@ class SSHRunner:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=self._subproc_env(),
+                env=self._subproc_env(host),
             )
             try:
                 out, err = await asyncio.wait_for(
@@ -284,7 +294,7 @@ class SSHRunner:
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=self._subproc_env(),
+                env=self._subproc_env(host),
             )
             try:
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)

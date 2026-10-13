@@ -1,9 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-13
 
 ### Added
 
+- **`scripts/verify-onboarding.sh` — the acceptance pass, runnable.** The standing
+  criterion (clone on a second machine, configure an account and a password, drive the
+  cluster) is exactly what reading the code cannot confirm, so the whole first-run path is
+  now scripted: `init` → `login` → `jms_list_assets` → build `hosts.yaml` → `doctor` (the
+  gate) → `jms_dev_discover` → one real `jms_dev_run`, stopping at the first step that does
+  not work and printing that step's real output. It pins the config, inventory and
+  credentials inside a scratch `mktemp -d` and forces keyring's null backend, so the real
+  `~/.config/jms-bridge` and the OS keychain are never touched, and leaves `$HOME` alone
+  because ssh still needs the real `~/.ssh`. `scripts/mcp_call.py` speaks the MCP stdio
+  protocol directly, so the pass exercises the same tools a Claude Code session calls
+  rather than a private in-process API.
+- **Configurable SSH fan-out cap** (`max_parallel`, or `JMS_BRIDGE_MAX_PARALLEL`). The
+  fan-out width was hard-coded at 8 and passed nowhere, so a wide selector on a large,
+  healthy fleet could not be widened without editing the code — and the value that reached
+  `SSHRunner` was always its default. The server and both CLI paths now build the runner
+  from the setting, a sub-1 value is rejected where it was written (a `Semaphore(0)` is a
+  hang, not an error), and directly-constructed runners clamp rather than deadlock.
 - **Flagos development loop (4 tools).** `jms_dev_discover`, `jms_dev_sync`,
   `jms_dev_run`, `jms_dev_logs` implement *write once, verify on every chip*: deliver a
   git `ref` into every workspace's container and return one cross-chip consistency table
@@ -52,7 +69,7 @@
   backend. The keyring is an optional `[keyring]` extra, so the default install is
   unchanged and a headless host degrades quietly to the file.
 
-- **Domestic-accelerator platform profiles (7 vendors).** `ascend-910c` / `cuda` no
+- **Domestic-accelerator platform profiles (8 vendors).** `ascend-910c` / `cuda` no
   longer cover the whole fleet: `hygon-dcu` (海光, `hy-smi`), `metax` (沐曦, `mx-smi`),
   `enflame` (燧原, `efsmi`), `kunlunxin` (昆仑芯, `xpu-smi`), `thead` (平头哥, `ppu-smi`),
   `iluvatar` (天数, `ixsmi`), `moore-threads` (摩尔线程, `mthreads-gmi`) and `tsingmicro`
@@ -70,6 +87,28 @@
 
 ### Changed
 
+- **Every tool that takes a caller-supplied command now shares one denylist and one
+  override.** The two halves had drifted apart in opposite directions: `jms_dev_run`'s
+  `ut_cmd` override was interpolated into a container shell with no `_looks_dangerous`
+  check at all, while `jms_cluster_submit` screened its `command` and hard-failed with no
+  `allow_dangerous` escape hatch, so a caller who genuinely needed an override was stuck.
+  The commands an inventory carries (`ut_cmd`, `env_setup`) are spec text at the same trust
+  level as the rest of `hosts.yaml`, and are deliberately still not screened.
+- **The onboarding path now leads to a working dev loop.** `jms-bridge init` writes an
+  inventory with a `workspaces:` block, so the documented quickstart is no longer a
+  sequence that ends in `jms_dev_run` matching nothing. Its `Next:` steps are ordered
+  around the one field a new user cannot fill in yet — a JumpServer **asset id** is only
+  knowable from `jms_list_assets` *after* a login — and both `init` and the README point
+  at `examples/`, which exercises every supported field.
+- **`init` writes `hosts.yaml` mode 600 as well.** It names every host and its asset id;
+  previously only `config.toml` was tightened, leaving the inventory world-readable until
+  a later `login` (which only ever touched the config).
+- **`doctor` labels the two credentials and checks `sshpass`.** The control plane takes
+  `JMS_BRIDGE_PASSWORD` and the data plane takes `JMS_BRIDGE_SSH_PASSWORD`; a single
+  "credentials" line invited the assumption that `login --save-password` covered both. It
+  now reports each separately, and reports `sshpass` under the same section when
+  `ssh_password` is set, so password auth fails with a diagnosis instead of an unexplained
+  data-plane error.
 - **All ranks of one coordinated launch now share a single job id.** Ranks live on
   different hosts so one id cannot collide, and it is what lets `jms_job_status` /
   `jms_job_wait` / `jms_job_logs` / `jms_cluster_cancel` take that one id instead of a
@@ -91,6 +130,16 @@
 
 ### Fixed
 
+- **`SSHPASS` was exported to every child the runner spawned.** A direct (`ssh_host`) host
+  is key-based, so `sshpass` is not in its argv — handing it the bastion password put the
+  secret where it had no purpose. It now reaches only the child that will actually
+  authenticate with it, and `close()`'s `ssh -O exit` (which talks to the existing control
+  socket) carries none either.
+- **The SSH runner was never closed on shutdown.** Nothing called `SSHRunner.close()` when
+  the server exited, so every session left one `ControlMaster` socket and one `/tmp/jmsb-*`
+  directory per host it had talked to. `main()` now tears down the lazily-built clients on
+  the way out — best-effort, so a cleanup failure cannot turn a clean exit into a nonzero
+  one.
 - **The `iluvatar` probe silently found nothing on three of four hosts.** `ixsmi`
   ships under `/usr/local/corex/bin` and is only on `PATH` on some nodes; where it
   was not, the bare `ixsmi` probe returned empty and every consumer read the host as
@@ -157,8 +206,9 @@
 - **Setup errors reached the agent as an opaque message.** `ConfigError` /
   `InventoryError` raised inside a tool were wrapped by the MCP SDK and shown as
   `Error executing tool <name>`. They are now translated to `ToolError`, so the
-  actionable text ("No inventory at …; create one or set `JMS_BRIDGE_INVENTORY`") is
-  what a freshly-cloned-but-unconfigured checkout actually sees.
+  actionable text ("No inventory at …; run `jms-bridge init` … or set
+  `JMS_BRIDGE_INVENTORY`") is what a freshly-cloned-but-unconfigured checkout actually
+  sees.
 - **CLI and server disagreed on the config path.** The CLI hard-coded the default path
   and ignored `JMS_BRIDGE_CONFIG`, so `login` could cache a token in one file while the
   server read another. Both now resolve it through `config.config_path()`.

@@ -56,7 +56,7 @@ def _tool() -> Callable[[_F], _F]:
     SDK forwards the *text* of a ``ToolError`` to the client; anything else reaches the
     agent as the opaque ``Error executing tool <name>`` — which is exactly, and
     uselessly, what a freshly-cloned-but-unconfigured checkout would see. Translating
-    keeps the actionable message ("No inventory at …; create one or set
+    keeps the actionable message ("No inventory at …; run `jms-bridge init` or set
     JMS_BRIDGE_INVENTORY") in front of the agent.
     """
 
@@ -92,7 +92,8 @@ def _inv() -> Inventory:
 
 def _ssh() -> SSHRunner:
     if "ssh" not in _state:
-        _state["ssh"] = SSHRunner(_cfg())
+        cfg = _cfg()
+        _state["ssh"] = SSHRunner(cfg, max_parallel=cfg.max_parallel)
     return _state["ssh"]
 
 
@@ -745,7 +746,11 @@ async def jms_dev_sync(targets: list[str], ref: str) -> dict:
 
 @_tool()
 async def jms_dev_run(
-    targets: list[str], ref: str, timeout: float = 600.0, ut_cmd: str | None = None
+    targets: list[str],
+    ref: str,
+    timeout: float = 600.0,
+    ut_cmd: str | None = None,
+    allow_dangerous: bool = False,
 ) -> dict:
     """Deliver `ref` to every workspace, run the UT suite in each container, and
     return ONE cross-chip consistency table.
@@ -762,6 +767,29 @@ async def jms_dev_run(
 
     Long training runs do NOT go here; use `jms_submit_job` / `jms_cluster_submit`.
     """
+    # `ut_cmd` is the one caller-supplied string this tool interpolates into a container
+    # shell, so it gets the same denylist as `jms_exec`'s `command`. The workspace's own
+    # `ut_cmd` / `env_setup` come from the hand-written inventory, the same trust level
+    # as the rest of `hosts.yaml`, and are deliberately not screened here.
+    if ut_cmd and _looks_dangerous(ut_cmd) and not allow_dangerous:
+        return {
+            "ok": False,
+            "stage": "guard",
+            "error": "ut_cmd matched the safety denylist; pass allow_dangerous=true to override",
+            "ref": ref,
+            "columns": [],
+            "rows": [],
+            "revisions": {},
+            "revisions_consistent": False,
+            "revisions_unverified": [],
+            "failed_hosts": [],
+            "results": [],
+            "attestation": {},
+            "attestation_consistent": False,
+            "attestation_diverged": [],
+            "attestation_unverified": [],
+            "hosts": {},
+        }
     from .attest import (
         build_attest_script,
         check_attestation_parity,
@@ -1135,6 +1163,7 @@ async def jms_cluster_submit(
     master: str | None = None,
     port: int = DEFAULT_RDZV_PORT,
     allow_busy: bool = False,
+    allow_dangerous: bool = False,
 ) -> dict:
     """Launch ONE coordinated distributed job across a heterogeneous cluster.
 
@@ -1163,8 +1192,12 @@ async def jms_cluster_submit(
     so a missing driver tool never blocks a launch on its own. `jms_cluster_preflight`
     reports the same busy hosts before you get here.
     """
-    if _looks_dangerous(command):
-        return {"ok": False, "error": "command matched the safety denylist", "command": command}
+    if _looks_dangerous(command) and not allow_dangerous:
+        return {
+            "ok": False,
+            "error": "command matched the safety denylist; pass allow_dangerous=true to override",
+            "command": command,
+        }
     hosts = _resolve(targets)
     if len(hosts) < 2:
         return {
@@ -1288,12 +1321,37 @@ def _looks_dangerous(command: str) -> bool:
     return any(pat in flat for pat in _DANGEROUS_PATTERNS)
 
 
+async def _aclose_state() -> None:
+    """Tear down the lazily-built clients: multiplexed SSH sockets and the HTTP pool.
+
+    Called once, on shutdown. Nothing else ever closes the runner, so without this the
+    process leaves one ControlMaster socket per host it talked to (plus the short
+    ``/tmp/jmsb-*`` directory) behind for every session.
+    """
+    ssh = _state.pop("ssh", None)
+    api = _state.pop("api", None)
+    _state.pop("jobs", None)
+    if api is not None:
+        await api.aclose()
+    if ssh is not None:
+        await ssh.close()
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    server.run("stdio")
+    try:
+        server.run("stdio")
+    finally:
+        # ``server.run`` returns on stdin EOF and on Ctrl-C; either way the loop it
+        # created is finished, so a fresh one here is fine. Cleanup is best-effort —
+        # a failure must not turn a clean exit into a nonzero one.
+        try:
+            asyncio.run(_aclose_state())
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            log.debug("state cleanup on shutdown failed", exc_info=True)
 
 
 if __name__ == "__main__":

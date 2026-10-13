@@ -42,12 +42,19 @@ needs:
 ## Install
 
 ```bash
-pip install -e .            # or: pipx install .
-pip install -e ".[keyring]" # optional: keep a saved password in the OS keyring
+git clone https://github.com/lvyufeng/jms-agent-bridge.git && cd jms-agent-bridge
+python3 -m venv .venv && . .venv/bin/activate   # a venv, not optional: Homebrew/Debian
+                                                # Pythons refuse a bare `pip install`
+pip install -e .                                # or: pipx install .
+pip install -e ".[keyring]"                     # optional: keep a saved password in the
+                                                # OS keyring; with pipx use
+                                                # `pipx install ".[keyring]"`
 ```
 
 Requires Python 3.10+ and `ssh` + `rsync` on PATH (the bridge shells out to them and
-inherits your key agent).
+inherits your key agent). Authenticating to the gateway with a *password* rather than a
+key additionally needs `sshpass` — most distros have it in their package manager, and
+`jms-bridge doctor` tells you if it is missing.
 
 ## Configure
 
@@ -56,6 +63,14 @@ jms-bridge init             # writes ~/.config/jms-bridge/{config.toml,hosts.yam
 $EDITOR ~/.config/jms-bridge/config.toml
 $EDITOR ~/.config/jms-bridge/hosts.yaml
 ```
+
+Both live under `~/.config/jms-bridge/` and both can be relocated — `JMS_BRIDGE_CONFIG`,
+`JMS_BRIDGE_INVENTORY`, and (for the saved password) `JMS_BRIDGE_CREDENTIALS` each take
+an explicit path, which is what the error messages point at when they cannot find one.
+
+`examples/` holds the same two files with every field exercised — `examples/hosts.yaml`
+in particular documents the `workspaces:` block that `jms-bridge init` only sketches,
+and it is the one to copy if you want the development loop, not just command execution.
 
 `config.toml` — the bastion and its control-plane credentials:
 
@@ -66,9 +81,14 @@ ssh_port = 2222                 # KoKo gateway port
 login_user = "your-login"       # the login dimension of `<login>#<account>#<asset_id>`
 # ssh_key = "~/.ssh/id_ed25519"
 verify_tls = true
+max_parallel = 8                # parallel fan-out cap for the whole fleet
 # Prefer env vars for secrets: JMS_BRIDGE_ACCESS_KEY_ID / JMS_BRIDGE_ACCESS_KEY_SECRET
 # or JMS_BRIDGE_PRIVATE_TOKEN.
 ```
+
+`max_parallel` (or `JMS_BRIDGE_MAX_PARALLEL`) bounds how many hosts the data plane talks to
+at once. The default of 8 keeps a wide selector from fork-bombing the local machine or
+tripping the bastion's per-account connection limit; raise it for a large, healthy fleet.
 
 `hosts.yaml` — your cluster:
 
@@ -114,13 +134,22 @@ instead of falling back to `uname`, and the busy gate in `jms_cluster_preflight`
 values are the vendors' commonly cited torchrun backends, **unverified on your fleet**;
 confirm before a multi-node launch.
 
-Authenticate the control plane, then check it end to end:
+The `asset_id`s are the one thing you cannot fill in yet: looking them up needs a
+logged-in session, which is the next step. So do it in this order — `config.toml` and
+the hostnames first, then authenticate, then come back for the ids:
 
 ```bash
 jms-bridge login --save-password   # prompts for your JumpServer password
 jms-bridge doctor                  # tooling → config → API → SSH, layer by layer
-jms-bridge probe cluster           # accelerator + driver/CANN version per host
 ```
+
+`doctor`'s last layer pushes a command through `<login>#<account>#<asset_id>@bastion`, so
+it cannot be green while the ids are still the placeholders the template ships — expect
+the tooling, config and control-plane layers to pass and the data plane to fail. Once the
+login above has succeeded, get the ids from `jms_list_assets` inside Claude Code (after
+[registering the server](#register-with-claude-code) below), or from the JumpServer web
+UI, and fill in `asset_id` for each host. Then `jms-bridge doctor` and `jms-bridge probe
+cluster` should both be green.
 
 `login` exchanges your username/password for a token once, so the MCP server itself
 never handles a password. `JMS_BRIDGE_PASSWORD='...' jms-bridge login` still works for
@@ -140,8 +169,43 @@ never on the remote host):
 
 ```bash
 export JMS_BRIDGE_SSH_PASSWORD='...'
-jms-bridge doctor
+jms-bridge doctor                  # reports sshpass under `== credentials ==` if unset
 ```
+
+These are **two different secrets**, and only the first is what `login` manages:
+
+| Secret | Plane | Env var |
+| --- | --- | --- |
+| JumpServer login password → exchanged for a session token | control plane (assets, audit, tickets) | `JMS_BRIDGE_PASSWORD` |
+| The credential the KoKo gateway wants | data plane (commands, jobs, rsync, dev loop) | `JMS_BRIDGE_SSH_PASSWORD` |
+
+So `login --save-password` does **not** cover the data plane: a setup that only runs
+`login` will have `jms_list_assets` working and `jms_exec` still failing to connect.
+
+### Cloning onto a second machine
+
+Nothing secret travels in the clone. `config.toml` is a template, the saved password
+lives in the OS keyring or `credentials.toml` (both machine-local), and the session
+token `login` writes into `config.toml` is issued to *that* config file. So on a new
+machine the sequence is the same one as on the first: `jms-bridge init`, edit both
+files, copy your own `hosts.yaml` if you have one, then `jms-bridge login
+--save-password` again. If you copy a `config.toml` across, delete the stale
+`session_token` line first — otherwise the bridge starts up holding a token the server
+may no longer accept.
+
+That whole first-run path is scripted, so you can prove a fresh clone works rather than
+assume it:
+
+```bash
+JMS_BRIDGE_PASSWORD='...' scripts/verify-onboarding.sh
+```
+
+It runs `init` → `login` → `jms_list_assets` → build `hosts.yaml` → `doctor` (the gate)
+→ `jms_dev_discover` → one real `jms_dev_run`, and stops at the first step that does not
+work, printing that step's actual output. The config, the inventory and the credentials
+file are all pinned inside a scratch directory and the OS keyring is bypassed, so it
+never touches `~/.config/jms-bridge`; `$HOME` is left alone because ssh still needs the
+real `~/.ssh`. Exit status is 0 only when the cross-chip table comes back green.
 
 ## Register with Claude Code
 
@@ -179,7 +243,7 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_cluster_cancel` | SSH | Stop **every rank** of one coordinated launch under its shared job id |
 | `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free, **cards free**; estimates `world_size` |
 | `jms_cluster_plan` | SSH | Partition targets into backend-homogeneous **islands** (HCCL/NCCL) |
-| `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous (refuses occupied cards unless `allow_busy=true`) |
+| `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous (refuses occupied cards unless `allow_busy=true`; denylist override `allow_dangerous=true`) |
 | `jms_dev_discover` | SSH | Inspect each host's container and emit a paste-ready `workspaces:` block |
 | `jms_dev_sync` | SSH | Deliver a git `ref` into every selected workspace's container (git / proxy-git / push) |
 | `jms_dev_run` | SSH | Deliver `ref`, run the UT suite in every container, return **one cross-chip consistency table** |
@@ -437,10 +501,13 @@ containers fetch), and once the table is green all the way across, opens the PR 
   policy requires approval before anything runs, gate at the account/permission layer or
   raise a `login_asset_confirm` ticket with `jms_create_ticket` and wait for it out of
   band.
-- `jms_exec` / `jms_submit_job` apply a small denylist for obviously destructive commands
-  (`rm -rf /`, `mkfs`, `dd if=`, fork bombs), overridable with `allow_dangerous=true`.
-  This is a *typo guard*, not a security boundary — JumpServer's command blacklist and
-  permission model are the real controls.
+- Every tool that runs a caller-supplied command — `jms_exec`, `jms_submit_job`,
+  `jms_cluster_submit`, and `jms_dev_run`'s `ut_cmd` override — applies a small denylist for
+  obviously destructive commands (`rm -rf /`, `mkfs`, `dd if=`, fork bombs), overridable
+  with `allow_dangerous=true`. This is a *typo guard*, not a security boundary —
+  JumpServer's command blacklist and permission model are the real controls. The commands
+  a workspace carries in `hosts.yaml` (`ut_cmd`, `env_setup`) are inventory spec text, not
+  tool arguments, and are not screened here.
 - Secrets are read from env/config and never logged. A password saved with
   `login --save-password` goes to the OS keyring when the `[keyring]` extra is present,
   otherwise to a mode-600 `~/.config/jms-bridge/credentials.toml` (delete that file, or

@@ -4,11 +4,13 @@ Config lives at ``~/.config/jms-bridge/config.toml`` (overridable with the
 ``JMS_BRIDGE_CONFIG`` env var). Secrets are never required to be in this file:
 every value can be supplied or overridden from the environment.
 
-``jms-bridge login`` may also *persist* credentials, and it keeps them in a separate
-``~/.config/jms-bridge/credentials.toml`` (mode 600, overridable with
-``JMS_BRIDGE_CREDENTIALS``) rather than in ``config.toml``. The split is deliberate:
-``config.toml`` is hand-written and safe to share or keep in a dotfiles repo, while the
-credentials file is machine-written, secret, and deletable with ``rm`` to revoke.
+``jms-bridge login`` may also *persist* credentials, and it keeps the saved *password*
+in a separate ``~/.config/jms-bridge/credentials.toml`` (mode 600, overridable with
+``JMS_BRIDGE_CREDENTIALS``) rather than in ``config.toml``. That split is deliberate:
+the password never sits in the hand-written file, and deleting the credentials file
+revokes it. What ``config.toml`` *does* hold after a login is the session **token**
+(``bastion.session_token``), so it is owner-only (600) and is **not** a file to commit
+or drop in a shared dotfiles repo.
 """
 
 from __future__ import annotations
@@ -43,6 +45,10 @@ class BastionConfig:
     verify_tls: bool = True
     #: Request timeout (seconds) for the REST control plane.
     api_timeout: float = 30.0
+    #: Parallel fan-out cap for the SSH data plane. Bounded so a wide selector does not
+    #: fork-bomb the local machine or trip the bastion's per-account connection limit;
+    #: raise it for a large, healthy fleet.
+    max_parallel: int = 8
     #: Set if the deployment enforces multi-org; sent as the ``X-JMS-ORG`` header.
     org_id: str | None = None
 
@@ -75,6 +81,22 @@ def _expand(value: str | None) -> str | None:
 def _env(name: str) -> str | None:
     v = os.environ.get(name)
     return v if v else None
+
+
+def _positive_int(value: object, *, what: str) -> int:
+    """Parse a fan-out cap, rejecting a value that would stall the semaphore.
+
+    ``SSHRunner`` guards the same way, but a config typo should be reported where it was
+    made rather than silently clamped: ``0`` here means the caller has misunderstood the
+    field, and a cap below 1 is a fleet that never runs anything.
+    """
+    try:
+        n = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{what} must be an integer, got {value!r}") from exc
+    if n < 1:
+        raise ConfigError(f"{what} must be at least 1, got {n}")
+    return n
 
 
 def config_path(path: str | Path | None = None) -> Path:
@@ -121,7 +143,8 @@ def load_config(path: str | Path | None = None) -> BastionConfig:
         JMS_BRIDGE_CONFIG, JMS_BRIDGE_URL, JMS_BRIDGE_SSH_PORT, JMS_BRIDGE_LOGIN_USER,
         JMS_BRIDGE_SSH_KEY, JMS_BRIDGE_SSH_PASSWORD, JMS_BRIDGE_ACCESS_KEY_ID,
         JMS_BRIDGE_ACCESS_KEY_SECRET, JMS_BRIDGE_PRIVATE_TOKEN,
-        JMS_BRIDGE_SESSION_TOKEN, JMS_BRIDGE_ORG_ID, JMS_BRIDGE_VERIFY_TLS
+        JMS_BRIDGE_SESSION_TOKEN, JMS_BRIDGE_ORG_ID, JMS_BRIDGE_VERIFY_TLS,
+        JMS_BRIDGE_MAX_PARALLEL
     """
 
     cfg_path = config_path(path)
@@ -155,6 +178,10 @@ def load_config(path: str | Path | None = None) -> BastionConfig:
         ssh_password=ssh_password,
         verify_tls=bool(verify_tls),
         api_timeout=float(bastion.get("api_timeout", 30.0)),
+        max_parallel=_positive_int(
+            _env("JMS_BRIDGE_MAX_PARALLEL") or bastion.get("max_parallel", 8),
+            what="max_parallel (JMS_BRIDGE_MAX_PARALLEL)",
+        ),
         org_id=_env("JMS_BRIDGE_ORG_ID") or bastion.get("org_id"),
         access_key_id=_env("JMS_BRIDGE_ACCESS_KEY_ID") or bastion.get("access_key_id"),
         access_key_secret=_env("JMS_BRIDGE_ACCESS_KEY_SECRET") or bastion.get("access_key_secret"),
