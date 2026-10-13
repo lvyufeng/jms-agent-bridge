@@ -114,12 +114,15 @@ the hostnames first, then authenticate, then come back for the ids:
 ```bash
 jms-bridge login --save-password   # prompts for your JumpServer password
 jms-bridge doctor                  # tooling → config → API → SSH, layer by layer
-jms-bridge probe cluster           # accelerator + driver/CANN version per host
 ```
 
-Once `doctor` is green, get the ids from `jms_list_assets` inside Claude Code (after
+`doctor`'s last layer pushes a command through `<login>#<account>#<asset_id>@bastion`, so
+it cannot be green while the ids are still the placeholders the template ships — expect
+the tooling, config and control-plane layers to pass and the data plane to fail. Once the
+login above has succeeded, get the ids from `jms_list_assets` inside Claude Code (after
 [registering the server](#register-with-claude-code) below), or from the JumpServer web
-UI, and fill in `asset_id` for each host. Re-run `jms-bridge doctor` to confirm.
+UI, and fill in `asset_id` for each host. Then `jms-bridge doctor` and `jms-bridge probe
+cluster` should both be green.
 
 `login` exchanges your username/password for a token once, so the MCP server itself
 never handles a password. `JMS_BRIDGE_PASSWORD='...' jms-bridge login` still works for

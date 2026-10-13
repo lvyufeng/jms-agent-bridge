@@ -11,9 +11,23 @@ of the tool, was unreachable from the documented path.
 import stat
 import textwrap
 
+import pytest
+
 from jms_bridge.cli import _CONFIG_TEMPLATE, _INVENTORY_TEMPLATE, cmd_init
 from jms_bridge.config import read_toml
 from jms_bridge.inventory import Inventory
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_bridge_env(monkeypatch):
+    # `Inventory.load(path)` resolves the path through `config.inventory_path()`, where the
+    # env var wins over the explicit argument — so a developer (or CI job) with
+    # JMS_BRIDGE_INVENTORY exported, which the README documents as a first-class way to
+    # relocate the inventory, would make the template tests below parse *their* file. The
+    # regression they pin would then go unguarded. tests/test_config.py and
+    # tests/test_secrets.py delenv the same vars for the same reason.
+    for name in ("JMS_BRIDGE_INVENTORY", "JMS_BRIDGE_CONFIG", "JMS_BRIDGE_CREDENTIALS"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _load_template(tmp_path, text):
