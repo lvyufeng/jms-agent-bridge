@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`python -m jms_bridge` — the CLI without an install.** `[project.scripts]` puts
+  `jms-bridge` on `PATH` only after `pip install`, so a freshly-cloned checkout had to reach
+  `init` / `login` / `doctor` through `python -c 'from jms_bridge.cli import main; …'`. The
+  new `src/jms_bridge/__main__.py` is the same `main`, reached the ordinary way.
+- **`platforms.guess_platform(declared, name, address)`** — the one place that decides which
+  profile an asset JumpServer described should be probed with, returning the profile's
+  canonical name plus a note when the answer is only a fallback. The declared field is
+  scanned first, so a customer's free-text label containing a vendor word cannot override a
+  platform that really is known; the asset's own name and address are the second source.
+
+### Fixed
+
+- **A fan-out whose selector matched no host reported success.** `resolve([])` returns `[]`
+  without raising and `all()` over nothing is `True`, so `jms_probe`, `jms_exec`,
+  `jms_sync_push`, `jms_sync_pull`, `jms_submit_job`, `jms_job_status`, `jms_job_logs`,
+  `jms_job_cancel`, `jms_job_wait`, `jms_cluster_cancel`, `jms_cluster_plan` and
+  `jms_cluster_preflight` could all come back green over zero hosts — and for
+  `jms_job_wait` that green was the claim "every rank is terminal" about hosts nobody had
+  asked. Each now returns `ok: false` with "matched no host", in its own reply shape, and
+  without contacting anything.
+- **`jms_cluster_preflight` raised on an empty selection** instead of answering.
+  `resolve_rendezvous([])` raises `InventoryError("cannot resolve a rendezvous for an empty
+  host list")`, which the `bool(health)` guard could not reach because the rendezvous is
+  resolved first — so the caller got an opaque tool error rather than a preflight that says
+  "not ready".
+- **The job tools returned an opaque error for a malformed job id.** `jms_job_status`,
+  `jms_job_logs` and `jms_job_cancel` passed the argument straight to the manager, where
+  `ValueError` is not one of the two exceptions `@_tool()` translates, so the client saw
+  `Error executing tool …` rather than what was wrong with the id. They now use the
+  message-returning `validate_job_id` and return `{"ok": false, "error": …}`. The same
+  lookup no longer raises `IndexError` for a host that resolved to nothing.
+- **`scripts/verify_support.py` could tag a domestic accelerator `cuda` in silence.** Its
+  platform list was a hand-maintained copy of four entries, so it drifted from the profiles
+  the probes are built from — and an asset it did not recognize was tagged `generic`, which
+  probes `uname`, finds no accelerator and reads as a healthy host with none. The tagger is
+  now generated from `platforms.PLATFORMS` (via `guess_platform`, so the same name/address
+  heuristics the rest of the bridge uses) and every fallback is reported as a
+  `warning: <host>: <why>` line on stderr. `scripts/verify-onboarding.sh` captures stderr
+  together with stdout, so its two asset-table loops now pass a `warning:` line through to
+  the terminal instead of rendering it as a row whose columns are all empty.
+
 ## 0.2.0 — 2026-10-13
 
 ### Added

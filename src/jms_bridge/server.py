@@ -113,6 +113,23 @@ def _resolve(selectors: list[str]) -> list[Host]:
     return _inv().resolve(selectors)
 
 
+def _empty_refusal(selectors: list[str], **empty: Any) -> dict[str, Any]:
+    """The reply for a fan-out whose selectors matched no host.
+
+    ``resolve([])`` returns an empty list *without* raising (only an *unmatched* selector
+    raises), and ``all()`` over nothing is ``True`` — so a fan-out that reached no host
+    would otherwise come back green, and for the job tools that green would be a claim
+    about hosts nobody asked ("every rank is terminal"). Callers pass their tool's usual
+    keys with their empty value (``hosts=[]``) so a client reading the reply finds the
+    shape it expects instead of a missing key.
+    """
+    return {
+        "ok": False,
+        "error": f"selectors {selectors!r} matched no host; nothing was done",
+        **empty,
+    }
+
+
 # --- control plane: discovery / audit / tickets -----------------------------------
 
 
@@ -223,6 +240,8 @@ async def jms_probe(targets: list[str]) -> dict:
     host in parallel and parses the result.
     """
     hosts = _resolve(targets)
+    if not hosts:
+        return _empty_refusal(targets, hosts=[])
     results = []
     for host in hosts:
         platform = host.platform_def
@@ -258,6 +277,8 @@ async def jms_exec(
             "command": command,
         }
     hosts = _resolve(targets)
+    if not hosts:
+        return _empty_refusal(targets, results=[])
     results = await _ssh().exec_many(hosts, command, timeout=timeout)
     return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
 
@@ -280,6 +301,8 @@ async def jms_sync_push(
     """
     hosts = _resolve(targets)
     excludes = excludes if excludes is not None else _DEFAULT_EXCLUDES
+    if not hosts:
+        return _empty_refusal(targets, results=[])
     results = await _gather_rsync(hosts, local, remote, "push", excludes, delete)
     return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
 
@@ -290,6 +313,8 @@ async def jms_sync_pull(
 ) -> dict:
     """rsync a remote path from every targeted host back to the local machine."""
     hosts = _resolve(targets)
+    if not hosts:
+        return _empty_refusal(targets, results=[])
     results = await _gather_rsync(hosts, local, remote, "pull", excludes or [], False)
     return {"ok": all(r.ok for r in results), "results": [r.to_dict() for r in results]}
 
@@ -442,6 +467,8 @@ async def jms_submit_job(targets: list[str], command: str, allow_dangerous: bool
             "command": command,
         }
     hosts = _resolve(targets)
+    if not hosts:
+        return _empty_refusal(targets, jobs=[])
     jobs = _jobs()
     out = []
     submitted = await asyncio.gather(*(jobs.submit(h, command) for h in hosts))
@@ -459,26 +486,47 @@ async def jms_submit_job(targets: list[str], command: str, allow_dangerous: bool
 
 @_tool()
 async def jms_job_status(targets: list[str], job_id: str) -> dict:
-    """Check a job's status on each targeted host (status, exit code, log size, alive)."""
+    """Check a job's status on each targeted host (status, exit code, log size, alive).
+
+    `ok` is false when a targeted host could not be asked. A job that is merely
+    `missing` on a reachable host is an answer, not a failure — the job may simply be
+    one this bridge never launched, or one whose status file is gone.
+    """
     hosts = _resolve(targets)
+    bad = validate_job_id(job_id)
+    if bad:
+        return {"ok": False, "error": bad}
+    if not hosts:
+        return _empty_refusal(targets, status=[])
     results = await asyncio.gather(*(_jobs().status(h, job_id) for h in hosts))
-    return {"ok": True, "status": list(results)}
+    return {"ok": all(r.get("ok") for r in results), "status": list(results)}
 
 
 @_tool()
-async def jms_job_logs(
-    host: str, job_id: str, offset: int = 0, max_bytes: int = 65536
-) -> dict:
+async def jms_job_logs(host: str, job_id: str, offset: int = 0, max_bytes: int = 65536) -> dict:
     """Read a job's log from `offset` onward. Poll with the returned `next_offset`."""
-    h = _inv().resolve([host])[0]
-    return {"ok": True, **(await _jobs().logs(h, job_id, offset=offset, max_bytes=max_bytes))}
+    bad = validate_job_id(job_id)
+    if bad:
+        return {"ok": False, "error": bad}
+    hosts = _resolve([host])
+    if not hosts:
+        return _empty_refusal([host], host=host, job_id=job_id)
+    return {
+        "ok": True,
+        **(await _jobs().logs(hosts[0], job_id, offset=offset, max_bytes=max_bytes)),
+    }
 
 
 @_tool()
 async def jms_job_cancel(host: str, job_id: str) -> dict:
     """Kill a running job on one host."""
-    h = _inv().resolve([host])[0]
-    return {"ok": True, **(await _jobs().cancel(h, job_id))}
+    bad = validate_job_id(job_id)
+    if bad:
+        return {"ok": False, "error": bad}
+    hosts = _resolve([host])
+    if not hosts:
+        return _empty_refusal([host], host=host, job_id=job_id)
+    return {"ok": True, **(await _jobs().cancel(hosts[0], job_id))}
 
 
 @_tool()
@@ -500,6 +548,10 @@ async def jms_job_wait(
     bad = validate_job_id(job_id)
     if bad:
         return {"ok": False, "error": bad}
+    if not hosts:
+        # `wait([])` polls nothing and `all()` over nothing is True, so an empty
+        # selection would report "every job finished" about hosts never asked.
+        return _empty_refusal(targets, job_id=job_id, finished=False, status=[])
     latest, finished = await _jobs().wait(
         [(h, job_id) for h in hosts], timeout=timeout, interval=interval
     )
@@ -559,7 +611,7 @@ async def jms_cluster_cancel(targets: list[str], job_id: str) -> dict:
         }
     results = await _jobs().cancel_many([(h, job_id) for h in hosts])
     return {
-        "ok": all(r.get("ok") for r in results),
+        "ok": bool(results) and all(r.get("ok") for r in results),
         "job_id": job_id,
         "cancelled": [r for r in results if r.get("killed")],
         "results": results,
@@ -1096,6 +1148,11 @@ async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_POR
     a launch. Set `allow_busy=true` on the submit to override the busy gate.
     """
     hosts = _resolve(targets)
+    if not hosts:
+        # Nothing to preflight is not "ready": say so in the tool's own shape rather than
+        # letting `resolve_rendezvous([])` raise an InventoryError the caller has to read
+        # as text.
+        return _empty_refusal(targets, hosts=[], world_size_estimate=0, busy_hosts=[])
     health = await preflight(_ssh(), hosts, port=port)
     # Match `jms_cluster_submit` exactly: a reachable host with no device count still gets
     # `nproc=1` there, so it must count 1 here. Counting 0 under-reported the world size
@@ -1104,7 +1161,10 @@ async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_POR
     rdv = resolve_rendezvous(hosts, port=port)
     busy = [h for h in health if h.busy]
     return {
-        "ok": all(h.ok for h in health) and not busy,
+        # `bool(health)` matters: this is the gate the README puts in front of
+        # `jms_cluster_submit`, and a selector that matched no host preflights nothing —
+        # reporting that as ready would wave an empty cluster through.
+        "ok": bool(health) and all(h.ok for h in health) and not busy,
         "world_size_estimate": ranks,
         "rendezvous": rdv.to_dict(),
         "heterogeneous": is_heterogeneous(hosts),
@@ -1121,6 +1181,13 @@ async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_POR
     }
 
 
+_FEDERATION_NOTE = (
+    "Same-backend hosts in one island CAN form a single collective. Cross-island "
+    "training must federate (exchange updates between rounds), not share a "
+    "collective — HCCL and NCCL do not interoperate."
+)
+
+
 @_tool()
 async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) -> dict:
     """Plan a federated layout for a target set, grouped by communication backend.
@@ -1133,6 +1200,16 @@ async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) ->
     application logic; the bridge provides per-island launch + rendezvous).
     """
     hosts = _resolve(targets)
+    if not hosts:
+        # `plan_islands([])` returns `[]` without complaint, so the reply would be an empty
+        # `islands` and an `ok` that only stayed honest thanks to the `bool(plan)` below —
+        # true, but silent about why. Say it in the tool's own shape, like the other fan-outs.
+        return _empty_refusal(
+            targets,
+            heterogeneous=False,
+            islands=[],
+            note=_FEDERATION_NOTE,
+        )
     plan = []
     for island in plan_islands(hosts):
         rdv = resolve_rendezvous(island.hosts, port=port)
@@ -1145,14 +1222,11 @@ async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) ->
             }
         )
     return {
-        "ok": True,
+        # A selector that matched no host produces no islands, which is not a plan.
+        "ok": bool(plan),
         "heterogeneous": is_heterogeneous(hosts),
         "islands": plan,
-        "note": (
-            "Same-backend hosts in one island CAN form a single collective. Cross-island "
-            "training must federate (exchange updates between rounds), not share a "
-            "collective — HCCL and NCCL do not interoperate."
-        ),
+        "note": _FEDERATION_NOTE,
     }
 
 

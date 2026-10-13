@@ -19,9 +19,11 @@ from jms_bridge.platforms import (
     PLATFORMS,
     T_HEAD,
     TSINGMICRO,
+    guess_platform,
 )
 
 # --- which platforms probe at all ---------------------------------------------------
+
 
 def test_accelerator_platforms_have_an_occupancy_probe():
     assert ASCEND.occupancy_cmd and ASCEND.occupancy_re
@@ -429,3 +431,54 @@ def test_domestic_unrecognized_body_is_unknown_not_free():
     for plat in _DOMESTIC:
         assert plat.parse_occupancy("WARNING: driver busy\n", device_count=8) is None, plat.name
         assert plat.parse_occupancy("", device_count=8) is None, plat.name
+
+
+# --- guessing a profile for an asset we were only told about --------------------------
+# A wrong tag is quiet: a domestic accelerator tagged `cuda` probes `nvidia-smi`, finds
+# nothing and reports a host with no accelerator at all. So the guess has two jobs —
+# always answer with a profile that exists, and never answer silently when it is only a
+# fallback.
+
+
+def test_a_declared_alias_is_canonicalized_to_the_profiles_own_name():
+    # JumpServer may say "NVIDIA", the profile is called `cuda` — and it is the profile's
+    # name that must come out, because that is what an inventory stores.
+    assert guess_platform(declared="NVIDIA") == ("cuda", None)
+    assert guess_platform(declared="Ascend 910C") == ("ascend-910c", None)
+
+
+def test_every_accepted_platform_alias_round_trips():
+    # The answer is always a profile in the table, so the tag can never name a platform
+    # the probes do not have.
+    for alias in PLATFORMS:
+        name, note = guess_platform(declared=alias)
+        assert note is None and name in {p.name for p in PLATFORMS.values()}
+
+
+def test_a_vendor_name_or_address_decides_when_the_declared_field_cannot():
+    # JumpServer's platform list is free text and often unhelpful ("Linux" is its usual
+    # default for any Unix host), so the asset's own name and address are the next best
+    # evidence.
+    assert guess_platform(declared="Linux", name="fl-moore-1") == ("moore-threads", None)
+    assert guess_platform(declared="Linux", name="node-7", address="kunlun-8c") == (
+        "kunlunxin",
+        None,
+    )
+
+
+def test_a_declared_profile_wins_over_a_vendor_substring_in_the_name():
+    # The declared field is scanned first, so a customer's free-text label that happens to
+    # contain a vendor word cannot override a platform that really is known.
+    assert guess_platform(declared="NVIDIA CUDA", name="摩尔线程-1") == ("cuda", None)
+
+
+def test_no_evidence_falls_back_to_generic_with_a_note():
+    name, note = guess_platform(declared="Plain Linux Board", name="node-7", address="10.0.0.9")
+    assert name == "generic"
+    assert note and "Plain Linux Board" in note and "name or address" in note
+
+
+def test_an_absent_declared_field_is_still_a_noted_fallback():
+    name, note = guess_platform()
+    assert name == "generic"
+    assert note and "declares no platform" in note

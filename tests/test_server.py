@@ -842,24 +842,47 @@ def test_inventory_reload_surfaces_a_load_error(monkeypatch):
     assert "no 'hosts:'" in r["error"]
 
 
-# --- job lifecycle tools: wait / list / cluster_cancel ------------------------------
+# --- job lifecycle tools: status / logs / cancel / wait / list / cluster_cancel ------
 
 
 class _FakeJobManager:
     """A JobManager stand-in for the lifecycle tools (no SSH, no tmux).
 
     ``statuses`` drives `wait` (a host with no scripted status reports `done`); ``jobs``
-    drives `list_jobs`; ``killed`` names the hosts whose cancel reports a kill and
-    ``raises`` the hosts whose cancel fails outright.
+    drives `list_jobs`; ``job_statuses`` drives `status` per host (default `done`) and
+    ``status_fails`` the hosts whose exec did not come back — the real `status` reports a
+    host it could not ask as ``ok: false`` rather than raising. ``killed`` names the hosts
+    whose cancel reports a kill and ``raises`` the hosts whose cancel fails outright.
     """
 
-    def __init__(self, *, statuses=None, jobs=None, killed=(), raises=(), list_raises=()):
+    def __init__(
+        self,
+        *,
+        statuses=None,
+        jobs=None,
+        job_statuses=None,
+        status_fails=(),
+        killed=(),
+        raises=(),
+        list_raises=(),
+    ):
         self.statuses = statuses or {}
         self.jobs = jobs or {}
+        self.job_statuses = job_statuses or {}
+        self.status_fails = set(status_fails)
         self.killed = set(killed)
         self.raises = set(raises)
         self.list_raises = set(list_raises)
         self.calls = []
+
+    async def status(self, host, job_id):
+        self.calls.append(("status", host.name, job_id))
+        return {
+            "host": host.name,
+            "job_id": job_id,
+            "status": self.job_statuses.get(host.name, "done"),
+            "ok": host.name not in self.status_fails,
+        }
 
     async def wait(self, pairs, *, timeout=150.0, interval=2.0):
         self.calls.append(("wait", [(h.name, j) for h, j in pairs], timeout))
@@ -896,6 +919,84 @@ def _lifecycle_install(monkeypatch, names, **kw):
     monkeypatch.setitem(S._state, "inv", inv)
     monkeypatch.setitem(S._state, "jobs", jobs)
     return jobs
+
+
+def test_job_status_asks_every_host_once(monkeypatch):
+    jobs = _lifecycle_install(monkeypatch, ["a", "b"], job_statuses={"b": "running"})
+    r = asyncio.run(S.jms_job_status(["a", "b"], "abcd1234"))
+    assert r["ok"] is True
+    assert [(s["host"], s["status"]) for s in r["status"]] == [("a", "done"), ("b", "running")]
+    assert jobs.calls == [("status", "a", "abcd1234"), ("status", "b", "abcd1234")]
+
+
+def test_job_status_treats_a_missing_job_as_an_answer(monkeypatch):
+    # A job this bridge never launched (or one whose status directory is gone) is
+    # `missing` on a host that answered — information, not a failure.
+    _lifecycle_install(monkeypatch, ["a"], job_statuses={"a": "missing"})
+    r = asyncio.run(S.jms_job_status(["a"], "abcd1234"))
+    assert r["ok"] is True and r["status"][0]["status"] == "missing"
+
+
+def test_job_status_a_host_that_could_not_be_asked_is_not_ok(monkeypatch):
+    # The real manager answers a host it could not reach with `ok: false` rather than
+    # raising, and that must not be read as "this job is fine".
+    _lifecycle_install(monkeypatch, ["a", "b"], status_fails={"b"})
+    r = asyncio.run(S.jms_job_status(["a", "b"], "abcd1234"))
+    assert r["ok"] is False
+    assert [s["ok"] for s in r["status"]] == [True, False]
+
+
+def test_job_status_rejects_a_malformed_id_without_asking(monkeypatch):
+    jobs = _lifecycle_install(monkeypatch, ["a"])
+    r = asyncio.run(S.jms_job_status(["a"], "not-an-id"))
+    assert r["ok"] is False and "invalid job id" in r["error"]
+    assert jobs.calls == []
+
+
+def test_job_status_on_an_empty_selection_is_not_success(monkeypatch):
+    # `all()` over nothing is True, so a status fan-out that reached no host must say so.
+    jobs = _lifecycle_install(monkeypatch, [])
+    r = asyncio.run(S.jms_job_status([], "abcd1234"))
+    assert r["ok"] is False and r["status"] == []
+    assert "matched no host" in r["error"]
+    assert jobs.calls == []
+
+
+def test_job_logs_rejects_a_malformed_id_without_reading(monkeypatch):
+    jobs = _lifecycle_install(monkeypatch, ["a"])
+    r = asyncio.run(S.jms_job_logs("a", "not-an-id"))
+    assert r["ok"] is False and "invalid job id" in r["error"]
+    assert jobs.calls == []
+
+
+def test_job_cancel_rejects_a_malformed_id_without_killing(monkeypatch):
+    jobs = _lifecycle_install(monkeypatch, ["a"])
+    r = asyncio.run(S.jms_job_cancel("a", "not-an-id"))
+    assert r["ok"] is False and "invalid job id" in r["error"]
+    assert jobs.calls == []
+
+
+def test_job_logs_and_cancel_on_a_selection_that_matched_no_host_are_not_success(monkeypatch):
+    # A single-host tool takes a name, but `all` on an inventory with no hosts resolves to
+    # nothing without raising — and a log read from, or a cancel sent to, nobody is not a
+    # successful call.
+    jobs = _lifecycle_install(monkeypatch, [])
+    logs = asyncio.run(S.jms_job_logs("all", "abcd1234"))
+    cancel = asyncio.run(S.jms_job_cancel("all", "abcd1234"))
+    assert logs["ok"] is False and "matched no host" in logs["error"]
+    assert cancel["ok"] is False and "matched no host" in cancel["error"]
+    assert logs["host"] == "all" and cancel["job_id"] == "abcd1234"
+    assert jobs.calls == []
+
+
+def test_job_wait_on_an_empty_selection_does_not_claim_the_ranks_finished(monkeypatch):
+    # The dangerous green: `wait([])` polls nothing, so `all()` over nothing would report
+    # "every job is terminal" — a completion claim about hosts that were never asked.
+    jobs = _lifecycle_install(monkeypatch, [])
+    r = asyncio.run(S.jms_job_wait([], "abcd1234", timeout=5))
+    assert r["ok"] is False and r["finished"] is False and r["status"] == []
+    assert "matched no host" in r["error"]
+    assert jobs.calls == []
 
 
 def test_job_wait_reports_finished_once_every_host_is_terminal(monkeypatch):
@@ -985,6 +1086,66 @@ def test_cluster_cancel_rejects_a_malformed_id(monkeypatch):
     r = asyncio.run(S.jms_cluster_cancel(["a"], "nope"))
     assert r["ok"] is False and "invalid job id" in r["error"]
     assert jobs.calls == []
+
+
+# --- a fan-out that reached no host must not report success --------------------------
+# `resolve([])` returns an empty list without raising, and `all([])` is True — so every
+# tool that fans out over resolved hosts needs its own guard, or a selector that matched
+# nothing reads as a clean green sweep over zero hosts.
+
+
+def test_probe_on_an_empty_selection_is_not_success(monkeypatch):
+    fake = _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_probe([]))
+    assert r["ok"] is False and r["hosts"] == []
+    assert "matched no host" in r["error"]
+    assert fake.calls == []  # nothing was executed
+
+
+def test_exec_on_an_empty_selection_is_not_success(monkeypatch):
+    fake = _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_exec([], "uname -a"))
+    assert r["ok"] is False and r["results"] == []
+    assert "matched no host" in r["error"]
+    assert fake.calls == []
+
+
+def test_sync_push_on_an_empty_selection_is_not_success(monkeypatch):
+    fake = _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_sync_push([], "local", "remote"))
+    assert r["ok"] is False and r["results"] == []
+    assert fake.calls == []  # no rsync was attempted anywhere
+
+
+def test_sync_pull_on_an_empty_selection_is_not_success(monkeypatch):
+    fake = _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_sync_pull([], "remote", "local"))
+    assert r["ok"] is False and r["results"] == []
+    assert fake.calls == []
+
+
+def test_submit_job_on_an_empty_selection_is_not_success(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_submit_job([], "sleep 1"))
+    assert r["ok"] is False and r["jobs"] == []
+    assert "matched no host" in r["error"]
+
+
+def test_cluster_preflight_on_an_empty_selection_is_not_ready(monkeypatch):
+    # An empty cluster must not read as "ready to launch" — this is the gate the README
+    # puts in front of `jms_cluster_submit`.
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_cluster_preflight([]))
+    assert r["ok"] is False and r["hosts"] == []
+    assert r["world_size_estimate"] == 0
+    assert "matched no host" in r["error"]
+
+
+def test_cluster_plan_on_an_empty_selection_is_not_a_plan(monkeypatch):
+    _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_cluster_plan([]))
+    assert r["ok"] is False and r["islands"] == []
+    assert "matched no host" in r["error"]
 
 
 # --- jms_pull_artifacts: one directory per host, no path escape ----------------------
