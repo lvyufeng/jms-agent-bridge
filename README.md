@@ -27,8 +27,11 @@ plane, SSH for the data plane** — and adds the three things a real cluster wor
 needs:
 
 - **Heterogeneous hosts behind one address.** `hosts.yaml` maps a friendly name to a
-  JumpServer asset plus a *platform profile* (`ascend-910c` / `cuda` / `aarch64`), so
-  `npu-smi` vs `nvidia-smi` vs `uname` is the tool's problem, not the agent's.
+  JumpServer asset plus a *platform profile* — `ascend-910c` / `cuda` / `aarch64` for the
+  mainstream boards, plus probe profiles for the domestic accelerators (`hygon-dcu`,
+  `metax`, `enflame`, `kunlunxin`, `thead`, `iluvatar`, `moore-threads`, `tsingmicro`) —
+  so `npu-smi` vs `nvidia-smi` vs `mx-smi` vs `uname` is the tool's problem, not the
+  agent's.
 - **Non-blocking jobs.** A training run takes hours; the gateway buffers responses for
   ~200s. Every long action is launched detached in `tmux` and polled, so no tool call
   that *starts* work ever blocks. `jms_job_wait` is the one deliberate exception, and it
@@ -108,9 +111,28 @@ hosts:
     workdir: ~/torch-fl
     tags: [gpu, cuda, training]
 
+  node-p800-1:                        # a domestic accelerator: same shape, its own SMI
+    login: your-login
+    account: root
+    asset_id: 22222222-....
+    platform: kunlunxin               # one of the domestic profiles below; `probe` uses
+                                      # it to pick `xpu-smi` and parse version + card count
+    workdir: ~/torch-fl
+    tags: [accelerator, kunlunxin, training]
+
 groups:
-  cluster: [ascend-910c, node-4090-1]
+  cluster: [ascend-910c, node-4090-1, node-p800-1]
 ```
+
+Domestic platforms and the SMI each probes: `hygon-dcu` (海光 `hy-smi`), `metax` (沐曦
+`mx-smi`), `enflame` (燧原 `efsmi`), `kunlunxin` (昆仑芯 `xpu-smi`), `thead` (平头哥
+`ppu-smi`), `iluvatar` (天数 `ixsmi`), `moore-threads` (摩尔线程 `mthreads-gmi`),
+`tsingmicro` (清微 `tsm_smi`). Each reports its runtime version and device count *and*
+which cards already hold a compute process, so `jms_probe` / preflight show real numbers
+instead of falling back to `uname`, and the busy gate in `jms_cluster_preflight` /
+`jms_cluster_submit` applies here as it does on Ascend and CUDA. Their `dist_backend`
+values are the vendors' commonly cited torchrun backends, **unverified on your fleet**;
+confirm before a multi-node launch.
 
 The `asset_id`s are the one thing you cannot fill in yet: looking them up needs a
 logged-in session, which is the next step. So do it in this order — `config.toml` and

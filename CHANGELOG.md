@@ -69,6 +69,22 @@
   backend. The keyring is an optional `[keyring]` extra, so the default install is
   unchanged and a headless host degrades quietly to the file.
 
+- **Domestic-accelerator platform profiles (8 vendors).** `ascend-910c` / `cuda` no
+  longer cover the whole fleet: `hygon-dcu` (海光, `hy-smi`), `metax` (沐曦, `mx-smi`),
+  `enflame` (燧原, `efsmi`), `kunlunxin` (昆仑芯, `xpu-smi`), `thead` (平头哥, `ppu-smi`),
+  `iluvatar` (天数, `ixsmi`), `moore-threads` (摩尔线程, `mthreads-gmi`) and `tsingmicro`
+  (清微, `tsm_smi`) each probe their own SMI for liveness, runtime version and device
+  count, so `jms-bridge probe` and preflight report real numbers instead of falling back
+  to a bare `uname`. Each also carries a **per-vendor occupancy query** — hygon keys on
+  the `HCU Index` each KFD process holds, metax/enflame/moore-threads/tsingmicro on the
+  device id in each process row, and kunlunxin/thead/iluvatar on the device header a
+  nested `Process ID` sits under — so the busy gate applies on these hosts too. A vendor
+  with a recognizable "nothing running" reply licenses a trusted zero (metax, enflame,
+  thead, kunlunxin, moore-threads); one that does not stays *unknown* on an idle host
+  (hygon, iluvatar, tsingmicro), which raises the flag only on a positive parse. Their
+  `dist_backend` values are the vendors' commonly cited torchrun backends but are
+  **unverified on this fleet**; confirm before a multi-node launch.
+
 ### Changed
 
 - **Every tool that takes a caller-supplied command now shares one denylist and one
@@ -124,6 +140,20 @@
   directory per host it had talked to. `main()` now tears down the lazily-built clients on
   the way out — best-effort, so a cleanup failure cannot turn a clean exit into a nonzero
   one.
+- **The `iluvatar` probe silently found nothing on three of four hosts.** `ixsmi`
+  ships under `/usr/local/corex/bin` and is only on `PATH` on some nodes; where it
+  was not, the bare `ixsmi` probe returned empty and every consumer read the host as
+  having no accelerator. The probe (and the new occupancy query) now sets
+  `LD_LIBRARY_PATH` to the corex lib dir and falls back to the install path, so all
+  four hosts report their device count and their busy cards.
+- **`jms-bridge doctor` reported green for assets KoKo refused.** A rejection (no
+  permission, asset offline, bad address) comes back over the gateway with ssh **exit
+  code 0** and the error text on stdout, and the data-plane check trusted the exit code
+  alone — so a `403 没有资产或资产未激活`, a `No route to host` or a bad-address dial all
+  read as `OK`. The probe now requires the `jms-bridge-ok` sentinel it echoes to come
+  back in the reply, so only a command that actually ran on the far side counts as
+  reached. Six unauthorized DGX assets and several unreachable hosts that doctor had
+  been marking green now correctly fail.
 - **`jms_cluster_cancel` on an empty selection reported success.** `resolve([])` returns
   `[]` without raising and `all()` over nothing is `True`, so a cancel that reached no
   host read as a green result. It now reports `ok: false` with "no hosts matched the
