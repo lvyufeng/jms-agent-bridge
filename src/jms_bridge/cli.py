@@ -38,6 +38,9 @@ login_user = "your-login"
 # ssh_password = "..."
 # set false only for a self-signed internal certificate
 verify_tls = true
+# parallel fan-out cap for the SSH data plane (default 8); raise it for a large fleet.
+# Also settable with JMS_BRIDGE_MAX_PARALLEL.
+# max_parallel = 8
 
 # --- control plane credentials (prefer env vars for these) ---
 # access_key_id = "..."       # or JMS_BRIDGE_ACCESS_KEY_ID
@@ -303,7 +306,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         await api.aclose()
 
     print("== data plane ==")
-    runner = SSHRunner(cfg)
+    runner = SSHRunner(cfg, max_parallel=cfg.max_parallel)
     try:
         hosts = inv.resolve(args.targets)
         for h in hosts:
@@ -324,7 +327,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
 async def cmd_probe(args: argparse.Namespace) -> int:
     cfg = load_config()
     inv = Inventory.load()
-    runner = SSHRunner(cfg)
+    runner = SSHRunner(cfg, max_parallel=cfg.max_parallel)
     try:
         for host in inv.resolve(args.targets):
             platform = host.platform_def

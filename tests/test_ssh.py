@@ -54,13 +54,27 @@ def test_controlmaster_is_enabled_for_reuse():
 
 def test_bastion_password_uses_sshpass_and_forces_password_auth():
     r = make_runner(ssh_password="s3cret")
-    argv = r._ssh_argv(Host(name="a", login="u", asset_id="A"))
+    h = Host(name="a", login="u", asset_id="A")
+    argv = r._ssh_argv(h)
     assert argv[0] == "sshpass" and argv[1] == "-e"
     assert "PubkeyAuthentication=no" in argv
     assert "PreferredAuthentications=password" in argv
     # password rides in the env, never in argv (argv is visible in `ps`)
     assert "s3cret" not in argv
-    assert r._subproc_env()["SSHPASS"] == "s3cret"
+    assert r._subproc_env(h)["SSHPASS"] == "s3cret"
+
+
+def test_direct_host_env_carries_no_bastion_password():
+    """The bastion password must reach only the child that will actually use it.
+
+    A direct host is key-based, so `sshpass` is not in its argv — handing it SSHPASS
+    anyway is the password where it has no business being. `close()`'s `ssh -O exit`
+    talks to the control socket and needs none either, so the hostless default omits it.
+    """
+    r = make_runner(ssh_password="s3cret")
+    direct = Host(name="d", ssh_host="h", ssh_user="ubuntu")
+    assert "SSHPASS" not in r._subproc_env(direct)
+    assert "SSHPASS" not in r._subproc_env()
 
 
 def test_direct_host_ignores_bastion_password():
@@ -145,3 +159,23 @@ def test_missing_sshpass_is_a_config_error(monkeypatch):
     with pytest.raises(ConfigError) as e:
         r._ssh_argv(Host(name="a", login="u", asset_id="A"))
     assert "sshpass" in str(e.value) and "install" in str(e.value)
+
+
+# --- the fan-out cap is configurable, and can never be a hang -----------------------
+
+
+def test_max_parallel_defaults_to_eight():
+    assert make_runner().max_parallel == 8
+
+
+def test_max_parallel_is_configurable():
+    cfg = BastionConfig(url="https://bastion.example.com", max_parallel=32)
+    assert SSHRunner(cfg, max_parallel=cfg.max_parallel).max_parallel == 32
+
+
+def test_max_parallel_below_one_cannot_deadlock_the_semaphore():
+    # Semaphore(0) is a hang, not an error, and the loader rejects 0 — this is the last
+    # line of defence for a directly-constructed runner (tests, embedders).
+    cfg = BastionConfig(url="https://bastion.example.com")
+    assert SSHRunner(cfg, max_parallel=0).max_parallel == 1
+    assert SSHRunner(cfg, max_parallel=-4).max_parallel == 1

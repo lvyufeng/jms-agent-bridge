@@ -196,6 +196,31 @@ def test_dev_run_nonzero_exit_is_not_ok(monkeypatch):
     assert r["failed_hosts"] == ["a", "b"]
 
 
+def test_dev_run_screens_the_ut_cmd_override(monkeypatch):
+    # `ut_cmd` is the one caller-supplied string this tool interpolates into a container
+    # shell, so it gets the same denylist as jms_exec's `command` — and the guard fires
+    # before anything is delivered.
+    fake = _install(monkeypatch, [_ws("a", "h1")], {"git fetch": (0, "abc1234\n", "")})
+    r = asyncio.run(S.jms_dev_run(["all"], "main", ut_cmd="rm -rf / && pytest"))
+    assert r["ok"] is False
+    assert "denylist" in r["error"]
+    assert fake.calls == []  # nothing ran, nothing was delivered
+    # the same shape as every other early return, so callers never KeyError
+    assert r["rows"] == [] and r["attestation"] == {} and r["hosts"] == {}
+
+
+def test_dev_run_allow_dangerous_overrides_the_ut_cmd_guard(monkeypatch):
+    fake = _install(monkeypatch, [_ws("a", "h1")], {
+        "git fetch": (0, "abc1234\n", ""),
+        "pytest": (0, _UT_OK, ""),
+    })
+    r = asyncio.run(
+        S.jms_dev_run(["all"], "main", ut_cmd="rm -rf / && pytest", allow_dangerous=True)
+    )
+    assert r["ok"] is True
+    assert any("pytest" in c["command"] for c in fake.calls)
+
+
 def test_dev_run_git_chip_without_sha_fails_delivery(monkeypatch):
     # A git chip whose rev-parse stdout carries no sha-shaped line (banner, empty)
     # cannot prove which commit landed, so its delivery is a failure.
@@ -762,6 +787,25 @@ def test_cluster_submit_refuses_a_host_holding_the_rendezvous_port(monkeypatch):
     assert jobs.collab == []
 
 
+def test_cluster_submit_screens_the_command_like_the_other_launchers(monkeypatch):
+    # It used to hard-fail with no escape hatch, unlike jms_exec / jms_submit_job, so a
+    # caller who genuinely needed an overridable command was stuck. The override now
+    # exists; without it the command is still refused, before any host is contacted.
+    fake, jobs = _cluster_install(monkeypatch, ["a", "b"], {})
+    r = asyncio.run(S.jms_cluster_submit(["a", "b"], "rm -rf / ; torchrun train.py"))
+    assert r["ok"] is False
+    assert "allow_dangerous=true" in r["error"]
+    assert fake.calls == [] and jobs.collab == []
+
+    r = asyncio.run(
+        S.jms_cluster_submit(
+            ["a", "b"], "rm -rf / ; torchrun train.py", allow_dangerous=True
+        )
+    )
+    assert r["ok"] is True
+    assert jobs.collab[0]["command"] == "rm -rf / ; torchrun train.py"
+
+
 # --- jms_inventory_reload -----------------------------------------------------------
 
 
@@ -1062,3 +1106,69 @@ def test_preflight_world_size_matches_what_submit_would_launch(monkeypatch):
     pf = asyncio.run(S.jms_cluster_preflight(["a", "b"]))
     sub = asyncio.run(S.jms_cluster_submit(["a", "b"], "torchrun train.py"))
     assert pf["world_size_estimate"] == sub["world_size"] == 4
+
+
+# --- shutdown: the lazily-built clients are closed, and forgotten -------------------
+
+
+def _record_closes():
+    """Install fake ssh/api/jobs clients that record what happens to them."""
+    calls = []
+
+    class _FakeSSH:
+        async def close(self):
+            calls.append("ssh")
+
+    class _FakeAPI:
+        async def aclose(self):
+            calls.append("api")
+
+    return calls, _FakeSSH(), _FakeAPI()
+
+
+def test_aclose_state_closes_and_forgets_the_clients(monkeypatch):
+    # Nothing else closes the runner, so without this every session leaves one
+    # ControlMaster socket per host it talked to (plus the /tmp/jmsb-* directory).
+    calls, ssh, api = _record_closes()
+    monkeypatch.setitem(S._state, "ssh", ssh)
+    monkeypatch.setitem(S._state, "api", api)
+    monkeypatch.setitem(S._state, "jobs", object())
+
+    asyncio.run(S._aclose_state())
+
+    assert calls == ["api", "ssh"]
+    assert "ssh" not in S._state and "api" not in S._state and "jobs" not in S._state
+
+
+def test_aclose_state_tolerates_a_half_built_state(monkeypatch):
+    # A session that only ever used the control plane has no runner cached, and vice
+    # versa; cleanup must not assume either exists.
+    monkeypatch.delitem(S._state, "ssh", raising=False)
+    monkeypatch.delitem(S._state, "api", raising=False)
+    monkeypatch.delitem(S._state, "jobs", raising=False)
+    asyncio.run(S._aclose_state())  # must not raise
+
+
+def test_main_cleans_up_on_the_way_out(monkeypatch):
+    # `server.run` returns on stdin EOF and on Ctrl-C; either way the process is leaving
+    # and the sockets must go with it.
+    calls, ssh, api = _record_closes()
+    monkeypatch.setitem(S._state, "ssh", ssh)
+    monkeypatch.setitem(S._state, "api", api)
+    monkeypatch.setattr(S.server, "run", lambda transport: None)
+
+    S.main()
+
+    assert calls == ["api", "ssh"]
+
+
+def test_main_survives_a_failing_cleanup(monkeypatch):
+    # A cleanup failure at shutdown must not turn a clean exit into a nonzero one.
+    class _Boom:
+        async def close(self):
+            raise RuntimeError("control socket already gone")
+
+    monkeypatch.setitem(S._state, "ssh", _Boom())
+    monkeypatch.setattr(S.server, "run", lambda transport: None)
+
+    S.main()  # must not raise

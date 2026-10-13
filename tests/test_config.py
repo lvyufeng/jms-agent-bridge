@@ -51,3 +51,40 @@ def test_credentials_path_precedence(tmp_path, monkeypatch):
     assert credentials_path(tmp_path / "a.toml") == tmp_path / "a.toml"
     monkeypatch.setenv("JMS_BRIDGE_CREDENTIALS", str(tmp_path / "b.toml"))
     assert credentials_path(tmp_path / "a.toml") == tmp_path / "b.toml"
+
+
+# --- the SSH fan-out cap ------------------------------------------------------------
+
+
+def _write(tmp_path, body):
+    p = tmp_path / "c.toml"
+    p.write_text(textwrap.dedent(body))
+    return p
+
+
+def test_max_parallel_defaults_to_eight(tmp_path, monkeypatch):
+    monkeypatch.delenv("JMS_BRIDGE_MAX_PARALLEL", raising=False)
+    p = _write(tmp_path, '[bastion]\nurl = "https://x"\n')
+    assert load_config(p).max_parallel == 8
+
+
+def test_max_parallel_reads_file_then_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("JMS_BRIDGE_MAX_PARALLEL", raising=False)
+    p = _write(tmp_path, '[bastion]\nurl = "https://x"\nmax_parallel = 24\n')
+    assert load_config(p).max_parallel == 24
+    monkeypatch.setenv("JMS_BRIDGE_MAX_PARALLEL", "32")
+    assert load_config(p).max_parallel == 32
+
+
+def test_max_parallel_rejects_a_value_that_cannot_fan_out(tmp_path, monkeypatch):
+    monkeypatch.delenv("JMS_BRIDGE_MAX_PARALLEL", raising=False)
+    # 0 would build a Semaphore nothing can acquire — a hang, not an error.
+    p = _write(tmp_path, '[bastion]\nurl = "https://x"\nmax_parallel = 0\n')
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "at least 1" in str(e.value)
+
+    monkeypatch.setenv("JMS_BRIDGE_MAX_PARALLEL", "lots")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "must be an integer" in str(e.value)
