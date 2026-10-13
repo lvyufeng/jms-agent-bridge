@@ -153,6 +153,56 @@ def test_domestic_profiles_are_registered_under_their_names_and_aliases():
         assert alias in PLATFORMS, alias
 
 
+# --- the collective table ---------------------------------------------------------
+# `dist_backend` documents what the vendor's torch builds a process group with;
+# `collective` is the interoperability key islands partition on. They differ wherever a
+# vendor ships its own build of an NCCL-compatible library, because sharing a backend
+# *name* is not sharing an engine. The values come from the measured vendor table in the
+# sibling PyTorch-Plugin-FL project (torch_fl/comm/process_group.py:_VENDOR_PROFILES).
+
+#: platform name -> (dist_backend, collective)
+_COLLECTIVE_TABLE = {
+    "ascend-910c": ("hccl", "hccl"),
+    "cuda": ("nccl", "nccl"),
+    "aarch64": ("gloo", "gloo"),
+    "generic": ("gloo", "gloo"),
+    "hygon-dcu": ("nccl", "rccl"),  # hipified CUDA build; ProcessGroupNCCL is RCCL
+    "metax": ("nccl", "nccl-metax"),
+    "enflame": ("flagcx", "flagcx"),  # ECCL has no ProcessGroup; only FlagCX reaches it
+    "kunlunxin": ("nccl", "nccl-kunlunxin"),
+    "thead": ("nccl", "nccl-thead"),
+    "iluvatar": ("nccl", "nccl-iluvatar"),
+    "moore-threads": ("mccl", "mccl"),
+    "tsingmicro": ("nccl", "tsingmicro"),  # backend assumed; the engine is not established
+}
+
+
+def test_every_profile_declares_the_backend_and_the_interop_key():
+    for name, (backend, collective) in _COLLECTIVE_TABLE.items():
+        plat = PLATFORMS[name]
+        assert plat.dist_backend == backend, name
+        assert plat.collective == collective, name
+
+
+def test_no_two_platforms_that_cannot_interoperate_share_a_collective():
+    # A shared key is a promise that those hosts can join one `world_size` job. The two
+    # CPU platforms genuinely can (gloo over the same transport); nothing else does.
+    by_engine: dict[str, set[str]] = {}
+    for plat in {p.name: p for p in PLATFORMS.values()}.values():
+        by_engine.setdefault(plat.collective, set()).add(plat.name)
+    shared = {engine: names for engine, names in by_engine.items() if len(names) > 1}
+    assert shared == {"gloo": {"aarch64", "generic"}}, shared
+
+
+def test_a_vendor_qualified_collective_is_not_confused_with_nvidias():
+    # The specific regression: Kunlunxin and Iluvatar were keyed on the vendor's own
+    # library name, so they were *accidentally* split from NVIDIA. Correcting the backend
+    # to the truth must not merge them back in.
+    assert KUNLUNXIN.collective != CUDA.collective
+    assert ILUVATAR.collective != CUDA.collective
+    assert KUNLUNXIN.collective != ILUVATAR.collective
+
+
 def test_hygon_dcu_probe():
     # `hy-smi` default table has no version line, so only the device count is extracted.
     out = (

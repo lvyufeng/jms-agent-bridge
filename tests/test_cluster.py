@@ -97,7 +97,7 @@ def test_health_to_dict_roundtrip():
 # --- heterogeneous topology -------------------------------------------------------
 
 
-def test_plan_islands_partitions_by_backend():
+def test_plan_islands_partitions_by_collective_engine():
     from jms_bridge.cluster import plan_islands
 
     hosts = [
@@ -107,7 +107,7 @@ def test_plan_islands_partitions_by_backend():
         Host(name="arm", platform="aarch64"),
     ]
     islands = plan_islands(hosts)
-    assert [i.backend for i in islands] == ["hccl", "nccl", "gloo"]
+    assert [i.collective for i in islands] == ["hccl", "nccl", "gloo"]
     assert [h.name for h in islands[1].hosts] == ["gpu1", "gpu2"]
     assert islands[0].name == "island-0-hccl"
     assert islands[0].to_dict()["nodes"] == 1
@@ -119,8 +119,41 @@ def test_plan_islands_homogeneous_is_one_island():
     hosts = [Host(name=f"g{i}", platform="cuda") for i in range(4)]
     islands = plan_islands(hosts)
     assert len(islands) == 1
-    assert islands[0].backend == "nccl"
+    assert islands[0].collective == "nccl"
     assert islands[0].to_dict()["nodes"] == 4
+
+
+def test_two_vendors_that_both_say_nccl_do_not_share_an_island():
+    # The bug this pins: partitioning on `dist_backend` grouped every NVIDIA-ABI vendor
+    # under the string "nccl", so a mixed NVIDIA + Kunlunxin selection was planned as ONE
+    # collective — a launch that cannot work, because each vendor ships its own
+    # libnccl.so.2 and they do not rendezvous with each other or with NVIDIA's.
+    from jms_bridge.cluster import is_heterogeneous, plan_islands
+    from jms_bridge.platforms import CUDA, ILUVATAR, KUNLUNXIN
+
+    assert CUDA.dist_backend == ILUVATAR.dist_backend == KUNLUNXIN.dist_backend == "nccl"
+    assert len({CUDA.collective, ILUVATAR.collective, KUNLUNXIN.collective}) == 3
+
+    hosts = [
+        Host(name="gpu", platform="cuda"),
+        Host(name="klx", platform="kunlunxin"),
+        Host(name="ilu", platform="iluvatar"),
+    ]
+    islands = plan_islands(hosts)
+    assert [len(i.hosts) for i in islands] == [1, 1, 1]
+    assert is_heterogeneous(hosts) is True
+
+
+def test_hosts_that_genuinely_share_an_engine_still_merge():
+    # ...and the opposite failure: the key must not split hosts that *can* collect
+    # together. Both CPU platforms run gloo over the same transport.
+    from jms_bridge.cluster import is_heterogeneous, plan_islands
+
+    hosts = [Host(name="arm", platform="aarch64"), Host(name="x86", platform="generic")]
+    islands = plan_islands(hosts)
+    assert len(islands) == 1
+    assert islands[0].collective == "gloo"
+    assert is_heterogeneous(hosts) is False
 
 
 def test_is_heterogeneous():

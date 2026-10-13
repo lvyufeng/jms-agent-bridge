@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Islands were partitioned on a backend *name*, so mixed-vendor clusters were planned
+  as one collective.** `dist_backend` doubled as the island key, and five unrelated
+  stacks all answer `nccl`: NVIDIA, Metax, Kunlunxin, T-Head and Iluvatar each ship their
+  own `libnccl.so.2` and cannot rendezvous with each other or with NVIDIA's. Selecting a
+  CUDA host alongside any of them produced a single island and a `jms_cluster_submit`
+  that could only fail at launch. Platforms now carry a separate `collective` — the
+  interoperability key islands actually partition on — so only hosts sharing one engine
+  are grouped. `Island.backend` is `Island.collective` in the reply for the same reason
+  (the value is not always a backend name).
+- **Three domestic `dist_backend` guesses were wrong, and the field claimed to be
+  verified.** They were labelled UNVERIFIED but the notes came from the chip names: it is
+  NCCL, not CNCL, on Iluvatar and not BKCL on Kunlunxin, and Enflame's ECCL has no
+  `ProcessGroup` at all — FlagCX is the only path to it, so `eccl` named a backend no
+  torch build exposes. The values now come from the measured vendor table in the sibling
+  PyTorch-Plugin-FL project (`torch_fl/comm/process_group.py:_VENDOR_PROFILES`), and
+  TsingMicro — absent from that table — says so instead of asserting a backend. A test
+  pins the whole table so it cannot drift back.
+
 ### Added
 
 - **`jms-bridge ssh-key` — the key-registration hand-off, made safe to perform.**

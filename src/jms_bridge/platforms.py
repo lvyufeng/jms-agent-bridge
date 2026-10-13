@@ -17,8 +17,21 @@ class Platform:
     name: str
     #: Short shell command that reports liveness + accelerator identity.
     probe_cmd: str
-    #: Launcher for a distributed run (``torchrun`` on both, different backends).
+    #: The collective backend this platform's *torch* actually builds a process group
+    #: with — the string you would pass to ``init_process_group`` (``nccl`` / ``hccl`` /
+    #: ``mccl`` / ``gloo``). Documentation for a human reading a probe reply; it is NOT
+    #: what groups hosts into islands (see ``collective``). For the domestic vendors it
+    #: records what the vendor's torch fork reports, which is not always the vendor's own
+    #: collective library — Enflame's ECCL, for instance, has no ``ProcessGroup`` of its
+    #: own and is reachable only through FlagCX.
     dist_backend: str
+    #: The *interoperability* key: two hosts can join one ``world_size`` job only if they
+    #: agree here. Distinct from ``dist_backend`` because sharing a name does not mean
+    #: sharing an engine — NVIDIA's NCCL and a vendor's adapted ``libnccl.so.2`` are both
+    #: called "nccl" and cannot rendezvous. Hosts with the same value form one island
+    #: (``cluster.plan_islands``); every value below is therefore unique to one
+    #: interchangeable family, even where several families report the same backend.
+    collective: str
     #: Env vars that must be set for distributed comms on this platform.
     dist_env: dict[str, str] = field(default_factory=dict)
     #: Regexes applied to probe output to extract (driver/runtime version, device count).
@@ -90,6 +103,7 @@ ASCEND = Platform(
     name="ascend-910c",
     probe_cmd="npu-smi info",
     dist_backend="hccl",
+    collective="hccl",
     dist_env={
         "ASCEND_RT_VISIBLE_DEVICES": "all",
     },
@@ -114,6 +128,7 @@ CUDA = Platform(
     name="cuda",
     probe_cmd="nvidia-smi",
     dist_backend="nccl",
+    collective="nccl",
     dist_env={},
     version_re=r"CUDA Version:\s*([0-9][0-9A-Za-z._\-]*)",
     # GPU row: "|   0  NVIDIA GeForce RTX 4090  On  |   00000000:1B:00.0 Off |"
@@ -132,6 +147,7 @@ AARCH64 = Platform(
     name="aarch64",
     probe_cmd="uname -a && nproc",
     dist_backend="gloo",
+    collective="gloo",
     dist_env={},
     version_re=r"Linux\s+\S+\s+([0-9][0-9A-Za-z._\-]*)",
     device_re=r"^\s*(\d+)\s*$",  # nproc prints a bare core count
@@ -141,6 +157,7 @@ GENERIC = Platform(
     name="generic",
     probe_cmd="uname -a && (nproc || true)",
     dist_backend="gloo",
+    collective="gloo",
     dist_env={},
     version_re=r"Linux\s+\S+\s+([0-9][0-9A-Za-z._\-]*)",
     device_re=None,
@@ -166,15 +183,26 @@ GENERIC = Platform(
 # host is the only sample we have), the zero stays *unknown* — a positive count never
 # needs licensing, because the matched rows are the evidence.
 #
-# The ``dist_backend`` / ``dist_env`` values below are the vendors' commonly cited
-# torchrun backends but are **UNVERIFIED on this fleet** — confirm before relying on
-# a multi-node launch. Each row sample the regexes were written against is quoted
-# inline; the parsers are pinned by tests/test_platforms.py.
+# ``dist_backend`` records the collective a vendor's torch fork *really* builds a
+# process group with; ``collective`` is the interoperability key islands partition on.
+# The backend names come from the measured table in the sibling ``PyTorch-Plugin-FL``
+# project (``torch_fl/comm/process_group.py:_VENDOR_PROFILES``, whose per-vendor
+# comments say what was actually exercised), not from the chip names — three of the
+# original values were guessed from the vendor's own collective library and were wrong:
+# Kunlunxin and Iluvatar both build NCCL groups under their CUDA-ABI torch, and
+# Enflame's ECCL has no ``ProcessGroup`` at all (it is reachable only through FlagCX).
+# Where a vendor ships its own build of an NCCL-compatible library, ``collective`` is
+# qualified with the vendor, because a shared name is not a shared engine: a mixed
+# NVIDIA + Kunlunxin cluster must not be planned as one collective.
+#
+# Each row sample the regexes were written against is quoted inline; the parsers are
+# pinned by tests/test_platforms.py.
 
 HYGON_DCU = Platform(  # 海光 DCU — `hy-smi` (not on PATH; installed under /opt/hyhal/bin)
     name="hygon-dcu",
     probe_cmd="hy-smi 2>/dev/null || /opt/hyhal/bin/hy-smi 2>/dev/null || true",
-    dist_backend="nccl",  # RCCL-based; UNVERIFIED
+    dist_backend="nccl",  # a hipified CUDA build — its ProcessGroupNCCL is RCCL
+    collective="rccl",  # measured: all_reduce/all_gather/reduce_scatter/DDP on 2 cards
     dist_env={},
     version_re=None,  # `hy-smi` prints no version line in its default table
     # "0       51.0C    95.0W      auto     1000.0W    0%..."
@@ -190,7 +218,8 @@ HYGON_DCU = Platform(  # 海光 DCU — `hy-smi` (not on PATH; installed under /
 METAX = Platform(  # 沐曦
     name="metax",
     probe_cmd="mx-smi",
-    dist_backend="nccl",  # MACA stack; UNVERIFIED
+    dist_backend="nccl",  # MetaX's own libnccl: an NCCL group, but not NVIDIA's
+    collective="nccl-metax",  # vendor-qualified: interops only with other MetaX hosts
     dist_env={},
     version_re=r"Kernel Mode Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
     # "| 0     MetaX C550 | 0           Off | 0000:2b:00.0        | 0%"
@@ -206,7 +235,8 @@ METAX = Platform(  # 沐曦
 ENFLAME = Platform(  # 燧原
     name="enflame",
     probe_cmd="efsmi",
-    dist_backend="eccl",  # UNVERIFIED
+    dist_backend="flagcx",  # ECCL has no ProcessGroup; FlagCX is the only path to it
+    collective="flagcx",
     dist_env={},
     version_re=r"Driver Ver:\s*([0-9][0-9A-Za-z._\-]*)",
     # "| 0      ZIXIAOC200           | 35.6.5            | 00:23:00.0  Enable"
@@ -222,7 +252,8 @@ ENFLAME = Platform(  # 燧原
 KUNLUNXIN = Platform(  # 昆仑芯
     name="kunlunxin",
     probe_cmd="xpu-smi",
-    dist_backend="bkcl",  # UNVERIFIED
+    dist_backend="nccl",  # a CUDA-ABI build: the group is NCCL, not BKCL (corrected)
+    collective="nccl-kunlunxin",
     dist_env={},
     version_re=r"Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
     # "|   0  P800 OAM           N/A   | 00000000:03:00.0 N/A |"
@@ -240,7 +271,8 @@ KUNLUNXIN = Platform(  # 昆仑芯
 T_HEAD = Platform(  # 平头哥
     name="thead",
     probe_cmd="ppu-smi",
-    dist_backend="nccl",  # UNVERIFIED
+    dist_backend="nccl",  # PPU_SDK ships a vendor-adapted libnccl.so.2 — a real CUDA build
+    collective="nccl-thead",
     dist_env={},
     version_re=r"Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
     # "| 0  PPU-ZW810E        N/A        | 00000000:3C:00.0     |"
@@ -261,7 +293,8 @@ ILUVATAR = Platform(  # 天数
         "export LD_LIBRARY_PATH=/usr/local/corex/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}; "
         "ixsmi 2>/dev/null || /usr/local/corex/bin/ixsmi 2>/dev/null || true"
     ),
-    dist_backend="cncl",  # UNVERIFIED
+    dist_backend="nccl",  # a CUDA-ABI build: the group is NCCL, not CNCL (corrected)
+    collective="nccl-iluvatar",
     dist_env={},
     version_re=r"Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
     # "| 0    Iluvatar BI-V150            | 00000000:13:00.0     | 1500MHz"
@@ -281,7 +314,8 @@ ILUVATAR = Platform(  # 天数
 MOORE_THREADS = Platform(  # 摩尔线程
     name="moore-threads",
     probe_cmd="mthreads-gmi",
-    dist_backend="mccl",  # UNVERIFIED
+    dist_backend="mccl",  # confirmed: the MUSA device's own collective backend
+    collective="mccl",
     dist_env={},
     version_re=r"Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
     # "0    MTT S5000            |00000000:18:00.0    |0%    0MiB(81920MiB)"
@@ -298,7 +332,10 @@ MOORE_THREADS = Platform(  # 摩尔线程
 TSINGMICRO = Platform(  # 清微 — `tsm_smi` reports chips, not cards; count chips (32 here)
     name="tsingmicro",
     probe_cmd="tsm_smi",
-    dist_backend="nccl",  # UNVERIFIED — vendor backend unknown
+    dist_backend="nccl",  # ASSUMED — torch_fl routes an unknown vendor to NCCL; untested here
+    collective="tsingmicro",  # names no library on purpose: the engine is not established,
+    # so the only defensible claim is "this vendor, among itself". It must stay distinct
+    # from NVIDIA's `nccl` rather than inherit the guess above.
     dist_env={},
     version_re=r"SMI V([0-9][0-9A-Za-z._\-]*)",
     # Chip rows come in two shapes: the first chip of each card shares its line with the
