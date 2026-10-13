@@ -27,8 +27,11 @@ plane, SSH for the data plane** — and adds the three things a real cluster wor
 needs:
 
 - **Heterogeneous hosts behind one address.** `hosts.yaml` maps a friendly name to a
-  JumpServer asset plus a *platform profile* (`ascend-910c` / `cuda` / `aarch64`), so
-  `npu-smi` vs `nvidia-smi` vs `uname` is the tool's problem, not the agent's.
+  JumpServer asset plus a *platform profile* — `ascend-910c` / `cuda` / `aarch64` for the
+  mainstream boards, plus probe profiles for the domestic accelerators (`hygon-dcu`,
+  `metax`, `enflame`, `kunlunxin`, `thead`, `iluvatar`, `moore-threads`, `tsingmicro`) —
+  so `npu-smi` vs `nvidia-smi` vs `mx-smi` vs `uname` is the tool's problem, not the
+  agent's.
 - **Non-blocking jobs.** A training run takes hours; the gateway buffers responses for
   ~200s. Every long action is launched detached in `tmux` and polled, so no tool call
   that *starts* work ever blocks. `jms_job_wait` is the one deliberate exception, and it

@@ -52,6 +52,17 @@
   backend. The keyring is an optional `[keyring]` extra, so the default install is
   unchanged and a headless host degrades quietly to the file.
 
+- **Domestic-accelerator platform profiles (7 vendors).** `ascend-910c` / `cuda` no
+  longer cover the whole fleet: `hygon-dcu` (海光, `hy-smi`), `metax` (沐曦, `mx-smi`),
+  `enflame` (燧原, `efsmi`), `kunlunxin` (昆仑芯, `xpu-smi`), `thead` (平头哥, `ppu-smi`),
+  `iluvatar` (天数, `ixsmi`), `moore-threads` (摩尔线程, `mthreads-gmi`) and `tsingmicro`
+  (清微, `tsm_smi`) each probe their own SMI for liveness, runtime version and device
+  count, so `jms-bridge probe` and preflight report real numbers instead of falling back
+  to a bare `uname`. These are **probe-only** so far — no per-process occupancy query, so
+  no busy gate on these hosts yet. Their `dist_backend` values are the vendors' commonly
+  cited torchrun backends but are **unverified on this fleet**; confirm before a
+  multi-node launch.
+
 ### Changed
 
 - **All ranks of one coordinated launch now share a single job id.** Ranks live on
@@ -75,6 +86,14 @@
 
 ### Fixed
 
+- **`jms-bridge doctor` reported green for assets KoKo refused.** A rejection (no
+  permission, asset offline, bad address) comes back over the gateway with ssh **exit
+  code 0** and the error text on stdout, and the data-plane check trusted the exit code
+  alone — so a `403 没有资产或资产未激活`, a `No route to host` or a bad-address dial all
+  read as `OK`. The probe now requires the `jms-bridge-ok` sentinel it echoes to come
+  back in the reply, so only a command that actually ran on the far side counts as
+  reached. Six unauthorized DGX assets and several unreachable hosts that doctor had
+  been marking green now correctly fail.
 - **`jms_cluster_cancel` on an empty selection reported success.** `resolve([])` returns
   `[]` without raising and `all()` over nothing is `True`, so a cancel that reached no
   host read as a green result. It now reports `ok: false` with "no hosts matched the

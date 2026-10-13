@@ -24,6 +24,12 @@ from .inventory import Inventory, InventoryError
 from .platforms import PLATFORMS
 from .ssh import SSHRunner
 
+#: Printed by the ``doctor`` data-plane probe and required back in the reply. KoKo
+#: rejects a connection (no permission, asset offline, bad address) with **exit code
+#: 0** and the error text on stdout, so the exit status alone reads as success. Only a
+#: reply that actually contains this sentinel proves the command ran on the far side.
+_DOCTOR_SENTINEL = "jms-bridge-ok"
+
 _CONFIG_TEMPLATE = """\
 # jms-agent-bridge configuration
 [bastion]
@@ -53,7 +59,9 @@ hosts:
     login: your-login
     account: root
     asset_id: 00000000-0000-0000-0000-000000000000
-    platform: ascend-910c          # one of: ascend-910c, cuda, aarch64, generic
+    platform: ascend-910c          # one of: ascend-910c, cuda, aarch64, generic,
+                                   #         hygon-dcu, metax, enflame, kunlunxin,
+                                   #         thead, iluvatar, moore-threads, tsingmicro
     env_setup: "source /path/to/env.sh"
     workdir: /path/to/workdir
     tags: [gpu, ascend, training]
@@ -243,10 +251,13 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
     try:
         hosts = inv.resolve(args.targets)
         for h in hosts:
-            res = await runner.exec_on(h, "echo jms-bridge-ok && hostname", timeout=45)
-            mark = "OK  " if res.ok else "FAIL"
+            res = await runner.exec_on(h, f"echo {_DOCTOR_SENTINEL} && hostname", timeout=45)
+            # Require the sentinel, not just a zero exit: a KoKo rejection exits 0 with
+            # the error on stdout, and trusting that would report a dead asset green.
+            reached = res.ok and _DOCTOR_SENTINEL in res.stdout
+            mark = "OK  " if reached else "FAIL"
             print(f"  {h.name:20} {mark} {res.stdout.strip() or res.stderr.strip()[:200]}")
-            ok = ok and res.ok
+            ok = ok and reached
     except (InventoryError, Exception) as exc:  # noqa: BLE001
         print(f"  data plane   FAIL {exc}")
         ok = False

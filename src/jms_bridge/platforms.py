@@ -146,6 +146,100 @@ GENERIC = Platform(
     device_re=None,
 )
 
+# --- domestic accelerators -------------------------------------------------------
+# One profile per vendor SMI. These are **probe-only** for now: each knows how to
+# report liveness, runtime version and device count, but carries no ``occupancy_cmd``
+# — so the cluster tools apply no busy gate on these hosts (occupancy stays unknown,
+# which is the safe default) until a per-vendor process query is added.
+#
+# The ``dist_backend`` / ``dist_env`` values below are the vendors' commonly cited
+# torchrun backends but are **UNVERIFIED on this fleet** — confirm before relying on
+# a multi-node launch. Each device row sample the regexes were written against is
+# quoted inline; the parsers are pinned by tests/test_platforms.py.
+
+HYGON_DCU = Platform(  # 海光 DCU — `hy-smi` (not on PATH; installed under /opt/hyhal/bin)
+    name="hygon-dcu",
+    probe_cmd="hy-smi 2>/dev/null || /opt/hyhal/bin/hy-smi 2>/dev/null || true",
+    dist_backend="nccl",  # RCCL-based; UNVERIFIED
+    dist_env={},
+    version_re=None,  # `hy-smi` prints no version line in its default table
+    # "0       51.0C    95.0W      auto     1000.0W    0%..."
+    device_re=r"^\s*(\d+)\s+\d+\.\d+C\s+\d+\.\d+W\b",
+)
+
+METAX = Platform(  # 沐曦
+    name="metax",
+    probe_cmd="mx-smi",
+    dist_backend="nccl",  # MACA stack; UNVERIFIED
+    dist_env={},
+    version_re=r"Kernel Mode Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
+    # "| 0     MetaX C550 | 0           Off | 0000:2b:00.0        | 0%"
+    device_re=r"^\|\s*(\d+)\s+MetaX\b",
+)
+
+ENFLAME = Platform(  # 燧原
+    name="enflame",
+    probe_cmd="efsmi",
+    dist_backend="eccl",  # UNVERIFIED
+    dist_env={},
+    version_re=r"Driver Ver:\s*([0-9][0-9A-Za-z._\-]*)",
+    # "| 0      ZIXIAOC200           | 35.6.5            | 00:23:00.0  Enable"
+    device_re=r"^\|\s*(\d+)\s+[A-Za-z]\S*\s*\|",
+)
+
+KUNLUNXIN = Platform(  # 昆仑芯
+    name="kunlunxin",
+    probe_cmd="xpu-smi",
+    dist_backend="bkcl",  # UNVERIFIED
+    dist_env={},
+    version_re=r"Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
+    # "|   0  P800 OAM           N/A   | 00000000:03:00.0 N/A |"
+    device_re=r"^\|\s*(\d+)\s+P800\b",
+)
+
+T_HEAD = Platform(  # 平头哥
+    name="thead",
+    probe_cmd="ppu-smi",
+    dist_backend="nccl",  # UNVERIFIED
+    dist_env={},
+    version_re=r"Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
+    # "| 0  PPU-ZW810E        N/A        | 00000000:3C:00.0     |"
+    device_re=r"^\|\s*(\d+)\s+PPU-",
+)
+
+ILUVATAR = Platform(  # 天数
+    name="iluvatar",
+    probe_cmd="ixsmi",
+    dist_backend="cncl",  # UNVERIFIED
+    dist_env={},
+    version_re=r"Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
+    # "| 0    Iluvatar BI-V150            | 00000000:13:00.0     | 1500MHz"
+    device_re=r"^\|\s*(\d+)\s+Iluvatar\b",
+)
+
+MOORE_THREADS = Platform(  # 摩尔线程
+    name="moore-threads",
+    probe_cmd="mthreads-gmi",
+    dist_backend="mccl",  # UNVERIFIED
+    dist_env={},
+    version_re=r"Driver Version:\s*([0-9][0-9A-Za-z._\-]*)",
+    # "0    MTT S5000            |00000000:18:00.0    |0%    0MiB(81920MiB)"
+    device_re=r"^\s*(\d+)\s+MTT\b",
+)
+
+TSINGMICRO = Platform(  # 清微 — `tsm_smi` reports chips, not cards; count chips (32 here)
+    name="tsingmicro",
+    probe_cmd="tsm_smi",
+    dist_backend="nccl",  # UNVERIFIED — vendor backend unknown
+    dist_env={},
+    version_re=r"SMI V([0-9][0-9A-Za-z._\-]*)",
+    # Chip rows come in two shapes: the first chip of each card shares its line with the
+    # card name, the rest stand alone — so anchor on the bus-id, not the row start.
+    #   "|  0    TX8110-256-00      |  0    0000:d1:00.0   45C ..."   (card + chip 0)
+    #   "|                          |  1    0000:cf:00.0   44C ..."   (chip alone)
+    device_re=r"\|\s*(?:\d+\s+\S+\s*\|\s*)?(\d+)\s+[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:",
+)
+
 PLATFORMS: dict[str, Platform] = {
     "ascend-910c": ASCEND,
     "ascend": ASCEND,
@@ -154,4 +248,18 @@ PLATFORMS: dict[str, Platform] = {
     "aarch64": AARCH64,
     "arm64": AARCH64,
     "generic": GENERIC,
+    # domestic accelerators introduced above
+    "hygon-dcu": HYGON_DCU,
+    "hygon": HYGON_DCU,
+    "metax": METAX,
+    "enflame": ENFLAME,
+    "kunlunxin": KUNLUNXIN,
+    "kunlun": KUNLUNXIN,
+    "thead": T_HEAD,
+    "t-head": T_HEAD,
+    "iluvatar": ILUVATAR,
+    "moore-threads": MOORE_THREADS,
+    "mthreads": MOORE_THREADS,
+    "tsingmicro": TSINGMICRO,
+    "tsm": TSINGMICRO,
 }
