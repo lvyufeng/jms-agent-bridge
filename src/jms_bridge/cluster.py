@@ -222,55 +222,62 @@ def resolve_rendezvous(
 
 @dataclass
 class Island:
-    """A set of hosts that share a communication backend and *can* form one collective.
+    """A set of hosts that share one collective engine and *can* form one collective.
 
     Ascend (HCCL) and NVIDIA (NCCL) nodes cannot rendezvous into a single
     ``world_size`` job — different collective libraries, different transports. So a
     mixed cluster is partitioned into islands, each island running its own
     distributed job, and the islands are *federated*: they exchange model updates
     between rounds rather than gradients within one collective.
+
+    Grouping is by ``Platform.collective``, the *interoperability* key, and not by
+    ``dist_backend`` — several NVIDIA-ABI vendors all report the backend name ``nccl``
+    while shipping their own ``libnccl.so.2``, and those builds cannot rendezvous with
+    each other or with NVIDIA's. Keying on the name would have planned one collective
+    across engines that cannot talk.
     """
 
     id: int
-    backend: str
+    collective: str
     hosts: list[Host]
 
     @property
     def name(self) -> str:
-        return f"island-{self.id}-{self.backend}"
+        return f"island-{self.id}-{self.collective}"
 
     def to_dict(self) -> dict:
         return {
             "id": self.id,
             "name": self.name,
-            "backend": self.backend,
+            "collective": self.collective,
             "hosts": [h.name for h in self.hosts],
             "nodes": len(self.hosts),
         }
 
 
 def plan_islands(hosts: list[Host]) -> list[Island]:
-    """Partition hosts into islands by communication backend, preserving order.
+    """Partition hosts into islands by collective engine, preserving order.
 
-    Hosts are grouped by their platform's ``dist_backend`` (``hccl`` / ``nccl`` /
-    ``gloo``). Same-backend hosts form one island that runs a single collective;
-    differing backends become separate islands that federate. A homogeneous cluster
-    yields a single island, which the caller may run as a plain coordinated job.
+    Hosts are grouped by their platform's ``collective`` (``hccl`` / ``nccl`` /
+    ``rccl`` / ``mccl`` / ``flagcx`` / ``gloo``). Same-engine hosts form one island that
+    runs a single collective; differing engines become separate islands that federate.
+    A homogeneous cluster yields a single island, which the caller may run as a plain
+    coordinated job.
     """
     order: list[str] = []
     buckets: dict[str, list[Host]] = {}
     for h in hosts:
-        backend = h.platform_def.dist_backend
-        if backend not in buckets:
-            buckets[backend] = []
-            order.append(backend)
-        buckets[backend].append(h)
-    return [Island(id=i, backend=b, hosts=buckets[b]) for i, b in enumerate(order)]
+        key = h.platform_def.collective
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(h)
+    return [Island(id=i, collective=k, hosts=buckets[k]) for i, k in enumerate(order)]
 
 
 def is_heterogeneous(hosts: list[Host]) -> bool:
-    """True when a target set spans more than one communication backend."""
-    return len({h.platform_def.dist_backend for h in hosts}) > 1
+    """True when a target set spans more than one collective engine."""
+    return len({h.platform_def.collective for h in hosts}) > 1
 
 
 # Re-export for callers that only import cluster.

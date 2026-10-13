@@ -1271,18 +1271,20 @@ async def jms_cluster_preflight(targets: list[str], port: int = DEFAULT_RDZV_POR
 
 
 _FEDERATION_NOTE = (
-    "Same-backend hosts in one island CAN form a single collective. Cross-island "
-    "training must federate (exchange updates between rounds), not share a "
-    "collective — HCCL and NCCL do not interoperate."
+    "Hosts sharing a collective engine in one island CAN form a single collective. "
+    "Cross-island training must federate (exchange updates between rounds), not share "
+    "a collective — HCCL and NCCL do not interoperate, and neither do two vendors' "
+    "respective NCCL builds."
 )
 
 
 @_tool()
 async def jms_cluster_plan(targets: list[str], port: int = DEFAULT_RDZV_PORT) -> dict:
-    """Plan a federated layout for a target set, grouped by communication backend.
+    """Plan a federated layout for a target set, grouped by collective engine.
 
-    Ascend (HCCL) and NVIDIA (NCCL) nodes cannot form a single collective. This
-    partitions the targets into **islands** — one per backend — each of which runs
+    Ascend (HCCL) and NVIDIA (NCCL) nodes cannot form a single collective, and neither
+    can two vendors whose torch builds each ship their own NCCL. This
+    partitions the targets into **islands** — one per engine — each of which runs
     its own coordinated job, and returns the federation plan: per-island rendezvous,
     world size and job wiring. Run `jms_cluster_submit` once per island, then let the
     islands exchange model updates between rounds (the FL exchange is the agent's
@@ -1372,10 +1374,11 @@ async def jms_cluster_submit(
         return {
             "ok": False,
             "error": (
-                "targets span multiple communication backends "
-                f"({[i.backend for i in islands]}); a single collective is impossible "
-                "(e.g. HCCL and NCCL do not interoperate). Submit one island at a time "
-                "and federate across them."
+                "targets span multiple collective engines "
+                f"({[i.collective for i in islands]}); a single collective is impossible "
+                "(e.g. HCCL and NCCL do not interoperate, and neither do two vendors' "
+                "respective NCCL builds). Submit one island at a time and federate "
+                "across them."
             ),
             "islands": [i.to_dict() for i in islands],
             "hint": "call jms_cluster_plan, then jms_cluster_submit once per island",

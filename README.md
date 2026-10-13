@@ -130,9 +130,18 @@ Domestic platforms and the SMI each probes: `hygon-dcu` (海光 `hy-smi`), `meta
 `tsingmicro` (清微 `tsm_smi`). Each reports its runtime version and device count *and*
 which cards already hold a compute process, so `jms_probe` / preflight show real numbers
 instead of falling back to `uname`, and the busy gate in `jms_cluster_preflight` /
-`jms_cluster_submit` applies here as it does on Ascend and CUDA. Their `dist_backend`
-values are the vendors' commonly cited torchrun backends, **unverified on your fleet**;
-confirm before a multi-node launch.
+`jms_cluster_submit` applies here as it does on Ascend and CUDA.
+
+Each profile also carries two values that are easy to confuse. `dist_backend` is what the
+vendor's torch **really** builds a process group with, taken from the measured vendor
+table in the sibling PyTorch-Plugin-FL project (`torch_fl/comm/process_group.py`) rather
+than guessed from the chip name — which is how three of them were originally wrong: it is
+NCCL, not CNCL, on Iluvatar and not BKCL on Kunlunxin, and Enflame's ECCL has no
+`ProcessGroup` at all (FlagCX is the only path to it). `collective` is the
+**interoperability key** that decides which hosts can join one `world_size` job, and it is
+vendor-qualified exactly where the backend name is not: NVIDIA, Metax, Kunlunxin, T-Head
+and Iluvatar all report `nccl`, but each ships its own `libnccl.so.2`, so only hosts
+sharing a `collective` value are grouped into an island.
 
 The `asset_id`s are the one thing you cannot fill in yet: looking them up needs a
 logged-in session, which is the next step. So do it in this order — `config.toml` and
@@ -256,7 +265,7 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_job_list` | SSH | Every job the bridge has launched on a host |
 | `jms_cluster_cancel` | SSH | Stop **every rank** of one coordinated launch under its shared job id |
 | `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free, **cards free**; estimates `world_size` |
-| `jms_cluster_plan` | SSH | Partition targets into backend-homogeneous **islands** (HCCL/NCCL) |
+| `jms_cluster_plan` | SSH | Partition targets into **islands** of one collective engine (HCCL/NCCL/RCCL/…) |
 | `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous (refuses occupied cards unless `allow_busy=true`; denylist override `allow_dangerous=true`) |
 | `jms_dev_discover` | SSH | Inspect each host's container and emit a paste-ready `workspaces:` block |
 | `jms_dev_sync` | SSH | Deliver a git `ref` into every selected workspace's container (git / proxy-git / push) |
@@ -322,9 +331,10 @@ in `hosts.yaml`), and all nodes must be mutually routable.
 ### Heterogeneous clusters — islands and federation
 
 Ascend (HCCL) and NVIDIA (NCCL) nodes **cannot form one collective** — different
-libraries, different transports. So a mixed cluster is not one `world_size`; it is
-several *islands*, one per communication backend, that **federate** (exchange model
-updates between rounds) rather than share a collective.
+libraries, different transports. Neither can two vendors whose torch builds each ship
+their own NCCL, even though both call the backend `nccl`. So a mixed cluster is not one
+`world_size`; it is several *islands*, one per **collective engine**, that **federate**
+(exchange model updates between rounds) rather than share a collective.
 
 `jms_cluster_plan` returns this layout; `jms_cluster_submit` refuses a mixed set and
 points you at it:
@@ -332,8 +342,8 @@ points you at it:
 ```text
 jms_cluster_plan(["cluster"])
 # -> islands: [
-#      {backend: "hccl", hosts: ["ascend-910c"],  world_size: 1, rendezvous: {...}},
-#      {backend: "nccl", hosts: ["node-4090-1", "node-4090-2"], world_size: 2, ...},
+#      {collective: "hccl", hosts: ["ascend-910c"],  world_size: 1, rendezvous: {...}},
+#      {collective: "nccl", hosts: ["node-4090-1", "node-4090-2"], world_size: 2, ...},
 #    ]
 
 # then one coordinated job per island (they form their own collectives):
