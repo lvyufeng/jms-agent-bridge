@@ -4,11 +4,13 @@ Config lives at ``~/.config/jms-bridge/config.toml`` (overridable with the
 ``JMS_BRIDGE_CONFIG`` env var). Secrets are never required to be in this file:
 every value can be supplied or overridden from the environment.
 
-``jms-bridge login`` may also *persist* credentials, and it keeps them in a separate
-``~/.config/jms-bridge/credentials.toml`` (mode 600, overridable with
-``JMS_BRIDGE_CREDENTIALS``) rather than in ``config.toml``. The split is deliberate:
-``config.toml`` is hand-written and safe to share or keep in a dotfiles repo, while the
-credentials file is machine-written, secret, and deletable with ``rm`` to revoke.
+``jms-bridge login`` may also *persist* credentials, and it keeps the saved *password*
+in a separate ``~/.config/jms-bridge/credentials.toml`` (mode 600, overridable with
+``JMS_BRIDGE_CREDENTIALS``) rather than in ``config.toml``. That split is deliberate:
+the password never sits in the hand-written file, and deleting the credentials file
+revokes it. What ``config.toml`` *does* hold after a login is the session **token**
+(``bastion.session_token``), so it is owner-only (600) and is **not** a file to commit
+or drop in a shared dotfiles repo.
 """
 
 from __future__ import annotations

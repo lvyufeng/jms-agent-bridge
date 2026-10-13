@@ -39,12 +39,19 @@ needs:
 ## Install
 
 ```bash
-pip install -e .            # or: pipx install .
-pip install -e ".[keyring]" # optional: keep a saved password in the OS keyring
+git clone https://github.com/lvyufeng/jms-agent-bridge.git && cd jms-agent-bridge
+python3 -m venv .venv && . .venv/bin/activate   # a venv, not optional: Homebrew/Debian
+                                                # Pythons refuse a bare `pip install`
+pip install -e .                                # or: pipx install .
+pip install -e ".[keyring]"                     # optional: keep a saved password in the
+                                                # OS keyring; with pipx use
+                                                # `pipx install ".[keyring]"`
 ```
 
 Requires Python 3.10+ and `ssh` + `rsync` on PATH (the bridge shells out to them and
-inherits your key agent).
+inherits your key agent). Authenticating to the gateway with a *password* rather than a
+key additionally needs `sshpass` — most distros have it in their package manager, and
+`jms-bridge doctor` tells you if it is missing.
 
 ## Configure
 
@@ -53,6 +60,14 @@ jms-bridge init             # writes ~/.config/jms-bridge/{config.toml,hosts.yam
 $EDITOR ~/.config/jms-bridge/config.toml
 $EDITOR ~/.config/jms-bridge/hosts.yaml
 ```
+
+Both live under `~/.config/jms-bridge/` and both can be relocated — `JMS_BRIDGE_CONFIG`,
+`JMS_BRIDGE_INVENTORY`, and (for the saved password) `JMS_BRIDGE_CREDENTIALS` each take
+an explicit path, which is what the error messages point at when they cannot find one.
+
+`examples/` holds the same two files with every field exercised — `examples/hosts.yaml`
+in particular documents the `workspaces:` block that `jms-bridge init` only sketches,
+and it is the one to copy if you want the development loop, not just command execution.
 
 `config.toml` — the bastion and its control-plane credentials:
 
@@ -92,13 +107,19 @@ groups:
   cluster: [ascend-910c, node-4090-1]
 ```
 
-Authenticate the control plane, then check it end to end:
+The `asset_id`s are the one thing you cannot fill in yet: looking them up needs a
+logged-in session, which is the next step. So do it in this order — `config.toml` and
+the hostnames first, then authenticate, then come back for the ids:
 
 ```bash
 jms-bridge login --save-password   # prompts for your JumpServer password
 jms-bridge doctor                  # tooling → config → API → SSH, layer by layer
 jms-bridge probe cluster           # accelerator + driver/CANN version per host
 ```
+
+Once `doctor` is green, get the ids from `jms_list_assets` inside Claude Code (after
+[registering the server](#register-with-claude-code) below), or from the JumpServer web
+UI, and fill in `asset_id` for each host. Re-run `jms-bridge doctor` to confirm.
 
 `login` exchanges your username/password for a token once, so the MCP server itself
 never handles a password. `JMS_BRIDGE_PASSWORD='...' jms-bridge login` still works for
@@ -118,8 +139,29 @@ never on the remote host):
 
 ```bash
 export JMS_BRIDGE_SSH_PASSWORD='...'
-jms-bridge doctor
+jms-bridge doctor                  # reports sshpass under `== credentials ==` if unset
 ```
+
+These are **two different secrets**, and only the first is what `login` manages:
+
+| Secret | Plane | Env var |
+| --- | --- | --- |
+| JumpServer login password → exchanged for a session token | control plane (assets, audit, tickets) | `JMS_BRIDGE_PASSWORD` |
+| The credential the KoKo gateway wants | data plane (commands, jobs, rsync, dev loop) | `JMS_BRIDGE_SSH_PASSWORD` |
+
+So `login --save-password` does **not** cover the data plane: a setup that only runs
+`login` will have `jms_list_assets` working and `jms_exec` still failing to connect.
+
+### Cloning onto a second machine
+
+Nothing secret travels in the clone. `config.toml` is a template, the saved password
+lives in the OS keyring or `credentials.toml` (both machine-local), and the session
+token `login` writes into `config.toml` is issued to *that* config file. So on a new
+machine the sequence is the same one as on the first: `jms-bridge init`, edit both
+files, copy your own `hosts.yaml` if you have one, then `jms-bridge login
+--save-password` again. If you copy a `config.toml` across, delete the stale
+`session_token` line first — otherwise the bridge starts up holding a token the server
+may no longer accept.
 
 ## Register with Claude Code
 

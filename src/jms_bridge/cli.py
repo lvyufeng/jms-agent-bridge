@@ -48,6 +48,13 @@ verify_tls = true
 
 _INVENTORY_TEMPLATE = """\
 # Map logical host names to JumpServer assets + platform metadata.
+#
+# Each host needs a JumpServer asset id, which you cannot know before you are logged
+# in. Do it in that order: fill in config.toml, run `jms-bridge login`, register the
+# MCP server, call `jms_list_assets`, *then* fill in the ids below. The JumpServer web
+# UI shows them too (`jms_list_assets` just saves you the lookup).
+#
+# `examples/hosts.yaml` in the repo is this same file with every field exercised.
 hosts:
   ascend-910c:
     login: your-login
@@ -69,6 +76,29 @@ hosts:
 
 groups:
   cluster: [ascend-910c, node-4090-1]
+
+# Workspaces are what the `jms_dev_*` development loop operates on: a host plus the
+# *container* on it that holds your checkout. Without a workspace here, `jms_dev_run`
+# matches nothing (`workspaces: []`) and cannot deliver code to any chip.
+#
+#   container  the same name on every host (must match [a-zA-Z0-9][a-zA-Z0-9_.-]*)
+#   repo       path to the checkout *inside* that container
+#   source     git | proxy-git | push   (how a ref reaches the container)
+#              proxy-git also needs `proxy:`, push also needs `mount:` + `local:`
+#   env_setup  sourced *inside* the container before the checkout and the UT command
+#   ut_cmd     must emit pytest -rA short-summary lines (the default already does)
+#   tags       free-form; usable as selectors, like host tags
+#
+# `jms_dev_discover` fills this in for you against a live cluster — prefer that once
+# the hosts above work. The block below is the shape it emits, reduced to one entry.
+workspaces:
+  fl-ascend:
+    host: ascend-910c
+    container: your-torch-fl
+    repo: /work/Torch-FL
+    source: git
+    env_setup: "source /usr/local/Ascend/ascend-toolkit/set_env.sh && conda activate fl"
+    tags: [ascend]
 """
 
 
@@ -91,21 +121,27 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"exists, skipping (use --force to overwrite): {path}")
             continue
         path.write_text(template)
-        # The config holds (or will hold) credentials; keep it owner-only from the
-        # start rather than relying on a later `login` to tighten it.
-        if path == cfg_path:
-            os.chmod(path, 0o600)
+        # config.toml will hold the session token after `login`, and hosts.yaml names
+        # every asset and login; keep both owner-only from the start rather than relying
+        # on a later `login` (which only tightens the config).
+        os.chmod(path, 0o600)
         print(f"wrote {path}")
     print(
         "\nNext:\n"
-        "  1. edit both files (bastion url, login_user, asset ids, workdirs)\n"
+        "  1. edit config.toml (bastion url, login_user) and hosts.yaml (hostnames,\n"
+        "     workdirs, the container in `workspaces:`). Leave the asset ids for step 3.\n"
         "  2. jms-bridge login --save-password\n"
         "     (prompts for the password; stores it in the OS keyring, else a 0600 file,\n"
         "      so later logins need no secret — or export JMS_BRIDGE_PASSWORD instead)\n"
         "     (if your deployment issues API keys:\n"
         "      export JMS_BRIDGE_ACCESS_KEY_ID / JMS_BRIDGE_ACCESS_KEY_SECRET,\n"
         "      or JMS_BRIDGE_PRIVATE_TOKEN)\n"
-        "  3. jms-bridge doctor"
+        "  3. jms-bridge doctor, then jms-bridge probe cluster\n"
+        "  4. asset ids: you need to be logged in to look them up. Register the MCP\n"
+        "     server (see README) and call jms_list_assets, or read them off the\n"
+        "     JumpServer web UI, then fill in `asset_id` above and re-run doctor.\n"
+        "     The data plane needs its own credential: an SSH key registered with\n"
+        "     JumpServer (recommended), or JMS_BRIDGE_SSH_PASSWORD plus sshpass."
     )
     return 0
 
@@ -213,11 +249,37 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         return 1
 
     print("== credentials ==")
-    print(f"  JMS_BRIDGE_PASSWORD  {'set' if os.environ.get('JMS_BRIDGE_PASSWORD') else 'unset'}")
+    # Two different secrets, deliberately named differently: the control plane takes the
+    # JumpServer *login* password (or a token), the data plane takes what the KoKo
+    # gateway needs. `login --save-password` only covers the control plane, so label
+    # them here rather than let a user assume one covers both.
+    print(
+        f"  JMS_BRIDGE_PASSWORD      (control plane) "
+        f"{'set' if os.environ.get('JMS_BRIDGE_PASSWORD') else 'unset'}"
+    )
+    print(
+        f"  JMS_BRIDGE_SSH_PASSWORD  (data plane)    "
+        f"{'set' if os.environ.get('JMS_BRIDGE_SSH_PASSWORD') else 'unset'}"
+    )
     saved = secrets.stored_password_source()
     print(f"  saved password       {saved or 'none (store: jms-bridge login --save-password)'}")
     backend = secrets.keyring_backend() or f"unavailable ({secrets.KEYRING_HINT})"
     print(f"  keyring backend      {backend}")
+    if cfg.ssh_password:
+        # sshpass is only needed for password auth, and the ssh/rsync check above cannot
+        # know that yet — report it here so the gate is not "tooling all OK" followed by
+        # an unexplained data-plane failure.
+        found = shutil.which("sshpass")
+        print(f"  sshpass              {'OK  ' + found if found else 'MISSING'}")
+        if not found:
+            print(
+                "                       ssh_password is set but sshpass is not installed; "
+                "install it (apt/brew) or register an SSH key instead"
+            )
+            ok = False
+    else:
+        auth = f"ssh_key {cfg.ssh_key}" if cfg.ssh_key else "ssh-agent / default keys"
+        print(f"  data plane auth      {auth}")
 
     print("== control plane ==")
     api = JumpServerAPI(cfg)

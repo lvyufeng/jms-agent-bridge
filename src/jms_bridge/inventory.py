@@ -201,7 +201,9 @@ class Inventory:
         p = inventory_path(path)
         if not p.exists():
             raise InventoryError(
-                f"No inventory at {p}. Create one (see docs) or set JMS_BRIDGE_INVENTORY."
+                f"No inventory at {p}. Run `jms-bridge init` to write a starter one, "
+                "edit it, or point JMS_BRIDGE_INVENTORY at an existing file. "
+                "`examples/hosts.yaml` in the repo shows every supported field."
             )
         with p.open("rb") as fh:
             data = yaml.safe_load(fh) or {}
