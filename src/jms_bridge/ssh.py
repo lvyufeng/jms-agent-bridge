@@ -28,6 +28,13 @@ from pathlib import Path
 from .config import BastionConfig, ConfigError
 from .inventory import Host, InventoryError, wrap_command
 
+#: Echoed by a data-plane reachability check and required back in the reply. KoKo
+#: rejects a connection (no permission, asset offline, bad address) with ssh **exit
+#: code 0** and the error text on stdout, so the exit status alone reads as success.
+#: Only a reply that actually contains this sentinel proves the command ran on the
+#: far side — it is what makes a reachability check trustworthy.
+REACH_SENTINEL = "jms-bridge-ok"
+
 
 def _require_tool(binary: str, hint: str) -> None:
     """Fail with an actionable ``ConfigError`` when a local tool is missing.

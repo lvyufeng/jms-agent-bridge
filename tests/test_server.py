@@ -39,7 +39,7 @@ def test_mcp_server_lists_all_tools():
     expected = {
         "jms_list_assets", "jms_audit_query", "jms_create_ticket",
         "jms_probe", "jms_exec", "jms_sync_push", "jms_sync_pull",
-        "jms_pull_artifacts",
+        "jms_pull_artifacts", "jms_fleet_summary",
         "jms_submit_job", "jms_job_status", "jms_job_logs", "jms_job_cancel",
         "jms_job_wait", "jms_job_list",
         "jms_cluster_preflight", "jms_cluster_plan", "jms_cluster_submit",
@@ -1148,6 +1148,17 @@ def test_cluster_plan_on_an_empty_selection_is_not_a_plan(monkeypatch):
     assert "matched no host" in r["error"]
 
 
+def test_fleet_summary_on_an_empty_selection_is_not_a_green_fleet(monkeypatch):
+    # The worst shape for this bug: "0 hosts, 0 devices, ok" reads as a fleet that is
+    # entirely healthy rather than as a selector that matched nothing.
+    fake = _install_hosts(monkeypatch, [], {})
+    r = asyncio.run(S.jms_fleet_summary([]))
+    assert r["ok"] is False and r["hosts_total"] == 0 and r["devices_total"] == 0
+    assert r["by_platform"] == {} and r["unreachable"] == []
+    assert "matched no host" in r["error"]
+    assert fake.calls == []  # no SSH was attempted
+
+
 # --- jms_pull_artifacts: one directory per host, no path escape ----------------------
 
 
@@ -1333,3 +1344,66 @@ def test_main_survives_a_failing_cleanup(monkeypatch):
     monkeypatch.setattr(S.server, "run", lambda transport: None)
 
     S.main()  # must not raise
+
+
+# --- jms_fleet_summary: the rollup rules and the tool (fakes; no SSH) ---------------
+
+
+def test_fleet_rollup_counts_reachable_and_devices_per_platform():
+    rows = [
+        {"host": "a", "platform": "cuda", "reachable": True, "device_count": 8, "reason": ""},
+        {"host": "b", "platform": "cuda", "reachable": True, "device_count": 8, "reason": ""},
+        {"host": "c", "platform": "metax", "reachable": False,
+         "device_count": None, "reason": "403"},
+    ]
+    r = S._fleet_rollup(rows)
+    assert r["by_platform"]["cuda"] == {"hosts": 2, "reachable": 2, "devices": 16}
+    # An unreachable host is counted as a host, never as reachable or as devices.
+    assert r["by_platform"]["metax"] == {"hosts": 1, "reachable": 0, "devices": 0}
+    assert r["unreachable"] == [{"host": "c", "reason": "403"}]
+
+
+def test_fleet_rollup_unknown_device_count_is_zero_not_guessed():
+    # Reachable but the probe gave no count -> contributes 0 devices, not a guess.
+    rows = [
+        {"host": "a", "platform": "iluvatar", "reachable": True,
+         "device_count": None, "reason": ""},
+    ]
+    r = S._fleet_rollup(rows)
+    assert r["by_platform"]["iluvatar"]["devices"] == 0
+
+
+class _ReachSSH:
+    """Reachability + probe fake: hosts in ``unreachable`` answer a KoKo rejection."""
+
+    def __init__(self, unreachable=()):
+        self.unreachable = set(unreachable)
+
+    async def exec_on(self, host, command, **kw):  # noqa: ANN001
+        if "jms-bridge-ok" in command:
+            if host.name in self.unreachable:
+                # KoKo rejects with exit 0 and the error on stdout (no sentinel).
+                return ExecResult(host.name, 0, "403 no permission\n", "")
+            return ExecResult(host.name, 0, "host\njms-bridge-ok\n", "")
+        cuda = "\n".join(f"| {i}  NVIDIA A100   00000000:1B:0{i}.0 Off |" for i in range(8))
+        metax = "\n".join(f"| {i}     MetaX C550 | 0 Off | 0000:2b:0{i}.0 |" for i in range(8))
+        return ExecResult(host.name, 0, metax if "mx-smi" in command else cuda, "")
+
+
+def test_fleet_summary_splits_reachable_from_unreachable(monkeypatch):
+    hosts = {
+        "a": Host(name="a", login="u", asset_id="A", platform="cuda"),
+        "b": Host(name="b", login="u", asset_id="B", platform="metax"),
+        "c": Host(name="c", login="u", asset_id="C", platform="cuda"),
+    }
+    monkeypatch.setitem(S._state, "inv", Inventory(hosts=hosts, groups={}, workspaces={}))
+    monkeypatch.setitem(S._state, "ssh", _ReachSSH(unreachable={"c"}))
+
+    r = asyncio.run(S.jms_fleet_summary(["all"]))
+
+    assert r["hosts_total"] == 3 and r["hosts_reachable"] == 2
+    assert r["devices_total"] == 16
+    assert r["by_platform"]["cuda"] == {"hosts": 2, "reachable": 1, "devices": 8}
+    assert r["by_platform"]["metax"] == {"hosts": 1, "reachable": 1, "devices": 8}
+    assert r["unreachable"] == [{"host": "c", "reason": "403 no permission"}]
+    assert r["ok"] is False  # one host did not answer

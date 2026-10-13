@@ -22,13 +22,11 @@ from .api import JumpServerAPI, JumpServerError
 from .config import ConfigError, config_path, inventory_path, load_config
 from .inventory import Inventory, InventoryError
 from .platforms import PLATFORMS
-from .ssh import SSHRunner
+from .ssh import REACH_SENTINEL, SSHRunner
 
-#: Printed by the ``doctor`` data-plane probe and required back in the reply. KoKo
-#: rejects a connection (no permission, asset offline, bad address) with **exit code
-#: 0** and the error text on stdout, so the exit status alone reads as success. Only a
-#: reply that actually contains this sentinel proves the command ran on the far side.
-_DOCTOR_SENTINEL = "jms-bridge-ok"
+#: Printed by the ``doctor`` data-plane probe and required back in the reply — see
+#: :data:`jms_bridge.ssh.REACH_SENTINEL` for why the exit code alone cannot be trusted.
+_DOCTOR_SENTINEL = REACH_SENTINEL
 
 _CONFIG_TEMPLATE = """\
 # jms-agent-bridge configuration

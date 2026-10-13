@@ -5,7 +5,8 @@ Runs as a local stdio process launched by Claude Code. Tools are grouped by plan
 * control plane (:mod:`jms_bridge.api`) — ``jms_list_assets``, ``jms_audit_query``,
   ``jms_create_ticket``
 * data plane (:mod:`jms_bridge.ssh`, :mod:`jms_bridge.jobs`) — ``jms_probe``,
-  ``jms_exec``, ``jms_sync_push`` / ``jms_sync_pull``, and the job lifecycle
+  ``jms_fleet_summary``, ``jms_exec``, ``jms_sync_push`` / ``jms_sync_pull``, and the
+  job lifecycle
 
 State (config, inventory, the SSH runner, the API client) is built lazily on first
 use so that ``import`` never fails just because the inventory is not written yet.
@@ -37,7 +38,7 @@ from .config import BastionConfig, ConfigError, load_config
 from .discover import DEFAULT_REPO_MATCH
 from .inventory import Host, Inventory, InventoryError, shell_quote
 from .jobs import JobManager, validate_job_id
-from .ssh import ExecResult, SSHRunner
+from .ssh import REACH_SENTINEL, ExecResult, SSHRunner
 from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
 log = logging.getLogger("jms_bridge.server")
@@ -258,6 +259,94 @@ async def jms_probe(targets: list[str]) -> dict:
             }
         )
     return {"ok": all(r["ok"] for r in results), "hosts": results}
+
+
+def _fleet_rollup(rows: list[dict]) -> dict:
+    """Aggregate per-host reachability/device rows into per-platform totals.
+
+    Pure, so the counting rules are unit-tested without SSH: an unreachable host is
+    counted in ``hosts`` but not in ``reachable``/``devices``; a reachable host whose
+    device count is unknown contributes 0 devices (never guessed).
+    """
+    by: dict[str, dict[str, int]] = {}
+    unreachable = []
+    for r in rows:
+        b = by.setdefault(r["platform"], {"hosts": 0, "reachable": 0, "devices": 0})
+        b["hosts"] += 1
+        if r["reachable"]:
+            b["reachable"] += 1
+            if r["device_count"] is not None:
+                b["devices"] += r["device_count"]
+        else:
+            unreachable.append({"host": r["host"], "reason": r["reason"]})
+    return {"by_platform": by, "unreachable": unreachable}
+
+
+@_tool()
+async def jms_fleet_summary(targets: list[str], probe: bool = True) -> dict:
+    """Roll up the selected fleet: how many hosts are reachable and how many
+    accelerators they hold, grouped by platform.
+
+    ``targets`` are inventory selectors (names, groups, tags); the default of ``all``
+    covers the whole inventory. Reachability is proven by the ``jms-bridge-ok``
+    sentinel coming back — a KoKo rejection (no permission, asset offline, bad address)
+    exits **0** with the error on stdout, so trusting the exit code would count a dead
+    asset as green. With ``probe`` on, each reachable host is also asked for its device
+    count, so the total is the accelerators actually present rather than the assets
+    JumpServer lists. A host that reports no device count is reachable but contributes
+    0 devices, and is named under ``device_count_unknown`` rather than assumed.
+    """
+    hosts = _resolve(targets)
+    if not hosts:
+        # Same trap as the other fan-outs: `all()` over nothing is True, so an empty
+        # selection would roll up as a reachable, device-holding fleet of nobody.
+        return _empty_refusal(
+            targets,
+            hosts_total=0,
+            hosts_reachable=0,
+            devices_total=0,
+            by_platform={},
+            device_count_unknown=[],
+            unreachable=[],
+        )
+    ssh = _ssh()
+
+    async def one(host: Host) -> dict:
+        platform = host.platform_def
+        try:
+            res = await ssh.exec_on(host, f"echo {REACH_SENTINEL} && hostname", timeout=45)
+            reached = res.ok and REACH_SENTINEL in res.stdout
+            reason = "" if reached else (res.stdout or res.stderr or "").strip()[:200]
+        except Exception as exc:  # noqa: BLE001 - a transport failure is just unreachable
+            reached, reason = False, f"{type(exc).__name__}: {exc}"[:200]
+        count = None
+        if reached and probe:
+            pr = await ssh.exec_on(host, platform.probe_cmd, timeout=45, workdir=False)
+            count = platform.parse_probe(pr.stdout).get("device_count")
+        return {
+            "host": host.name,
+            "platform": platform.name,
+            "reachable": reached,
+            "device_count": count,
+            "reason": reason,
+        }
+
+    rows = list(await asyncio.gather(*(one(h) for h in hosts)))
+    roll = _fleet_rollup(rows)
+    return {
+        # `rows` cannot be empty here — the guard above returns before any SSH is
+        # attempted — so this is a plain "did every host answer", and a partial fleet
+        # is deliberately `ok: false` with the detail under `unreachable`.
+        "ok": all(r["reachable"] for r in rows),
+        "hosts_total": len(rows),
+        "hosts_reachable": sum(1 for r in rows if r["reachable"]),
+        "devices_total": sum(v["devices"] for v in roll["by_platform"].values()),
+        "by_platform": roll["by_platform"],
+        "device_count_unknown": [
+            r["host"] for r in rows if r["reachable"] and r["device_count"] is None
+        ],
+        "unreachable": roll["unreachable"],
+    }
 
 
 @_tool()
