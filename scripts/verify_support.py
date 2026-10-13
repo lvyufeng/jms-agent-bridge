@@ -15,6 +15,12 @@ Subcommands (each prints to stdout, exits nonzero on a problem):
 
 ``--pick`` selects assets by index, name, or id (comma-separated). ``--hosts`` takes
 ``name=ref[:platform[:account]]`` entries and overrides ``--pick``.
+
+The platform written for an asset is guessed by ``jms_bridge.platforms.guess_platform`` —
+the same profiles the probes are built from, so the tag can never name a platform the
+server does not have. An asset that falls back to ``generic`` is reported on stderr: the
+inventory it produced would probe a domestic chip with the wrong tool and quietly see no
+accelerator, so a wrong guess has to be visible at the moment it is made.
 """
 
 from __future__ import annotations
@@ -22,8 +28,18 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
+from pathlib import Path
 
-KNOWN_PLATFORMS = ("ascend-910c", "cuda", "aarch64", "generic")
+# The acceptance script exports PYTHONPATH=<repo>/src, but this file is also runnable
+# straight out of a checkout. Deriving it from __file__ keeps the tagger working either
+# way — and it must resolve, because the platform names come from the profiles themselves
+# rather than from a copy kept here (a copy is what drifts).
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from jms_bridge import platforms  # noqa: E402
 
 
 def _slug(text: str | None) -> str:
@@ -31,20 +47,30 @@ def _slug(text: str | None) -> str:
     return s or "host"
 
 
+def _tag(asset: dict) -> tuple[str, str | None]:
+    """The platform profile for an asset, plus a note when that is only a fallback."""
+    return platforms.guess_platform(
+        declared=asset.get("platform"),
+        name=asset.get("name"),
+        address=asset.get("address"),
+    )
+
+
 def _platform_of(asset: dict) -> str:
     """Best-effort platform for an asset, from its own field then its name/address."""
-    declared = str(asset.get("platform") or "").lower()
-    for p in KNOWN_PLATFORMS:
-        if p in declared:
-            return p
-    hay = " ".join(str(asset.get(k) or "") for k in ("name", "address")).lower()
-    if "ascend" in hay or "910" in hay:
-        return "ascend-910c"
-    if "4090" in hay or "cuda" in hay or "nvidia" in hay:
-        return "cuda"
-    if "aarch64" in hay or "arm" in hay:
-        return "aarch64"
-    return "generic"
+    return _tag(asset)[0]
+
+
+def _warn_untagged(assets: list[dict]) -> None:
+    """Say why an asset landed on ``generic`` — on stderr, the stdout tables are parsed."""
+    for a in assets:
+        note = _tag(a)[1]
+        if note:
+            print(
+                f"warning: {a.get('name') or a.get('id')}: {note}; "
+                f"tag it by hand with --hosts name=ref:platform",
+                file=sys.stderr,
+            )
 
 
 def _resolve(assets: list[dict], token: str) -> dict:
@@ -90,6 +116,7 @@ def cmd_assets(args: argparse.Namespace) -> int:
     for i, a in enumerate(assets):
         plat = _platform_of(a)
         print(f"{i}\t{a.get('name')}\t{a.get('address')}\t{plat}\t{a.get('id')}")
+    _warn_untagged(assets)
     return 0
 
 
@@ -99,6 +126,7 @@ def cmd_mkhosts(args: argparse.Namespace) -> int:
         raise SystemExit("jms_list_assets returned no assets; nothing to put in the inventory")
 
     chosen: list[dict] = []
+    guessed: list[dict] = []  # assets whose platform was the guess, not the caller's
     seen: set[str] = set()
 
     def add(name: str, asset: dict, platform: str | None, account: str | None) -> None:
@@ -113,6 +141,8 @@ def cmd_mkhosts(args: argparse.Namespace) -> int:
                 "address": asset.get("address"),
             }
         )
+        if not platform:
+            guessed.append(asset)
 
     if args.hosts.strip():
         for item in args.hosts.split(","):
@@ -153,6 +183,7 @@ def cmd_mkhosts(args: argparse.Namespace) -> int:
     with open(args.out, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
+    _warn_untagged(guessed)
     for c in chosen:
         print(f"{c['name']}\t{c['platform']}\t{c['id']}")
     return 0

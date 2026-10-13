@@ -131,8 +131,10 @@ export JMS_BRIDGE_INVENTORY="$SCRATCH/hosts.yaml"
 export JMS_BRIDGE_CREDENTIALS="$SCRATCH/credentials.toml"
 export PYTHON_KEYRING_BACKEND="keyring.backends.null.Keyring"
 
-# The CLI, addressed without relying on a `python -m` entry point (there is none).
-jms() { PYTHONPATH="$REPO/src" "$PY" -c 'import sys; from jms_bridge.cli import main; sys.exit(main())' "$@"; }
+# The CLI, addressed through the package rather than the installed console script, so a
+# checkout that has not been `pip install`-ed still runs — which is the state a fresh
+# clone is in. `src/jms_bridge/__main__.py` is what makes `python -m` work.
+jms() { PYTHONPATH="$REPO/src" "$PY" -m jms_bridge "$@"; }
 
 SUPPORT="$REPO/scripts/verify_support.py"
 mcp() { # mcp TOOL [ARGS_JSON] [mcp_call flags...]
@@ -186,6 +188,7 @@ printf '%s' "$LAST_OUT" > "$SCRATCH/assets.json"
 capture "$PY" "$SUPPORT" assets --file "$SCRATCH/assets.json"
 [ "$LAST_STATUS" -eq 0 ] || step_failed "read the jms_list_assets result"
 printf '%s\n' "$LAST_OUT" | while IFS="$TAB" read -r idx name addr plat id; do
+  case "$idx" in warning:*) printf '  %s\n' "$idx" >&2; continue ;; esac
   printf '  [%s] %-24s %-16s %s\n' "$idx" "$name" "$addr" "$plat"
 done
 [ -n "$LAST_OUT" ] || step_failed "jms_list_assets returned no assets (no account bound?)"
@@ -202,6 +205,7 @@ capture "$PY" "$SUPPORT" mkhosts \
   --pick "${PICK-}" --hosts "${HOSTS-}"
 [ "$LAST_STATUS" -eq 0 ] || step_failed "build hosts.yaml from jms_list_assets"
 printf '%s\n' "$LAST_OUT" | while IFS="$TAB" read -r name plat id; do
+  case "$name" in warning:*) printf '  %s\n' "$name" >&2; continue ;; esac
   printf '  %-24s platform=%-12s id=%s\n' "$name" "$plat" "$id"
 done
 ok "inventory written to $JMS_BRIDGE_INVENTORY"
