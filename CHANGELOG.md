@@ -58,10 +58,15 @@
   `iluvatar` (天数, `ixsmi`), `moore-threads` (摩尔线程, `mthreads-gmi`) and `tsingmicro`
   (清微, `tsm_smi`) each probe their own SMI for liveness, runtime version and device
   count, so `jms-bridge probe` and preflight report real numbers instead of falling back
-  to a bare `uname`. These are **probe-only** so far — no per-process occupancy query, so
-  no busy gate on these hosts yet. Their `dist_backend` values are the vendors' commonly
-  cited torchrun backends but are **unverified on this fleet**; confirm before a
-  multi-node launch.
+  to a bare `uname`. Each also carries a **per-vendor occupancy query** — hygon keys on
+  the `HCU Index` each KFD process holds, metax/enflame/moore-threads/tsingmicro on the
+  device id in each process row, and kunlunxin/thead/iluvatar on the device header a
+  nested `Process ID` sits under — so the busy gate applies on these hosts too. A vendor
+  with a recognizable "nothing running" reply licenses a trusted zero (metax, enflame,
+  thead, kunlunxin, moore-threads); one that does not stays *unknown* on an idle host
+  (hygon, iluvatar, tsingmicro), which raises the flag only on a positive parse. Their
+  `dist_backend` values are the vendors' commonly cited torchrun backends but are
+  **unverified on this fleet**; confirm before a multi-node launch.
 
 ### Changed
 
@@ -86,6 +91,12 @@
 
 ### Fixed
 
+- **The `iluvatar` probe silently found nothing on three of four hosts.** `ixsmi`
+  ships under `/usr/local/corex/bin` and is only on `PATH` on some nodes; where it
+  was not, the bare `ixsmi` probe returned empty and every consumer read the host as
+  having no accelerator. The probe (and the new occupancy query) now sets
+  `LD_LIBRARY_PATH` to the corex lib dir and falls back to the install path, so all
+  four hosts report their device count and their busy cards.
 - **`jms-bridge doctor` reported green for assets KoKo refused.** A rejection (no
   permission, asset offline, bad address) comes back over the gateway with ssh **exit
   code 0** and the error text on stdout, and the data-plane check trusted the exit code

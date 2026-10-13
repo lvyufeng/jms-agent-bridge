@@ -128,21 +128,19 @@ def test_probe_failure_text_does_not_read_as_occupancy():
 
 
 # --- domestic accelerators -------------------------------------------------------
-# Probe-only profiles: they report version + device count but carry no occupancy probe,
-# so the cluster tools apply no busy gate on them. The samples below are trimmed from
-# real SMI output on this fleet — the regexes are pinned to those layouts.
+# Each profile probes version + device count *and* carries a per-vendor occupancy
+# query, so the cluster tools apply a real busy gate. The samples below are trimmed
+# from real SMI output on this fleet — the regexes are pinned to those layouts.
 
 _DOMESTIC = [HYGON_DCU, METAX, ENFLAME, KUNLUNXIN, T_HEAD, ILUVATAR, MOORE_THREADS, TSINGMICRO]
 
 
-def test_every_domestic_profile_has_a_probe_and_no_occupancy_gate():
+def test_every_domestic_profile_has_a_probe_and_an_occupancy_query():
     for plat in _DOMESTIC:
         assert plat.probe_cmd, plat.name
         assert plat.device_re, plat.name
-        # No per-process query yet: occupancy must stay unknown, never a fake zero.
-        assert plat.occupancy_cmd is None, plat.name
-        assert plat.occupancy_re is None, plat.name
-        assert plat.parse_occupancy("0  0  python\n", device_count=1) is None, plat.name
+        assert plat.occupancy_cmd, plat.name
+        assert plat.occupancy_re, plat.name
 
 
 def test_domestic_profiles_are_registered_under_their_names_and_aliases():
@@ -249,3 +247,185 @@ def test_tsingmicro_counts_chips_on_both_row_shapes():
     assert parsed["version"] == "0.29842.5.01"
     # 4 chips across 2 cards; the process row below the table is not a device.
     assert parsed["device_count"] == 4
+
+
+# --- domestic occupancy ----------------------------------------------------------
+# Row carries the device id as its first field (hygon keys on HCU index, the rest on
+# the SMI device/card id); dedupe means several processes on one card is one busy card.
+
+_HYGON_PIDS = """\
+PIDs for KFD processes:
+
+PID: 1280324
+\tPASID: 32832
+\tHCU Index: ['2']
+PID: 1280322
+\tPASID: 32816
+\tHCU Index: ['0']
+"""
+
+_METAX_BUSY = """\
+| Process:
+|  GPU                    PID         Process Name                 GPU Memory
+|=================================================================================
+|  0                  2548673         python                       0
+|  0                  2572595         python                       0
+|  1                  1234567         python                       0
+"""
+
+_METAX_IDLE = """\
+| Process:
+|  GPU                    PID         Process Name                 GPU Memory
+|=================================================================================
+|  no process found
++---------------------------------------------------------------------------------+
+"""
+
+_KUNLUN_BUSY = """\
+Attached XPUs                             : 8
+XPU 00000000:03:00.0
+    Product Name                          : P800 OAM
+    Processes
+        XPU instance ID                   : N/A
+        Compute instance ID               : N/A
+        Process ID                        : 1288826
+            Type                          : C
+XPU 00000000:16:00.0
+    Product Name                          : P800 OAM
+    Processes                             : None
+"""
+
+_KUNLUN_IDLE = """\
+Attached XPUs                             : 8
+XPU 00000000:03:00.0
+    Processes                             : None
+XPU 00000000:16:00.0
+    Processes                             : None
+"""
+
+_THEAD_IDLE = """\
+Attached PPUs                               : 16
+PPU 00000000:3C:00.0
+    Product Name                            : PPU-ZW810E
+    Processes                               : None
+PPU 00000000:36:00.0
+    Processes                               : None
+"""
+
+_ILUVATAR_BUSY = """\
+GPU 00000000:13:00.0
+    Processes
+        Process ID                              : 3274461
+            Type                                : C
+            Name                                : VLLM::Worker
+        Process ID                              : 3271203
+            Type                                : C
+GPU 00000000:16:00.0
+    Processes
+        Process ID                              : 3274462
+            Type                                : C
+"""
+
+_ILUVATAR_IDLE = """\
+GPU 00000000:13:00.0
+    Processes
+GPU 00000000:16:00.0
+    Processes
+"""
+
+_ENFLAME_IDLE = """\
+*Dev Pid      DevMem  SysMem  Command
+*Idx #        %       M       Name
+0    N/A      N/A     N/A     no process running on
+1    N/A      N/A     N/A     no process running on
+"""
+
+_ENFLAME_BUSY = """\
+*Dev Pid      DevMem  SysMem  Command
+*Idx #        %       M       Name
+0    1280324  12      5       python
+1    N/A      N/A     N/A     no process running on
+"""
+
+_MOORE_BUSY = """\
+Processes:
+ID   PID           Process name                           GPU Memory
+                                                               Usage
++-------------------------------------------------------------------+
+0    2091833       python                                      40MiB
+0    2092171       ...rtualenvs/sglang-0.5.6/bin/python        40MiB
+1    2093534       sglang::scheduler_DP0_TP0                78549MiB
+"""
+
+_MOORE_IDLE = """\
+Processes:
+ID   PID           Process name                           GPU Memory
+                                                               Usage
++-------------------------------------------------------------------+
+   No running processes found
+---------------------------------------------------------------------
+"""
+
+_TSM_PROC = """\
+|  Card   PID      Process name                            Memory Usage       |
+|=============================================================================|
+|   0     1212884    python                                  2M               |
+|   0     1216475    python                                  2M               |
+|  16     1954602    python                                  144M             |
+|  17     1954601    python                                  38128M           |
+"""
+
+
+def test_hygon_counts_busy_hcus_not_processes():
+    # Two processes on one HCU would be one busy card; here two distinct indices.
+    assert HYGON_DCU.parse_occupancy(_HYGON_PIDS, device_count=8) == 2
+
+
+def test_metax_dedupes_processes_per_device_and_licenses_the_zero():
+    # Several processes on device 0 plus one on device 1 -> two busy cards.
+    assert METAX.parse_occupancy(_METAX_BUSY, device_count=8) == 2
+    assert METAX.parse_occupancy(_METAX_IDLE, device_count=8) == 0
+
+
+def test_enflame_only_counts_a_held_card():
+    # The idle rows answer "N/A" for the PID, which must not count as busy.
+    assert ENFLAME.parse_occupancy(_ENFLAME_IDLE, device_count=8) == 0
+    assert ENFLAME.parse_occupancy(_ENFLAME_BUSY, device_count=8) == 1
+
+
+def test_kunlunxin_counts_busy_blocks_and_licenses_the_zero():
+    # A "Processes : None" block must not count; the one with a Process ID must.
+    assert KUNLUNXIN.parse_occupancy(_KUNLUN_BUSY, device_count=8) == 1
+    assert KUNLUNXIN.parse_occupancy(_KUNLUN_IDLE, device_count=8) == 0
+
+
+def test_thead_idle_reply_is_a_licensed_zero():
+    assert T_HEAD.parse_occupancy(_THEAD_IDLE, device_count=16) == 0
+
+
+def test_iluvatar_counts_busy_gpus_and_leaves_idle_unknown():
+    assert ILUVATAR.parse_occupancy(_ILUVATAR_BUSY, device_count=16) == 2
+    # No free-host reply was captured, so a GPU header with no process rows is
+    # unknown (no gate) rather than a confident zero.
+    assert ILUVATAR.parse_occupancy(_ILUVATAR_IDLE, device_count=16) is None
+
+
+def test_moore_threads_dedupes_and_licenses_the_zero():
+    assert MOORE_THREADS.parse_occupancy(_MOORE_BUSY, device_count=8) == 2
+    assert MOORE_THREADS.parse_occupancy(_MOORE_IDLE, device_count=8) == 0
+
+
+def test_tsingmicro_counts_busy_cards_not_processes():
+    # Cards 0, 16, 17 are held (card 0 twice) -> three busy cards.
+    assert TSINGMICRO.parse_occupancy(_TSM_PROC, device_count=32) == 3
+
+
+def test_domestic_occupancy_respects_the_device_count_guard():
+    # More "busy devices" than the probe saw means the match is not device rows.
+    assert METAX.parse_occupancy(_METAX_BUSY, device_count=1) is None
+
+
+def test_domestic_unrecognized_body_is_unknown_not_free():
+    for plat in _DOMESTIC:
+        assert plat.parse_occupancy("WARNING: driver busy\n", device_count=8) is None, plat.name
+        assert plat.parse_occupancy("", device_count=8) is None, plat.name

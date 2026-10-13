@@ -91,9 +91,28 @@ hosts:
     workdir: ~/torch-fl
     tags: [gpu, cuda, training]
 
+  node-p800-1:                        # a domestic accelerator: same shape, its own SMI
+    login: your-login
+    account: root
+    asset_id: 22222222-....
+    platform: kunlunxin               # one of the domestic profiles below; `probe` uses
+                                      # it to pick `xpu-smi` and parse version + card count
+    workdir: ~/torch-fl
+    tags: [accelerator, kunlunxin, training]
+
 groups:
-  cluster: [ascend-910c, node-4090-1]
+  cluster: [ascend-910c, node-4090-1, node-p800-1]
 ```
+
+Domestic platforms and the SMI each probes: `hygon-dcu` (海光 `hy-smi`), `metax` (沐曦
+`mx-smi`), `enflame` (燧原 `efsmi`), `kunlunxin` (昆仑芯 `xpu-smi`), `thead` (平头哥
+`ppu-smi`), `iluvatar` (天数 `ixsmi`), `moore-threads` (摩尔线程 `mthreads-gmi`),
+`tsingmicro` (清微 `tsm_smi`). Each reports its runtime version and device count *and*
+which cards already hold a compute process, so `jms_probe` / preflight show real numbers
+instead of falling back to `uname`, and the busy gate in `jms_cluster_preflight` /
+`jms_cluster_submit` applies here as it does on Ascend and CUDA. Their `dist_backend`
+values are the vendors' commonly cited torchrun backends, **unverified on your fleet**;
+confirm before a multi-node launch.
 
 Authenticate the control plane, then check it end to end:
 
