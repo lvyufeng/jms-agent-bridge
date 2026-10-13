@@ -163,7 +163,20 @@ reports what is stored and where. If your deployment issues API keys instead, sk
 
 The **data plane** authenticates to the KoKo SSH gateway. Register an SSH key with
 JumpServer (个人设置 → SSH 公钥) and point `ssh_key` at it — that is the recommended
-setup. For a quick start before the key is registered, KoKo also accepts password
+setup, and `jms-bridge ssh-key` walks you through it:
+
+```bash
+jms-bridge ssh-key                    # generate a bastion-only key (0600) + print its public half
+# paste that line into JumpServer → 个人设置 → SSH 公钥
+jms-bridge ssh-key --verify cluster   # prove the key alone authenticates, then drop the password
+```
+
+`--verify` clones the config with the password **removed**, so a green result is
+evidence about the key rather than about a fallback that happened to work — which is
+what makes the hand-off orderable: the password is deleted only once the key is proven,
+so the data plane is never left with no working credential.
+
+For a quick start before the key is registered, KoKo also accepts password
 auth; set `JMS_BRIDGE_SSH_PASSWORD` and it is used via `sshpass` (installed locally,
 never on the remote host):
 

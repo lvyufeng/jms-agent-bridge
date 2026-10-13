@@ -9,6 +9,7 @@ of the tool, was unreachable from the documented path.
 """
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from jms_bridge.cli import _CONFIG_TEMPLATE, _INVENTORY_TEMPLATE, cmd_init
+from jms_bridge.cli import _CONFIG_TEMPLATE, _INVENTORY_TEMPLATE, cmd_init, cmd_ssh_key
 from jms_bridge.config import read_toml
 from jms_bridge.inventory import Inventory
 
@@ -148,3 +149,64 @@ def test_python_m_jms_bridge_help_names_the_commands():
     assert p.returncode == 0, p.stderr
     for cmd in ("init", "login", "doctor", "serve"):
         assert cmd in p.stdout
+
+
+# --- ssh-key: the hardening hand-off ------------------------------------------------
+# `ssh-key` exists so the data plane can stop carrying the account password. What the
+# tests pin is the part a mistake would silently break: printing the *public* half (never
+# the private one), not overwriting or regenerating a key on a second run, and refusing
+# to "verify" a key that was never generated.
+
+
+class _KeyArgs:
+    def __init__(self, key, verify=False, targets=None):
+        self.key = key
+        self.verify = verify
+        self.targets = targets
+
+
+def test_ssh_key_generates_prints_only_the_public_half(tmp_path, capsys):
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen not installed")
+    key = tmp_path / "bastion_key"
+    assert cmd_ssh_key(_KeyArgs(str(key))) == 0
+    out = capsys.readouterr().out
+
+    assert key.exists()
+    pub = Path(str(key) + ".pub")
+    assert pub.read_text().strip() in out
+    # The private half must never be echoed — this command's whole output is meant to be
+    # pasted into a web form and into a chat, so a leaked private key would be a real one.
+    assert key.read_text().strip() not in out
+    assert "SSH 公钥" in out and "--verify" in out
+
+
+def test_ssh_key_is_owner_only(tmp_path):
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen not installed")
+    key = tmp_path / "bastion_key"
+    cmd_ssh_key(_KeyArgs(str(key)))
+    assert stat.S_IMODE(key.stat().st_mode) == 0o600
+
+
+def test_ssh_key_reuses_an_existing_key_instead_of_overwriting(tmp_path, capsys):
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen not installed")
+    key = tmp_path / "bastion_key"
+    cmd_ssh_key(_KeyArgs(str(key)))
+    before = key.read_text()
+    capsys.readouterr()
+
+    assert cmd_ssh_key(_KeyArgs(str(key))) == 0
+    assert "reusing" in capsys.readouterr().out
+    # A regenerated key would silently invalidate the key already registered with the
+    # bastion, and the failure would show up later as an unexplained auth refusal.
+    assert key.read_text() == before
+
+
+def test_ssh_key_verify_refuses_a_key_that_does_not_exist(tmp_path, capsys):
+    # Otherwise `--verify` would report on the *default* key's absence in a confusing way,
+    # or worse, pass by falling back to the password.
+    rc = cmd_ssh_key(_KeyArgs(str(tmp_path / "nope"), verify=True))
+    assert rc == 2
+    assert "no key at" in capsys.readouterr().err
