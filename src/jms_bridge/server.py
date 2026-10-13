@@ -56,7 +56,7 @@ def _tool() -> Callable[[_F], _F]:
     SDK forwards the *text* of a ``ToolError`` to the client; anything else reaches the
     agent as the opaque ``Error executing tool <name>`` — which is exactly, and
     uselessly, what a freshly-cloned-but-unconfigured checkout would see. Translating
-    keeps the actionable message ("No inventory at …; create one or set
+    keeps the actionable message ("No inventory at …; run `jms-bridge init` or set
     JMS_BRIDGE_INVENTORY") in front of the agent.
     """
 

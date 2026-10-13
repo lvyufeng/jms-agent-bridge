@@ -54,6 +54,21 @@
 
 ### Changed
 
+- **The onboarding path now leads to a working dev loop.** `jms-bridge init` writes an
+  inventory with a `workspaces:` block, so the documented quickstart is no longer a
+  sequence that ends in `jms_dev_run` matching nothing. Its `Next:` steps are ordered
+  around the one field a new user cannot fill in yet — a JumpServer **asset id** is only
+  knowable from `jms_list_assets` *after* a login — and both `init` and the README point
+  at `examples/`, which exercises every supported field.
+- **`init` writes `hosts.yaml` mode 600 as well.** It names every host and its asset id;
+  previously only `config.toml` was tightened, leaving the inventory world-readable until
+  a later `login` (which only ever touched the config).
+- **`doctor` labels the two credentials and checks `sshpass`.** The control plane takes
+  `JMS_BRIDGE_PASSWORD` and the data plane takes `JMS_BRIDGE_SSH_PASSWORD`; a single
+  "credentials" line invited the assumption that `login --save-password` covered both. It
+  now reports each separately, and reports `sshpass` under the same section when
+  `ssh_password` is set, so password auth fails with a diagnosis instead of an unexplained
+  data-plane error.
 - **All ranks of one coordinated launch now share a single job id.** Ranks live on
   different hosts so one id cannot collide, and it is what lets `jms_job_status` /
   `jms_job_wait` / `jms_job_logs` / `jms_cluster_cancel` take that one id instead of a
@@ -127,8 +142,9 @@
 - **Setup errors reached the agent as an opaque message.** `ConfigError` /
   `InventoryError` raised inside a tool were wrapped by the MCP SDK and shown as
   `Error executing tool <name>`. They are now translated to `ToolError`, so the
-  actionable text ("No inventory at …; create one or set `JMS_BRIDGE_INVENTORY`") is
-  what a freshly-cloned-but-unconfigured checkout actually sees.
+  actionable text ("No inventory at …; run `jms-bridge init` … or set
+  `JMS_BRIDGE_INVENTORY`") is what a freshly-cloned-but-unconfigured checkout actually
+  sees.
 - **CLI and server disagreed on the config path.** The CLI hard-coded the default path
   and ignored `JMS_BRIDGE_CONFIG`, so `login` could cache a token in one file while the
   server read another. Both now resolve it through `config.config_path()`.
