@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`jms_fleet_summary` — the fleet in one call.** Reachability and accelerator
+  inventory for a selector used to take one `jms_probe` round per host plus a manual
+  tally of who answered. This tool fans the whole set out in parallel and returns
+  `hosts_total` / `hosts_reachable` / `devices_total` plus a `by_platform` breakdown
+  (`hosts` / `reachable` / `devices`), the hosts whose device count came back unknown,
+  and each unreachable host with its reason. Reachability is proven by the
+  `jms-bridge-ok` sentinel coming back rather than by exit status: KoKo rejects a
+  connection with **exit 0** and the error on stdout, so an exit-code check would count
+  a dead asset as green. A host that answers but reports no device count contributes 0
+  devices and is named under `device_count_unknown` instead of being guessed at.
+
 ## 0.2.0 — 2026-10-13
 
 ### Added

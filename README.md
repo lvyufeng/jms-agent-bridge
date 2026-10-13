@@ -224,7 +224,7 @@ claude mcp add jms-bridge --scope user -e JMS_BRIDGE_SSH_PASSWORD='...' -- jms-b
 
 ## Tools
 
-23 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
+24 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
 metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 
 | Tool | Plane | What it does |
@@ -233,6 +233,7 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_audit_query` | REST | Recent command records — "what did the agent run?" |
 | `jms_create_ticket` | REST | Raise an approval ticket when policy gates an action |
 | `jms_probe` | SSH | Liveness + accelerator + version across a host set |
+| `jms_fleet_summary` | SSH | Roll the fleet up: reachable hosts and accelerators present, per platform |
 | `jms_exec` | SSH | Short command on one or many hosts, in parallel |
 | `jms_sync_push` / `jms_sync_pull` | rsync | Move code and artifacts across hosts |
 | `jms_pull_artifacts` | rsync | Pull a per-host subdirectory of one remote path into one local dir (no host-name collisions) |
