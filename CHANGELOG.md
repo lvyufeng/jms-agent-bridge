@@ -4,6 +4,23 @@
 
 ### Added
 
+- **`scripts/verify-onboarding.sh` — the acceptance pass, runnable.** The standing
+  criterion (clone on a second machine, configure an account and a password, drive the
+  cluster) is exactly what reading the code cannot confirm, so the whole first-run path is
+  now scripted: `init` → `login` → `jms_list_assets` → build `hosts.yaml` → `doctor` (the
+  gate) → `jms_dev_discover` → one real `jms_dev_run`, stopping at the first step that does
+  not work and printing that step's real output. It pins the config, inventory and
+  credentials inside a scratch `mktemp -d` and forces keyring's null backend, so the real
+  `~/.config/jms-bridge` and the OS keychain are never touched, and leaves `$HOME` alone
+  because ssh still needs the real `~/.ssh`. `scripts/mcp_call.py` speaks the MCP stdio
+  protocol directly, so the pass exercises the same tools a Claude Code session calls
+  rather than a private in-process API.
+- **Configurable SSH fan-out cap** (`max_parallel`, or `JMS_BRIDGE_MAX_PARALLEL`). The
+  fan-out width was hard-coded at 8 and passed nowhere, so a wide selector on a large,
+  healthy fleet could not be widened without editing the code — and the value that reached
+  `SSHRunner` was always its default. The server and both CLI paths now build the runner
+  from the setting, a sub-1 value is rejected where it was written (a `Semaphore(0)` is a
+  hang, not an error), and directly-constructed runners clamp rather than deadlock.
 - **Flagos development loop (4 tools).** `jms_dev_discover`, `jms_dev_sync`,
   `jms_dev_run`, `jms_dev_logs` implement *write once, verify on every chip*: deliver a
   git `ref` into every workspace's container and return one cross-chip consistency table
@@ -54,6 +71,13 @@
 
 ### Changed
 
+- **Every tool that takes a caller-supplied command now shares one denylist and one
+  override.** The two halves had drifted apart in opposite directions: `jms_dev_run`'s
+  `ut_cmd` override was interpolated into a container shell with no `_looks_dangerous`
+  check at all, while `jms_cluster_submit` screened its `command` and hard-failed with no
+  `allow_dangerous` escape hatch, so a caller who genuinely needed an override was stuck.
+  The commands an inventory carries (`ut_cmd`, `env_setup`) are spec text at the same trust
+  level as the rest of `hosts.yaml`, and are deliberately still not screened.
 - **The onboarding path now leads to a working dev loop.** `jms-bridge init` writes an
   inventory with a `workspaces:` block, so the documented quickstart is no longer a
   sequence that ends in `jms_dev_run` matching nothing. Its `Next:` steps are ordered
@@ -90,6 +114,16 @@
 
 ### Fixed
 
+- **`SSHPASS` was exported to every child the runner spawned.** A direct (`ssh_host`) host
+  is key-based, so `sshpass` is not in its argv — handing it the bastion password put the
+  secret where it had no purpose. It now reaches only the child that will actually
+  authenticate with it, and `close()`'s `ssh -O exit` (which talks to the existing control
+  socket) carries none either.
+- **The SSH runner was never closed on shutdown.** Nothing called `SSHRunner.close()` when
+  the server exited, so every session left one `ControlMaster` socket and one `/tmp/jmsb-*`
+  directory per host it had talked to. `main()` now tears down the lazily-built clients on
+  the way out — best-effort, so a cleanup failure cannot turn a clean exit into a nonzero
+  one.
 - **`jms_cluster_cancel` on an empty selection reported success.** `resolve([])` returns
   `[]` without raising and `all()` over nothing is `True`, so a cancel that reached no
   host read as a green result. It now reports `ok: false` with "no hosts matched the

@@ -78,9 +78,14 @@ ssh_port = 2222                 # KoKo gateway port
 login_user = "your-login"       # the login dimension of `<login>#<account>#<asset_id>`
 # ssh_key = "~/.ssh/id_ed25519"
 verify_tls = true
+max_parallel = 8                # parallel fan-out cap for the whole fleet
 # Prefer env vars for secrets: JMS_BRIDGE_ACCESS_KEY_ID / JMS_BRIDGE_ACCESS_KEY_SECRET
 # or JMS_BRIDGE_PRIVATE_TOKEN.
 ```
+
+`max_parallel` (or `JMS_BRIDGE_MAX_PARALLEL`) bounds how many hosts the data plane talks to
+at once. The default of 8 keeps a wide selector from fork-bombing the local machine or
+tripping the bastion's per-account connection limit; raise it for a large, healthy fleet.
 
 `hosts.yaml` — your cluster:
 
@@ -166,6 +171,20 @@ files, copy your own `hosts.yaml` if you have one, then `jms-bridge login
 `session_token` line first — otherwise the bridge starts up holding a token the server
 may no longer accept.
 
+That whole first-run path is scripted, so you can prove a fresh clone works rather than
+assume it:
+
+```bash
+JMS_BRIDGE_PASSWORD='...' scripts/verify-onboarding.sh
+```
+
+It runs `init` → `login` → `jms_list_assets` → build `hosts.yaml` → `doctor` (the gate)
+→ `jms_dev_discover` → one real `jms_dev_run`, and stops at the first step that does not
+work, printing that step's actual output. The config, the inventory and the credentials
+file are all pinned inside a scratch directory and the OS keyring is bypassed, so it
+never touches `~/.config/jms-bridge`; `$HOME` is left alone because ssh still needs the
+real `~/.ssh`. Exit status is 0 only when the cross-chip table comes back green.
+
 ## Register with Claude Code
 
 ```bash
@@ -202,7 +221,7 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_cluster_cancel` | SSH | Stop **every rank** of one coordinated launch under its shared job id |
 | `jms_cluster_preflight` | SSH | Check every host: reachable, accelerator visible, rendezvous port free, **cards free**; estimates `world_size` |
 | `jms_cluster_plan` | SSH | Partition targets into backend-homogeneous **islands** (HCCL/NCCL) |
-| `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous (refuses occupied cards unless `allow_busy=true`) |
+| `jms_cluster_submit` | SSH | Launch **one coordinated** job across a cluster with a shared rendezvous (refuses occupied cards unless `allow_busy=true`; denylist override `allow_dangerous=true`) |
 | `jms_dev_discover` | SSH | Inspect each host's container and emit a paste-ready `workspaces:` block |
 | `jms_dev_sync` | SSH | Deliver a git `ref` into every selected workspace's container (git / proxy-git / push) |
 | `jms_dev_run` | SSH | Deliver `ref`, run the UT suite in every container, return **one cross-chip consistency table** |
@@ -460,10 +479,13 @@ containers fetch), and once the table is green all the way across, opens the PR 
   policy requires approval before anything runs, gate at the account/permission layer or
   raise a `login_asset_confirm` ticket with `jms_create_ticket` and wait for it out of
   band.
-- `jms_exec` / `jms_submit_job` apply a small denylist for obviously destructive commands
-  (`rm -rf /`, `mkfs`, `dd if=`, fork bombs), overridable with `allow_dangerous=true`.
-  This is a *typo guard*, not a security boundary — JumpServer's command blacklist and
-  permission model are the real controls.
+- Every tool that runs a caller-supplied command — `jms_exec`, `jms_submit_job`,
+  `jms_cluster_submit`, and `jms_dev_run`'s `ut_cmd` override — applies a small denylist for
+  obviously destructive commands (`rm -rf /`, `mkfs`, `dd if=`, fork bombs), overridable
+  with `allow_dangerous=true`. This is a *typo guard*, not a security boundary —
+  JumpServer's command blacklist and permission model are the real controls. The commands
+  a workspace carries in `hosts.yaml` (`ut_cmd`, `env_setup`) are inventory spec text, not
+  tool arguments, and are not screened here.
 - Secrets are read from env/config and never logged. A password saved with
   `login --save-password` goes to the OS keyring when the `[keyring]` extra is present,
   otherwise to a mode-600 `~/.config/jms-bridge/credentials.toml` (delete that file, or
