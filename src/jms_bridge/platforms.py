@@ -338,3 +338,55 @@ PLATFORMS: dict[str, Platform] = {
     "tsingmicro": TSINGMICRO,
     "tsm": TSINGMICRO,
 }
+
+# --- tagging an asset we were only told about -------------------------------------
+# A ``jms_list_assets`` reply carries a free-text ``platform`` name from JumpServer's own
+# platform list ("Generic", "NVIDIA CUDA", a customer's own label) plus a name and an
+# address. Building an inventory from that means guessing which profile to probe with, and
+# guessing *wrong* is quiet: a domestic accelerator tagged ``cuda`` probes ``nvidia-smi``,
+# finds nothing and reports a host with no accelerator at all.
+#
+# The guess is therefore anchored on two things that cannot drift apart: the accepted
+# *names* are the keys of ``PLATFORMS``, and the answer is always a profile's own ``name``
+# (``"nvidia"`` → ``cuda``). Only the keyword lists are local to this table, because a
+# vendor's Chinese name and its SMI binary are not fields a profile carries.
+_VENDOR_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "ascend": ("ascend", "910", "npu"),
+    "cuda": ("4090", "cuda", "nvidia"),
+    "aarch64": ("aarch64", "arm"),
+    "hygon": ("海光", "hygon", "dcu"),
+    "metax": ("沐曦", "metax"),
+    "enflame": ("燧原", "enflame"),
+    "kunlunxin": ("昆仑", "kunlun"),
+    "thead": ("平头哥", "thead", "t-head"),
+    "iluvatar": ("天数", "iluvatar"),
+    "moore-threads": ("摩尔", "moore", "mthreads"),
+    "tsingmicro": ("清微", "tsingmicro"),
+}
+
+
+def guess_platform(
+    declared: str | None = None, name: str | None = None, address: str | None = None
+) -> tuple[str, str | None]:
+    """Which profile an asset JumpServer described should be probed with, and why not.
+
+    Returns ``(profile_name, note)``. ``note`` is ``None`` when the tag came from real
+    evidence — the declared platform named a known profile, or the asset's name/address
+    named a vendor — and a sentence when the tag is a fallback to ``generic``, because
+    ``generic`` is both a real profile (an unremarkable board) and what a vendor nobody
+    has written a profile for looks like. The caller decides how loudly to say it.
+    """
+    declared_text = (declared or "").strip()
+    low = declared_text.lower()
+    for alias, profile in PLATFORMS.items():
+        if alias in low:
+            return profile.name, None
+    hay = f"{name or ''} {address or ''}".lower()
+    for alias, keywords in _VENDOR_KEYWORDS.items():
+        if any(k in hay for k in keywords):
+            return PLATFORMS[alias].name, None
+    if declared_text:
+        note = f"declares platform {declared_text!r}, which is not a known profile"
+    else:
+        note = "declares no platform"
+    return "generic", f"{note}, and nothing in its name or address names a vendor"

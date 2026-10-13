@@ -8,8 +8,12 @@ block, so the documented onboarding sequence produced a file on which every
 of the tool, was unreachable from the documented path.
 """
 
+import os
 import stat
+import subprocess
+import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -117,3 +121,30 @@ def test_init_chmods_hosts_yaml_too(tmp_path, monkeypatch):
     assert stat.S_IMODE(inv.stat().st_mode) == 0o600
     # ...and the template comments survive the round trip (they are the documentation).
     assert "workspaces:" in inv.read_text()
+
+
+# --- `python -m jms_bridge`: the CLI without an install -------------------------------
+
+
+def test_module_entry_point_delegates_to_the_cli():
+    # `[project.scripts]` puts `jms-bridge` on PATH only after an install, so a freshly
+    # cloned checkout needed `python -c 'from jms_bridge.cli import main; ...'` to reach
+    # `init` / `login` / `doctor`. `__main__.py` is the same `main`, reached the ordinary way.
+    from jms_bridge import __main__ as entry
+    from jms_bridge.cli import main
+
+    assert entry.main is main
+
+
+def test_python_m_jms_bridge_help_names_the_commands():
+    repo = Path(__file__).resolve().parent.parent
+    p = subprocess.run(
+        [sys.executable, "-m", "jms_bridge", "--help"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(repo / "src")},
+        timeout=60,
+    )
+    assert p.returncode == 0, p.stderr
+    for cmd in ("init", "login", "doctor", "serve"):
+        assert cmd in p.stdout
