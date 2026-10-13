@@ -4,6 +4,17 @@
 
 ### Added
 
+- **`jms-bridge ssh-key` — the key-registration hand-off, made safe to perform.**
+  Key auth is the recommended data plane, but the two steps around it had no safe
+  order: registering a key meant hand-rolling `ssh-keygen` and pasting the public half
+  into the web UI (this deployment exposes no REST endpoint for it), and removing
+  `ssh_password` before the key was proven could leave the data plane with no working
+  credential. The subcommand generates a bastion-only key (0600, no passphrase — the
+  MCP server is non-interactive, so a prompt nothing can answer is a failure mode, not
+  a protection), prints the public half and the exact web steps, and `--verify` then
+  proves the key *alone* authenticates by cloning the config with the password removed.
+  Reachability is judged by the `jms-bridge-ok` sentinel, not the exit code, so a
+  refused asset is not reported green.
 - **`jms_fleet_summary` — the fleet in one call.** Reachability and accelerator
   inventory for a selector used to take one `jms_probe` round per host plus a manual
   tally of who answered. This tool fans the whole set out in parallel and returns

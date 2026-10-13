@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import getpass
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +29,12 @@ from .ssh import REACH_SENTINEL, SSHRunner
 #: Printed by the ``doctor`` data-plane probe and required back in the reply — see
 #: :data:`jms_bridge.ssh.REACH_SENTINEL` for why the exit code alone cannot be trusted.
 _DOCTOR_SENTINEL = REACH_SENTINEL
+
+#: Where `ssh-key` puts a key generated for the bastion alone. Deliberately *not* the
+#: user's default ``id_ed25519``: the point of this key is to open KoKo sessions, and a
+#: credential scoped to one service is one that can be revoked without touching
+#: everything else that trusts the default key.
+_DEFAULT_KEY = "~/.ssh/id_ed25519_jms-bridge"
 
 _CONFIG_TEMPLATE = """\
 # jms-agent-bridge configuration
@@ -152,7 +160,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         "     JumpServer web UI, then fill in `asset_id` above and re-run doctor\n"
         "     (and `jms-bridge probe cluster`).\n"
         "     The data plane needs its own credential: an SSH key registered with\n"
-        "     JumpServer (recommended), or JMS_BRIDGE_SSH_PASSWORD plus sshpass."
+        "     JumpServer (recommended) — `jms-bridge ssh-key` generates one and prints\n"
+        "     it for registration, and `jms-bridge ssh-key --verify` proves it works\n"
+        "     before you drop the password — or JMS_BRIDGE_SSH_PASSWORD plus sshpass."
     )
     return 0
 
@@ -228,6 +238,106 @@ async def cmd_login(args: argparse.Namespace) -> int:
     print(f"logged in as {username}; token cached in {path} (mode 600)")
     if getattr(args, "save_password", False):
         print(f"saved the password to {secrets.save_password(password)}")
+    return 0
+
+
+async def _verify_ssh_key(key: Path, targets: list[str]) -> int:
+    """Prove the registered key *alone* opens a KoKo session, before the password goes.
+
+    The config is cloned with the password removed, so a green result is evidence about
+    the key and not about a fallback that happened to work. Without this step the
+    hand-off has no safe order: deleting ``ssh_password`` first risks a data plane with
+    no working credential, and leaving it in place leaves the key unexercised.
+    """
+    cfg = dataclasses.replace(load_config(), ssh_password=None, ssh_key=str(key))
+    inv = Inventory.load()
+    runner = SSHRunner(cfg)
+    ok = True
+    try:
+        for host in inv.resolve(targets):
+            res = await runner.exec_on(host, f"echo {_DOCTOR_SENTINEL} && hostname", timeout=45)
+            # Sentinel, not exit code: KoKo rejects a connection with exit 0 (see
+            # _DOCTOR_SENTINEL), so a status-only check would call a refused asset green.
+            reached = res.ok and _DOCTOR_SENTINEL in res.stdout
+            mark = "OK  " if reached else "FAIL"
+            detail = res.stdout.strip() or res.stderr.strip()[:200]
+            print(f"  {host.name:20} {mark} {detail}")
+            ok = ok and reached
+    except (InventoryError, ConfigError) as exc:
+        print(f"  verify failed: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        await runner.close()
+    if ok:
+        print(
+            f"\nkey auth works. Now drop the password from the data plane:\n"
+            f"  - set `ssh_key = \"{key}\"` and remove `ssh_password` in "
+            f"{_config_path()},\n"
+            f"  - unset JMS_BRIDGE_SSH_PASSWORD if you exported it."
+        )
+        return 0
+    print(
+        "\nkey auth did NOT work — the password is still needed, so keep ssh_password "
+        "set.\nCheck that the public key above is saved in JumpServer "
+        "(个人设置 → SSH 公钥) for this login.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_ssh_key(args: argparse.Namespace) -> int:
+    """Generate a bastion-only key, print it for registration, optionally verify it.
+
+    Registering the *public* half is a web step (个人设置 → SSH 公钥): this deployment
+    exposes no REST endpoint for it, and the key is generated locally and never sent
+    anywhere. `--verify` then proves key-only auth end to end, which is what makes it
+    safe to remove `ssh_password` from the config afterwards — that removal is the point
+    of the exercise, since a password passed via `sshpass` is a secret the data plane
+    has to hold in memory and (in a plain config) on disk.
+    """
+    key = Path(os.path.expanduser(args.key or _DEFAULT_KEY))
+    if args.verify:
+        if not key.exists():
+            print(f"error: no key at {key}; run `jms-bridge ssh-key` first", file=sys.stderr)
+            return 2
+        return asyncio.run(_verify_ssh_key(key, args.targets or ["all"]))
+
+    pub = Path(str(key) + ".pub")
+    if pub.exists():
+        print(f"reusing the existing key {key}")
+    else:
+        if shutil.which("ssh-keygen") is None:
+            print(
+                "error: `ssh-keygen` is not installed (apt/brew install openssh)",
+                file=sys.stderr,
+            )
+            return 1
+        key.parent.mkdir(parents=True, exist_ok=True)
+        # No passphrase: the MCP server is a non-interactive stdio process, so an
+        # agent-answerable prompt does not exist — a passphrase-protected key would have
+        # to be unlocked in a running ssh-agent before every session, or the data plane
+        # fails with an unreadable prompt. The key is scoped to the bastion and lives in
+        # a 0600 file; that is the tradeoff being made, deliberately.
+        proc = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "jms-agent-bridge",
+             "-f", str(key)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            print(f"error: ssh-keygen failed: {proc.stderr.strip()}", file=sys.stderr)
+            return 1
+        os.chmod(key, 0o600)
+        print(f"generated {key}")
+
+    print(
+        f"\nRegister the public key with JumpServer — 个人设置 → SSH 公钥 (Profile →\n"
+        f"SSH public key), for the login this bridge uses. Paste this line:\n\n"
+        f"  {pub.read_text().strip()}\n\n"
+        f"Then prove it works before removing the password:\n\n"
+        f"  jms-bridge ssh-key --verify\n"
+        f"  jms-bridge ssh-key --verify some-group-or-host   # a smaller, faster set\n"
+    )
     return 0
 
 
@@ -376,6 +486,19 @@ def main(argv: list[str] | None = None) -> int:
         "--forget", action="store_true", help="delete the saved password and exit"
     )
     p_login.set_defaults(func=lambda a: asyncio.run(cmd_login(a)))
+
+    p_key = sub.add_parser(
+        "ssh-key",
+        help="generate a bastion-only SSH key, print it for registration, and verify it",
+    )
+    p_key.add_argument("--key", help=f"private key path (default: {_DEFAULT_KEY})")
+    p_key.add_argument(
+        "--verify",
+        action="store_true",
+        help="prove the registered key alone authenticates, with the password disabled",
+    )
+    p_key.add_argument("targets", nargs="*", help="hosts/groups/tags to verify against")
+    p_key.set_defaults(func=cmd_ssh_key)
 
     p_doc = sub.add_parser("doctor", help="check tooling, config, API and SSH end to end")
     p_doc.add_argument("targets", nargs="*", default=["all"])
