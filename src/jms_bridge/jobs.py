@@ -1,9 +1,9 @@
-"""Remote job lifecycle: submit / status / logs / cancel.
+"""Remote job lifecycle: submit / status / logs / cancel / bounded wait.
 
-The whole point of this module: an MCP tool call **must never block** on a long
-command. A Torch-FL run lasts hours, and the gateway on these hosts buffers
-non-streaming responses for ~200s, so any synchronous "run the training" tool
-would time out and leave the agent blind.
+The whole point of this module: a tool call that *starts* work **never blocks** on
+it. A Torch-FL run lasts hours, and the gateway on these hosts buffers
+non-streaming responses for ~200s, so any synchronous "run the training" tool would
+time out and leave the agent blind.
 
 Instead every long action becomes a *job*:
 
@@ -14,6 +14,15 @@ Instead every long action becomes a *job*:
 
 ``status``/``logs`` are cheap reads the agent can poll. ``logs`` takes a byte
 offset so polling only returns new output.
+
+``jms_job_wait`` is the one deliberate exception, and it is *bounded*: it blocks
+only up to its timeout (default well under the gateway's response buffer) and then
+returns whatever it has, so the transport is never the thing that cuts the call
+off. A timeout stops **watching**, never the job — nothing is cancelled, and the
+caller can wait again. Note that one stdio session cannot issue a second call while
+a call is in flight, so the escape hatch (cancel, then re-wait) is available only
+*after* the bounded wait has returned; a job that needs longer than the timeout is
+better polled with ``jms_job_status``.
 """
 
 from __future__ import annotations
@@ -31,6 +40,13 @@ JOB_DIR = ".jms-bridge/jobs"
 
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _STATE_FILES = ("status", "exit_code", "pid")
+
+#: ``status`` values that mean a job has stopped for good and will not change again
+#: without a relaunch. ``unknown`` is deliberately absent: right after a launch the
+#: runner has not written ``status`` yet, so treating it as terminal would report a
+#: healthy job as finished. ``missing`` *is* terminal — the job directory does not
+#: exist and never will, so waiting on it can only ever time out.
+TERMINAL_STATUS = frozenset({"done", "failed", "missing"})
 
 
 def _new_job_id() -> str:
@@ -246,14 +262,21 @@ class JobManager:
         the host list order defines rank order. All ranks launch concurrently and the
         call returns as soon as every launch is acknowledged — the job itself keeps
         running detached.
+
+        Every rank shares **one** job id. The ranks live on different hosts, so the id
+        cannot collide, and a collective that answers to a single id is what makes the
+        lifecycle tools work across it: ``jms_job_status`` / ``jms_job_wait`` /
+        ``jms_job_logs`` take the target list and that one id, and
+        ``jms_cluster_cancel`` can stop every rank without the caller pairing ids to
+        hosts first.
         """
         handles: list[JobHandle] = []
         results: list[ExecResult] = []
         rank = 0
         pending = []
+        job_id = _new_job_id()
+        session = f"jms-{job_id}"
         for host, nproc in assignments:
-            job_id = _new_job_id()
-            session = f"jms-{job_id}"
             root = _job_root(host, job_id)
 
             # Rank/world wiring, exported before the command; the launcher reads these.
@@ -386,10 +409,65 @@ class JobManager:
             if line.strip()
         ]
 
+    async def wait(
+        self,
+        pairs: list[tuple[Host, str]],
+        *,
+        timeout: float = 150.0,
+        interval: float = 2.0,
+    ) -> tuple[list[dict], bool]:
+        """Poll ``[(host, job_id), ...]`` until every job is terminal or ``timeout`` elapses.
+
+        Returns the last status of each job and whether they had all finished. A timeout
+        only stops *watching* — nothing is cancelled, so a slow job is still running when
+        the caller is told it timed out. The default timeout sits below the gateway's
+        ~200s non-streaming response buffer, so the tool call returns on its own rather
+        than being cut off by the transport.
+        """
+        latest: list[dict] = []
+
+        async def all_terminal() -> bool:
+            nonlocal latest
+            latest = await self.status_many(pairs)
+            return all(s.get("status") in TERMINAL_STATUS for s in latest)
+
+        done = await wait_for(all_terminal, timeout=timeout, interval=max(0.1, interval))
+        return latest, done
+
+    async def cancel_many(self, pairs: list[tuple[Host, str]]) -> list[dict]:
+        """Cancel ``[(host, job_id), ...]`` in parallel.
+
+        Each host is isolated: a cancel that raises on one host becomes that host's
+        error entry instead of discarding the ranks that were stopped successfully —
+        the same reason ``_launch`` guards a ranked launch.
+        """
+
+        async def one(host: Host, job_id: str) -> dict:
+            try:
+                return await self.cancel(host, job_id)
+            except Exception as exc:  # noqa: BLE001 - isolating one rank is the whole point
+                return {
+                    "host": host.name,
+                    "job_id": job_id,
+                    "killed": False,
+                    "ok": False,
+                    "error": str(exc),
+                }
+
+        return list(await asyncio.gather(*(one(h, j) for h, j in pairs)))
+
+
+def validate_job_id(job_id: str) -> str | None:
+    """Return why ``job_id`` is malformed, or ``None`` when it is valid."""
+    if _JOB_ID_RE.match(job_id):
+        return None
+    return f"invalid job id {job_id!r} (expected 8 hex chars)"
+
 
 def _validate_job_id(job_id: str) -> None:
-    if not _JOB_ID_RE.match(job_id):
-        raise ValueError(f"invalid job id {job_id!r} (expected 8 hex chars)")
+    error = validate_job_id(job_id)
+    if error:
+        raise ValueError(error)
 
 
 async def wait_for(predicate, timeout: float, interval: float = 2.0):  # noqa: ANN001 - small helper

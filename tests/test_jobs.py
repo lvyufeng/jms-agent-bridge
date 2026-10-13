@@ -3,7 +3,12 @@ import asyncio
 import pytest
 
 from jms_bridge.inventory import Host
-from jms_bridge.jobs import JobManager, _validate_job_id, build_runner_script
+from jms_bridge.jobs import (
+    JobManager,
+    _validate_job_id,
+    build_runner_script,
+    validate_job_id,
+)
 from jms_bridge.ssh import ExecResult
 
 
@@ -198,3 +203,108 @@ def test_job_logs_missing_file_advances_nowhere():
     assert out["log"] == ""
     assert out["size"] == 0
     assert out["next_offset"] == 0
+
+
+# --- shared collab job id -----------------------------------------------------------
+
+
+def test_collab_hands_every_rank_one_shared_job_id():
+    """A collective answers to a single id, which is what the lifecycle tools take.
+
+    The ranks live on different hosts, so one id cannot collide, and it is the only
+    thing that lets `jms_cluster_cancel` stop every rank without the caller pairing
+    per-rank ids to hosts first.
+    """
+    runner = _CollabRunner()
+    hosts = [Host(name=n, login="u", asset_id="A") for n in ("a", "b")]
+    handles, _ = asyncio.run(
+        JobManager(runner).submit_collab(
+            [(h, 2) for h in hosts],
+            "torchrun train.py",
+            master_addr="10.0.0.1",
+            port=29400,
+            world_size=4,
+        )
+    )
+    assert len({h.job_id for h in handles}) == 1
+    assert len({h.session for h in handles}) == 1
+    assert [h.host for h in handles] == ["a", "b"]
+
+
+# --- bounded wait / parallel cancel -------------------------------------------------
+
+
+class _StatusRunner:
+    """Answers status polls from a per-host script of statuses (the last one repeats)."""
+
+    def __init__(self, script):
+        self.script = {host: list(seq) for host, seq in script.items()}
+        self.commands = []
+
+    async def exec_on(self, host, command, *, timeout=60, workdir=False):
+        self.commands.append((host.name, command))
+        if "kill-session" in command:
+            return ExecResult(host.name, 0, "killed=yes", "")
+        seq = self.script.setdefault(host.name, ["unknown"])
+        status = seq.pop(0) if len(seq) > 1 else seq[0]
+        return ExecResult(
+            host.name, 0, f"status={status}\nexit_code=\npid=1\nlog_bytes=0\nalive=yes\n", ""
+        )
+
+
+def _pair(name="a"):
+    return Host(name=name, login="u", asset_id="A")
+
+
+def test_wait_returns_as_soon_as_every_job_is_terminal():
+    # `running` first, so the loop must actually poll more than once before it agrees.
+    runner = _StatusRunner({"a": ["running", "done"], "b": ["running", "failed"]})
+    latest, finished = asyncio.run(
+        JobManager(runner).wait([(_pair("a"), "abcd1234"), (_pair("b"), "abcd1234")],
+                                timeout=5, interval=0.01)
+    )
+    assert finished is True
+    assert [s["status"] for s in latest] == ["done", "failed"]
+
+
+def test_wait_treats_missing_as_terminal():
+    # A job directory that does not exist never will, so waiting on it can only time out.
+    runner = _StatusRunner({"a": ["missing"]})
+    _, finished = asyncio.run(
+        JobManager(runner).wait([(_pair("a"), "abcd1234")], timeout=5, interval=0.01)
+    )
+    assert finished is True
+
+
+def test_wait_times_out_without_cancelling_anything():
+    # A timeout stops *watching*, not the job: the caller may want to wait again, and an
+    # unexpected kill here would be the worst possible surprise.
+    runner = _StatusRunner({"a": ["running"]})
+    latest, finished = asyncio.run(
+        JobManager(runner).wait([(_pair("a"), "abcd1234")], timeout=0.05, interval=0.01)
+    )
+    assert finished is False
+    assert latest[0]["status"] == "running"
+    assert all("kill-session" not in cmd for _, cmd in runner.commands)
+
+
+def test_cancel_many_isolates_a_host_that_raises():
+    class _Boom(_StatusRunner):
+        async def exec_on(self, host, command, *, timeout=60, workdir=False):
+            if host.name == "b":
+                raise RuntimeError("ssh died")
+            return await super().exec_on(host, command, timeout=timeout, workdir=workdir)
+
+    runner = _Boom({"a": ["running"], "b": ["running"]})
+    results = asyncio.run(
+        JobManager(runner).cancel_many([(_pair("a"), "abcd1234"), (_pair("b"), "abcd1234")])
+    )
+    assert results[0]["ok"] is True and results[0]["killed"] is True
+    assert results[1]["ok"] is False and "ssh died" in results[1]["error"]
+
+
+def test_validate_job_id_reports_instead_of_raising():
+    # The server tools validate an id the caller typed; a raise would become an opaque
+    # tool error, so the public helper answers with a reason instead.
+    assert validate_job_id("deadbeef") is None
+    assert "invalid job id" in validate_job_id("nope")

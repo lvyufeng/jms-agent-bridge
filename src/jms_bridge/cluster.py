@@ -30,6 +30,9 @@ class HostHealth:
     port: int
     port_free: bool | None
     detail: str = ""
+    #: How many accelerators currently hold a compute process, or ``None`` when that is
+    #: unknown (no occupancy probe for this platform, or an unparseable reply).
+    busy_devices: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -41,49 +44,107 @@ class HostHealth:
             "port": self.port,
             "port_free": self.port_free,
             "detail": self.detail,
+            "busy_devices": self.busy_devices,
+            "busy": self.busy,
         }
 
     @property
     def ok(self) -> bool:
+        """Hard gate for a launch: reachable, and the rendezvous port is not taken.
+
+        Deliberately does *not* include :attr:`busy`. Occupancy is advisory — a host
+        whose cards are busy may be running the very job being resumed, and refusing
+        to rank it would make a legitimate relaunch impossible. ``busy`` is reported
+        so the caller can decide, and ``jms_cluster_submit`` takes an explicit
+        ``allow_busy`` override.
+        """
         return self.reachable and self.port_free is not False
+
+    @property
+    def busy(self) -> bool:
+        """True only on a *positive* occupancy count — unknown (``None``) is not busy."""
+        return bool(self.busy_devices)
+
+
+#: Section markers in the preflight reply, in wire order.
+_MARKERS = ("PROBE", "OCCUPANCY", "PORT", "END")
 
 
 def _preflight_command(platform: Platform, port: int) -> str:
-    """Probe the accelerator and check whether `port` is already bound on localhost."""
-    return "\n".join(
-        [
-            'echo "===PROBE==="',
-            f"{{ {platform.probe_cmd}; }} 2>&1 || echo __PROBE_FAILED__",
-            'echo "===PORT==="',
-            f"if (exec 3<>/dev/tcp/127.0.0.1/{int(port)}) 2>/dev/null; then "
-            f"echo PORT_BUSY; else echo PORT_FREE; fi",
-            'echo "===END==="',
+    """Probe the accelerator, sample device occupancy, and check the rendezvous port.
+
+    The occupancy probe is chained between the identity probe and the port test so one
+    round trip covers all three; it is fenced with ``|| echo`` like the identity probe
+    so a host whose driver tools are missing still reports a (failed) section rather
+    than aborting the whole script. Platforms with no occupancy probe skip the section
+    entirely, and the parser then reports occupancy as unknown.
+    """
+    lines = [
+        'echo "===PROBE==="',
+        f"{{ {platform.probe_cmd}; }} 2>&1 || echo __PROBE_FAILED__",
+    ]
+    if platform.occupancy_cmd:
+        lines += [
+            'echo "===OCCUPANCY==="',
+            f"{{ {platform.occupancy_cmd}; }} 2>&1 || echo __OCCUPANCY_FAILED__",
         ]
-    )
+    lines += [
+        'echo "===PORT==="',
+        f"if (exec 3<>/dev/tcp/127.0.0.1/{int(port)}) 2>/dev/null; then "
+        f"echo PORT_BUSY; else echo PORT_FREE; fi",
+        'echo "===END==="',
+    ]
+    return "\n".join(lines)
+
+
+def _sections(stdout: str) -> dict[str, str]:
+    """Split a marker-delimited preflight reply into ``{NAME: body}``.
+
+    A section that never arrived (an older host mid-upgrade, a truncated reply) maps to
+    ``""``, which the caller reads as "unknown" — never as a healthy value.
+    """
+    out: dict[str, str] = {}
+    for i, name in enumerate(_MARKERS):
+        head = f"==={name}==="
+        body = stdout.split(head, 1)[1] if head in stdout else ""
+        for tail in _MARKERS[i + 1 :]:
+            marker = f"==={tail}==="
+            if marker in body:
+                body = body.split(marker, 1)[0]
+                break
+        out[name] = body
+    return out
 
 
 def _parse_preflight(host: Host, platform: Platform, port: int, stdout: str) -> HostHealth:
-    probe = ""
+    sections = _sections(stdout)
+    probe = sections["PROBE"]
+    after = sections["PORT"]
     port_state = None
-    if "===PROBE===" in stdout and "===PORT===" in stdout:
-        probe = stdout.split("===PROBE===", 1)[1].split("===PORT===", 1)[0]
-        after = stdout.split("===PORT===", 1)[1]
-        if "PORT_BUSY" in after:
-            port_state = False
-        elif "PORT_FREE" in after:
-            port_state = True
+    if "PORT_BUSY" in after:
+        port_state = False
+    elif "PORT_FREE" in after:
+        port_state = True
 
     probe_failed = "__PROBE_FAILED__" in probe
     parsed = platform.parse_probe(probe) if (probe.strip() and not probe_failed) else {}
+    device_count = parsed.get("device_count")
+
+    occupancy = sections["OCCUPANCY"]
+    busy_devices = None
+    if occupancy.strip() and "__OCCUPANCY_FAILED__" not in occupancy:
+        busy_devices = platform.parse_occupancy(occupancy, device_count=device_count)
+
     return HostHealth(
         host=host.name,
         platform=platform.name,
         reachable=True,
-        device_count=parsed.get("device_count"),
+        device_count=device_count,
         version=parsed.get("version"),
         port=port,
         port_free=port_state,
         detail="accelerator probe failed" if probe_failed else "",
+        busy_devices=busy_devices,
     )
 
 

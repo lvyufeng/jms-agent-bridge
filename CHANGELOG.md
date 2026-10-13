@@ -18,6 +18,22 @@
   `jms_cluster_submit`: one job with a shared rendezvous and per-rank
   `JMS_RANK`/`JMS_NPROC`/`JMS_WORLD_SIZE`/`JMS_MASTER_ADDR`/`JMS_MASTER_PORT`, plus
   backend-homogeneous **islands** (HCCL/NCCL/gloo) for heterogeneous clusters.
+- **Job lifecycle, without hand-rolling a poll loop (3 tools).** `jms_job_wait` blocks
+  for a *bounded* timeout (default 150s, deliberately under the gateway's ~200s response
+  buffer) until every job is terminal, then returns whether they had finished — a
+  timeout stops *watching*, never the job. `jms_job_list` lists every job the bridge has
+  launched on a host, and `jms_cluster_cancel` stops **every rank** of one coordinated
+  launch from that launch's single job id.
+- **Artifact collection (1 tool).** `jms_pull_artifacts` pulls one remote path from many
+  hosts into a local directory, giving each host its **own** subdirectory so same-named
+  checkpoints from different chips cannot overwrite each other; a host name is sanitised
+  into a safe segment and a remote path that would escape the workdir is rejected.
+- **Device-occupancy detection in preflight.** `jms_cluster_preflight` now asks each
+  accelerator what already holds a compute process (`npu-smi info -t proc-mem`,
+  `nvidia-smi --query-compute-apps`), so two trainings can no longer land on the same
+  cards undetected. The count is advisory — only a *positive* parse raises the flag, and
+  `jms_cluster_submit` refuses occupied hosts unless `allow_busy=true` (the usual honest
+  reason a card is busy is your own previous run).
 - **Control-plane bootstrap** — `jms-bridge login` exchanges username/password for a
   session token and caches it in the config (mode 600), so the server never handles a
   password; `jms_inventory_reload` now drops the cached config and credentials too, so a
@@ -38,6 +54,15 @@
 
 ### Changed
 
+- **All ranks of one coordinated launch now share a single job id.** Ranks live on
+  different hosts so one id cannot collide, and it is what lets `jms_job_status` /
+  `jms_job_wait` / `jms_job_logs` / `jms_cluster_cancel` take that one id instead of a
+  rank-to-host pairing the caller had to reconstruct.
+- **A zero device-occupancy count is no longer trusted on its own.** A non-empty reply
+  with no recognizable device row is equally what a drifted vendor format or a stray
+  warning looks like, so it now degrades to *unknown* rather than "the cards are free".
+  Ascend licenses its zero with the `proc-mem` table header; CUDA answers nothing when
+  free, so it needs no license and any non-empty no-UUID reply is a warning.
 - **The default UT command is scoped to `tests/unit`** (was a bare `tests/`). That is
   the target repo's agnostic suite; a bare `tests/` also collects `tests/manual/**` and
   `tests/perf/**`, which are hardware-bound dev scripts — some parse `sys.argv` at
@@ -50,6 +75,15 @@
 
 ### Fixed
 
+- **`jms_cluster_cancel` on an empty selection reported success.** `resolve([])` returns
+  `[]` without raising and `all()` over nothing is `True`, so a cancel that reached no
+  host read as a green result. It now reports `ok: false` with "no hosts matched the
+  selection; nothing was cancelled", the same guard the other fan-out tools carry.
+- **`jms_cluster_preflight` under-reported `world_size_estimate`.** A reachable host
+  whose probe reported no device count was counted as **0** processes while
+  `jms_cluster_submit` gives it `nproc=1`, so the preflight predicted a narrower
+  collective than the launch would actually form. Both now apply the same
+  `max(1, device_count or 1)`, and a test pins the two together.
 - **`jms_cluster_submit` assigned ranks to hosts that could never join.** An unreachable
   host reports no device count and the tool still gave it `nproc=1`, so every launched
   rank was told a `JMS_WORLD_SIZE` larger than the set that could actually rendezvous —
