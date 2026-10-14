@@ -1,0 +1,116 @@
+name: Release
+
+# A release is a tag, and the tag is the only thing that has to be right: the version
+# guard below fails the run unless `vX.Y.Z` agrees with both places the version lives,
+# so a mistagged commit cannot reach PyPI. See CONTRIBUTING.md for the tag-a-release
+# sequence.
+on:
+  push:
+    tags: ["v*"]
+  # Dry run: build and validate without publishing, so the packaging can be checked
+  # (or a broken one discovered) before a version number is spent on it.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and check the distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag, pyproject.toml and __version__ agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python - <<'PY'
+          import os, pathlib, re, sys, tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = tag.removeprefix("v")
+          declared = {
+              "pyproject.toml": tomllib.loads(
+                  pathlib.Path("pyproject.toml").read_text()
+              )["project"]["version"],
+              "src/jms_bridge/__init__.py": re.search(
+                  r'^__version__ = "([^"]+)"',
+                  pathlib.Path("src/jms_bridge/__init__.py").read_text(),
+                  re.MULTILINE,
+              ).group(1),
+          }
+          wrong = {where: got for where, got in declared.items() if got != expected}
+          for where, got in wrong.items():
+              print(f"::error file={where}::{where} says {got}, tag {tag} says {expected}")
+          if wrong:
+              sys.exit(f"tag/version mismatch: {tag} does not match {sorted(wrong)}")
+          print(f"{tag} matches {expected} in both pyproject.toml and __init__.py")
+          PY
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      # Catches a README that PyPI would reject, malformed metadata, an unrenderable
+      # description — before the upload, where the failure is not retractable.
+      - name: Check the metadata
+        run: twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # The environment is the publish gate: add required reviewers to it and the upload
+    # waits for a human. It is also the (owner, repo, workflow, environment) tuple a
+    # PyPI *trusted publisher* is registered against — no API token in the repo.
+    environment: pypi
+    permissions:
+      id-token: write # OIDC for trusted publishing; the only credential needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # No `password:` input on purpose — passing one is what *disables* the secretless
+      # path, so leaving it out is what selects trusted publishing. To use an API token
+      # instead, add `password: ${{ secrets.PYPI_API_TOKEN }}` (and set the secret).
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Cut the GitHub release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # --notes-from-tag takes the body of the annotated tag, so the release notes are
+      # written once, where the version is decided, and cannot drift from the tag.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --notes-from-tag \
+            dist/*
