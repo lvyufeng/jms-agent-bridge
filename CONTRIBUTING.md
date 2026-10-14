@@ -57,3 +57,41 @@ touches `~/.config/jms-bridge`; `$HOME` is left alone because ssh still needs th
 speaks the MCP wire protocol (there is no CLI subcommand for the `jms_*` tools), and
 `verify_support.py` turns the `jms_list_assets` result into a `hosts.yaml` (`mkhosts`) and appends
 a discovered `workspaces:` block to it (`discover`).
+
+## Releasing
+
+The version lives in **two** places and the changelog in a third; a release commit moves all
+three together:
+
+```bash
+git switch -c release/0.2.2 origin/main
+# edit CHANGELOG.md:  ## Unreleased → ## 0.2.2 — 2026-10-14
+# bump both:          pyproject.toml [project] version, src/jms_bridge/__init__.py __version__
+git commit -am "chore: release 0.2.2"
+```
+
+Merge that through the normal PR flow, then tag `main` and push the tag:
+
+```bash
+git switch main && git pull
+git tag -a v0.2.2 -m "..."   # the tag body becomes the GitHub release notes
+git push origin v0.2.2
+```
+
+`.github/workflows/release.yml` does the rest: it re-checks that `vX.Y.Z` agrees with
+`pyproject.toml` and `__version__`, builds the sdist and wheel, runs `twine check`, publishes to
+PyPI, and cuts the GitHub release with the artifacts attached. A mistyped tag therefore fails the
+build job rather than uploading a wrong version.
+
+Two things the workflow needs that are **repository settings, not files**:
+
+- A `pypi` GitHub environment, which is the publish gate — add required reviewers to it if the
+  upload should wait for a human.
+- A PyPI [trusted publisher](https://docs.pypi.org/trusted-publishers/) registered for this repo,
+  workflow `release.yml`, environment `pypi`. That is the credential: the publish job carries no
+  token. To use an API token instead, set a `PYPI_API_TOKEN` secret and add
+  `password: ${{ secrets.PYPI_API_TOKEN }}` to the publish step — but note that an explicit
+  password *disables* the trusted-publishing path rather than falling back to it, so pick one.
+
+`workflow_dispatch` runs the build and the checks without publishing, which is the way to find a
+broken packaging manifest before spending a version number on it.
