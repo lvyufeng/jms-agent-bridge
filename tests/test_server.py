@@ -1,6 +1,7 @@
 import asyncio
 
 import jms_bridge.server as S
+from jms_bridge import __version__
 from jms_bridge.inventory import Host, Inventory
 from jms_bridge.jobs import TERMINAL_STATUS, JobHandle
 from jms_bridge.server import _looks_dangerous
@@ -55,12 +56,18 @@ def test_mcp_server_lists_all_tools():
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                info = await session.initialize()
                 tools = await session.list_tools()
-                return {t.name for t in tools.tools}
+                return info, {t.name for t in tools.tools}
 
-    names = asyncio.run(run())
+    info, names = asyncio.run(run())
     assert expected <= names, f"missing tools: {expected - names}"
+
+    # The client displays this and a bug report quotes it, so it must be the real
+    # version — the SDK's default is an empty string, which is what a bare
+    # `MCPServer(name)` hands back.
+    assert info.server_info.name == "jms-agent-bridge"
+    assert info.server_info.version == __version__, "serverInfo.version must be the package's"
 
 
 # --- jms_dev_run unit coverage (fakes; no SSH, no hardware) -------------------------

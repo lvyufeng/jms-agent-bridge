@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2 — 2026-10-14
+
+### Fixed
+
+- **Every MCP client was told the server had no version.** The server was built as
+  `MCPServer("jms-agent-bridge")`, and the SDK defaults `version` to the empty string —
+  so the version an agent shows for this server (and that a bug report would quote back)
+  was blank, while the real one sat unused in `jms_bridge.__version__`. It is now passed
+  through, and a test asserts the handshake reports it, so the two cannot drift apart
+  unnoticed. Nothing else about the tool surface changes: every launch path imports the
+  same server object, so this was the only construction site.
+
 ## 0.2.1 — 2026-10-14
 
 ### Fixed

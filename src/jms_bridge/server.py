@@ -26,6 +26,7 @@ from typing import Any, TypeVar
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from . import __version__
 from .api import JumpServerAPI, JumpServerError
 from .cluster import (
     DEFAULT_RDZV_PORT,
@@ -43,7 +44,9 @@ from .workspace import CONTAINER_RE, DEFAULT_CONTAINER, SOURCES
 
 log = logging.getLogger("jms_bridge.server")
 
-server = MCPServer("jms-agent-bridge")
+# The version is what a client shows in `/mcp` and what a bug report quotes back, so it
+# has to be the installed package's, not the SDK default (an empty string).
+server = MCPServer("jms-agent-bridge", version=__version__)
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
