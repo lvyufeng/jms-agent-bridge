@@ -95,3 +95,9 @@ Two things the workflow needs that are **repository settings, not files**:
 
 `workflow_dispatch` runs the build and the checks without publishing, which is the way to find a
 broken packaging manifest before spending a version number on it.
+
+`v0.2.0` and `v0.2.1` predate this workflow, and a tag only triggers it on the push that creates
+it — so those two exist as tags but were never published and have no GitHub release. Once the
+trusted publisher above is registered, re-point each one at the commit it already names and push
+it again to run the workflow (`git push --force origin v0.2.1`) — or publish that version by hand.
+Until then the tags are only markers, as before.
