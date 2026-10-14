@@ -1,60 +1,60 @@
 # jms-agent-bridge
 
-**An MCP bridge that lets Claude Code drive a heterogeneous GPU/NPU cluster through a
-[JumpServer](https://github.com/jumpserver/jumpserver) bastion — without breaking the
-audit chain.**
+**An MCP bridge that lets Claude Code and Codex drive a heterogeneous GPU/NPU cluster through a
+[JumpServer](https://github.com/jumpserver/jumpserver) bastion — without breaking the audit
+chain.**
 
-Point it at your bastion, describe your hosts once, and a single Claude Code session can
-probe the cluster, push experiment code, launch a Torch-FL run across Ascend and CUDA
-nodes in parallel, watch it, and pull results back. Every byte still goes through
-JumpServer's audited SSH gateway.
+Point it at your bastion, describe your hosts once, and a single agent session can probe the
+cluster, push experiment code, launch a Torch-FL run across Ascend and CUDA nodes in parallel,
+watch it, and pull results back. Every byte still goes through JumpServer's audited SSH gateway.
 
 ```
-Claude Code ──stdio MCP──▶ jms-agent-bridge (local)
-                              ├─ control plane: JumpServer REST API  (discovery · audit · tickets)
-                              └─ data plane:    ssh/rsync via KoKo   (commands · sync · jobs)
+Claude Code / Codex ──stdio MCP──▶ jms-agent-bridge (local)
+                                     ├─ control plane: JumpServer REST API  (discovery · audit · tickets)
+                                     └─ data plane:    ssh/rsync via KoKo   (commands · sync · jobs)
 ```
 
-## Why this exists
+The bridge runs on **your** machine and is launched by your agent: nothing is installed on the
+bastion, and your credentials stay in your own key agent and config file.
 
-JumpServer's own MCP server is an auto-generated OpenAPI wrapper: no SSH data plane, no
-job model, no multi-host fan-out. Community MCP servers for it are 0–1 star single-author
-projects with no accelerator awareness. Meanwhile the bastion's own AI is hard-wired to a
-different agent runtime.
+## Requirements
 
-`jms-agent-bridge` takes the two halves that actually work — **REST for the control
-plane, SSH for the data plane** — and adds the three things a real cluster workflow
-needs:
-
-- **Heterogeneous hosts behind one address.** `hosts.yaml` maps a friendly name to a
-  JumpServer asset plus a *platform profile* — `ascend-910c` / `cuda` / `aarch64` for the
-  mainstream boards, plus probe profiles for the domestic accelerators (`hygon-dcu`,
-  `metax`, `enflame`, `kunlunxin`, `thead`, `iluvatar`, `moore-threads`, `tsingmicro`) —
-  so `npu-smi` vs `nvidia-smi` vs `mx-smi` vs `uname` is the tool's problem, not the
-  agent's.
-- **Non-blocking jobs.** A training run takes hours; the gateway buffers responses for
-  ~200s. Every long action is launched detached in `tmux` and polled, so no tool call
-  that *starts* work ever blocks. `jms_job_wait` is the one deliberate exception, and it
-  is bounded well under that buffer — it stops *watching* on timeout, never the job.
-- **Parallel fan-out with audited identity.** Commands run against many hosts at once,
-  each under the per-asset login string, so JumpServer attributes every one.
+- **Python 3.10+**
+- **`ssh` and `rsync` on `PATH`** — the bridge shells out to them and inherits your key agent.
+- **`sshpass`** — only if you authenticate to the gateway with a *password* rather than a key.
+  Most distros package it; `jms-bridge doctor` reports whether it is missing.
 
 ## Install
 
 ```bash
-git clone https://github.com/lvyufeng/jms-agent-bridge.git && cd jms-agent-bridge
-python3 -m venv .venv && . .venv/bin/activate   # a venv, not optional: Homebrew/Debian
-                                                # Pythons refuse a bare `pip install`
-pip install -e .                                # or: pipx install .
-pip install -e ".[keyring]"                     # optional: keep a saved password in the
-                                                # OS keyring; with pipx use
-                                                # `pipx install ".[keyring]"`
+git clone https://github.com/lvyufeng/jms-agent-bridge.git
+cd jms-agent-bridge
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
 ```
 
-Requires Python 3.10+ and `ssh` + `rsync` on PATH (the bridge shells out to them and
-inherits your key agent). Authenticating to the gateway with a *password* rather than a
-key additionally needs `sshpass` — most distros have it in their package manager, and
-`jms-bridge doctor` tells you if it is missing.
+`jms-bridge` is now the console script at `<repo>/.venv/bin/jms-bridge`. Note that absolute
+path — the agent registration in
+[Register the MCP server with your agent](#register-the-mcp-server-with-your-agent) needs it,
+because the agent launches the server without your activated shell.
+
+If you would rather have `jms-bridge` on `PATH` (then a bare `jms-bridge` works everywhere,
+including in the registration below), install it globally instead:
+
+```bash
+pipx install .
+```
+
+Optional — keep a saved JumpServer password in the OS keyring rather than a mode-600 file:
+
+```bash
+pip install -e ".[keyring]"        # or: pipx install ".[keyring]"
+```
+
+That installs the **CLI**. The MCP server itself is the same binary's `serve` subcommand, which
+your agent launches for you — so the setup is: configure it (below), authenticate, then
+[register the MCP server with your agent](#register-the-mcp-server-with-your-agent).
 
 ## Configure
 
@@ -64,15 +64,15 @@ $EDITOR ~/.config/jms-bridge/config.toml
 $EDITOR ~/.config/jms-bridge/hosts.yaml
 ```
 
-Both live under `~/.config/jms-bridge/` and both can be relocated — `JMS_BRIDGE_CONFIG`,
-`JMS_BRIDGE_INVENTORY`, and (for the saved password) `JMS_BRIDGE_CREDENTIALS` each take
-an explicit path, which is what the error messages point at when they cannot find one.
+Both files live under `~/.config/jms-bridge/` and both can be relocated — `JMS_BRIDGE_CONFIG`,
+`JMS_BRIDGE_INVENTORY`, and (for the saved password) `JMS_BRIDGE_CREDENTIALS` each take an
+explicit path, which is what the error messages point at when they cannot find one.
 
-`examples/` holds the same two files with every field exercised — `examples/hosts.yaml`
-in particular documents the `workspaces:` block that `jms-bridge init` only sketches,
-and it is the one to copy if you want the development loop, not just command execution.
+`examples/` holds the same two files with every field exercised — `examples/hosts.yaml` in
+particular documents the `workspaces:` block that `jms-bridge init` only sketches, and it is the
+one to copy if you want the development loop, not just command execution.
 
-`config.toml` — the bastion and its control-plane credentials:
+### `config.toml` — the bastion and its control-plane credentials
 
 ```toml
 [bastion]
@@ -86,11 +86,11 @@ max_parallel = 8                # parallel fan-out cap for the whole fleet
 # or JMS_BRIDGE_PRIVATE_TOKEN.
 ```
 
-`max_parallel` (or `JMS_BRIDGE_MAX_PARALLEL`) bounds how many hosts the data plane talks to
-at once. The default of 8 keeps a wide selector from fork-bombing the local machine or
-tripping the bastion's per-account connection limit; raise it for a large, healthy fleet.
+`max_parallel` (or `JMS_BRIDGE_MAX_PARALLEL`) bounds how many hosts the data plane talks to at
+once. The default of 8 keeps a wide selector from fork-bombing the local machine or tripping the
+bastion's per-account connection limit; raise it for a large, healthy fleet.
 
-`hosts.yaml` — your cluster:
+### `hosts.yaml` — your cluster
 
 ```yaml
 hosts:
@@ -124,55 +124,75 @@ groups:
   cluster: [ascend-910c, node-4090-1, node-p800-1]
 ```
 
-Domestic platforms and the SMI each probes: `hygon-dcu` (海光 `hy-smi`), `metax` (沐曦
-`mx-smi`), `enflame` (燧原 `efsmi`), `kunlunxin` (昆仑芯 `xpu-smi`), `thead` (平头哥
-`ppu-smi`), `iluvatar` (天数 `ixsmi`), `moore-threads` (摩尔线程 `mthreads-gmi`),
-`tsingmicro` (清微 `tsm_smi`). Each reports its runtime version and device count *and*
-which cards already hold a compute process, so `jms_probe` / preflight show real numbers
-instead of falling back to `uname`, and the busy gate in `jms_cluster_preflight` /
-`jms_cluster_submit` applies here as it does on Ascend and CUDA.
+`platform` is what makes one tool work across chips: it picks the accelerator probe, so `npu-smi`
+vs `nvidia-smi` vs `mx-smi` vs `uname` is the bridge's problem, not the agent's. The mainstream
+profiles are `ascend-910c`, `cuda` and `aarch64`; a `generic` profile falls back to `uname` and
+reports **no** accelerator, so tag a host with its real platform whenever you can.
 
-Each profile also carries two values that are easy to confuse. `dist_backend` is what the
-vendor's torch **really** builds a process group with, taken from the measured vendor
-table in the sibling PyTorch-Plugin-FL project (`torch_fl/comm/process_group.py`) rather
-than guessed from the chip name — which is how three of them were originally wrong: it is
-NCCL, not CNCL, on Iluvatar and not BKCL on Kunlunxin, and Enflame's ECCL has no
-`ProcessGroup` at all (FlagCX is the only path to it). `collective` is the
-**interoperability key** that decides which hosts can join one `world_size` job, and it is
-vendor-qualified exactly where the backend name is not: NVIDIA, Metax, Kunlunxin, T-Head
-and Iluvatar all report `nccl`, but each ships its own `libnccl.so.2`, so only hosts
-sharing a `collective` value are grouped into an island.
+Domestic platforms and the SMI each probes: `hygon-dcu` (海光 `hy-smi`), `metax` (沐曦 `mx-smi`),
+`enflame` (燧原 `efsmi`), `kunlunxin` (昆仑芯 `xpu-smi`), `thead` (平头哥 `ppu-smi`), `iluvatar`
+(天数 `ixsmi`), `moore-threads` (摩尔线程 `mthreads-gmi`), `tsingmicro` (清微 `tsm_smi`). Each
+reports its runtime version and device count *and* which cards already hold a compute process, so
+`jms_probe` / preflight show real numbers instead of falling back to `uname`, and the busy gate in
+`jms_cluster_preflight` / `jms_cluster_submit` applies here as it does on Ascend and CUDA.
 
-The `asset_id`s are the one thing you cannot fill in yet: looking them up needs a
-logged-in session, which is the next step. So do it in this order — `config.toml` and
-the hostnames first, then authenticate, then come back for the ids:
+Each profile also carries two values that are easy to confuse. `dist_backend` is what the vendor's
+torch really builds a process group with — NCCL, not CNCL, on Iluvatar and not BKCL on Kunlunxin,
+and Enflame's ECCL has no `ProcessGroup` at all. `collective` is the **interoperability key** that
+decides which hosts can join one `world_size` job, and it is vendor-qualified exactly where the
+backend name is not: NVIDIA, Metax, Kunlunxin, T-Head and Iluvatar all report `nccl`, but each
+ships its own `libnccl.so.2`, so only hosts sharing a `collective` value are grouped into an
+island.
+
+The `asset_id`s are the one thing you cannot fill in yet: looking them up needs a logged-in
+session. So do it in this order — `config.toml` and the hostnames first, then authenticate, then
+come back for the ids:
 
 ```bash
 jms-bridge login --save-password   # prompts for your JumpServer password
 jms-bridge doctor                  # tooling → config → API → SSH, layer by layer
 ```
 
-`doctor`'s last layer pushes a command through `<login>#<account>#<asset_id>@bastion`, so
-it cannot be green while the ids are still the placeholders the template ships — expect
-the tooling, config and control-plane layers to pass and the data plane to fail. Once the
-login above has succeeded, get the ids from `jms_list_assets` inside Claude Code (after
-[registering the server](#register-with-claude-code) below), or from the JumpServer web
-UI, and fill in `asset_id` for each host. Then `jms-bridge doctor` and `jms-bridge probe
-cluster` should both be green.
+`doctor`'s last layer pushes a command through `<login>#<account>#<asset_id>@bastion`, so it
+cannot be green while the ids are still the placeholders the template ships — expect the tooling,
+config and control-plane layers to pass and the data plane to fail. Once the login above has
+succeeded, get the ids from `jms_list_assets` inside your agent session (after
+[registering the server](#register-the-mcp-server-with-your-agent)), or from the JumpServer web
+UI, and fill in `asset_id` for each host. Then `jms-bridge doctor` and `jms-bridge probe cluster`
+should both be green.
 
-`login` exchanges your username/password for a token once, so the MCP server itself
-never handles a password. `JMS_BRIDGE_PASSWORD='...' jms-bridge login` still works for
-scripted setups. `--save-password` also **stores** the password — in the OS keyring
-when the `[keyring]` extra is installed, otherwise a mode-600
-`~/.config/jms-bridge/credentials.toml` — so later logins (a new shell, a token
-expiry) need no secret; `jms-bridge login --forget` deletes it and `jms-bridge doctor`
-reports what is stored and where. If your deployment issues API keys instead, skip
+## Authenticate
+
+There are **two different secrets**, and only the first is what `login` manages:
+
+| Secret | Plane | Env var |
+| --- | --- | --- |
+| JumpServer login password → exchanged for a session token | control plane (assets, audit, tickets) | `JMS_BRIDGE_PASSWORD` |
+| The credential the KoKo gateway wants | data plane (commands, jobs, rsync, dev loop) | `JMS_BRIDGE_SSH_PASSWORD` |
+
+So `login --save-password` does **not** cover the data plane: a setup that only runs `login` will
+have `jms_list_assets` working and `jms_exec` still failing to connect.
+
+### Control plane
+
+```bash
+jms-bridge login --save-password   # prompts; exchanges username/password for a token
+```
+
+`login` exchanges your username/password for a token once, so the MCP server itself never handles
+a password. `JMS_BRIDGE_PASSWORD='...' jms-bridge login` still works for scripted setups.
+`--save-password` also **stores** the password — in the OS keyring when the `[keyring]` extra is
+installed, otherwise a mode-600 `~/.config/jms-bridge/credentials.toml` — so later logins (a new
+shell, a token expiry) need no secret; `jms-bridge login --forget` deletes it and `jms-bridge
+doctor` reports what is stored and where. If your deployment issues API keys instead, skip
 `login` and set `JMS_BRIDGE_ACCESS_KEY_ID` / `JMS_BRIDGE_ACCESS_KEY_SECRET` or
 `JMS_BRIDGE_PRIVATE_TOKEN`.
 
-The **data plane** authenticates to the KoKo SSH gateway. Register an SSH key with
-JumpServer (个人设置 → SSH 公钥) and point `ssh_key` at it — that is the recommended
-setup, and `jms-bridge ssh-key` walks you through it:
+### Data plane
+
+The **data plane** authenticates to the KoKo SSH gateway. Register an SSH key with JumpServer
+(个人设置 → SSH 公钥) and point `ssh_key` at it — that is the recommended setup, and `jms-bridge
+ssh-key` walks you through it:
 
 ```bash
 jms-bridge ssh-key                    # generate a bastion-only key (0600) + print its public half
@@ -180,74 +200,105 @@ jms-bridge ssh-key                    # generate a bastion-only key (0600) + pri
 jms-bridge ssh-key --verify cluster   # prove the key alone authenticates, then drop the password
 ```
 
-`--verify` clones the config with the password **removed**, so a green result is
-evidence about the key rather than about a fallback that happened to work — which is
-what makes the hand-off orderable: the password is deleted only once the key is proven,
-so the data plane is never left with no working credential.
+`--verify` clones the config with the password **removed**, so a green result is evidence about
+the key rather than about a fallback that happened to work — which is what makes the hand-off
+orderable: the password is deleted only once the key is proven, so the data plane is never left
+with no working credential.
 
-For a quick start before the key is registered, KoKo also accepts password
-auth; set `JMS_BRIDGE_SSH_PASSWORD` and it is used via `sshpass` (installed locally,
-never on the remote host):
+For a quick start before the key is registered, KoKo also accepts password auth; set
+`JMS_BRIDGE_SSH_PASSWORD` and it is used via `sshpass` (installed locally, never on the remote
+host):
 
 ```bash
 export JMS_BRIDGE_SSH_PASSWORD='...'
 jms-bridge doctor                  # reports sshpass under `== credentials ==` if unset
 ```
 
-These are **two different secrets**, and only the first is what `login` manages:
+## Register the MCP server with your agent
 
-| Secret | Plane | Env var |
-| --- | --- | --- |
-| JumpServer login password → exchanged for a session token | control plane (assets, audit, tickets) | `JMS_BRIDGE_PASSWORD` |
-| The credential the KoKo gateway wants | data plane (commands, jobs, rsync, dev loop) | `JMS_BRIDGE_SSH_PASSWORD` |
+`pip install` above installs the **CLI**; it does not, on its own, give your agent anything. The
+MCP server is a stdio process — `jms-bridge serve` — that the agent starts and then talks to over
+the protocol, so *"installing the MCP"* means adding **one entry** that tells the agent which
+command to launch. Two things to know before you add it:
 
-So `login --save-password` does **not** cover the data plane: a setup that only runs
-`login` will have `jms_list_assets` working and `jms_exec` still failing to connect.
+- **It is per-machine, not per-project.** The entry lives in the agent's own config, not in this
+  repo. Register once and every project on the machine can reach your cluster — and a fresh clone
+  on a second machine has to register again.
+- **Use the absolute path to the console script.** The agent launches the server without your
+  activated shell, so a bare `jms-bridge` only resolves if you installed it on `PATH` (the `pipx`
+  route above). With the venv activated, `which` prints the path to paste:
 
-### Cloning onto a second machine
+  ```bash
+  . .venv/bin/activate && which jms-bridge
+  # → /abs/path/to/jms-agent-bridge/.venv/bin/jms-bridge
+  ```
 
-Nothing secret travels in the clone. `config.toml` is a template, the saved password
-lives in the OS keyring or `credentials.toml` (both machine-local), and the session
-token `login` writes into `config.toml` is issued to *that* config file. So on a new
-machine the sequence is the same one as on the first: `jms-bridge init`, edit both
-files, copy your own `hosts.yaml` if you have one, then `jms-bridge login
---save-password` again. If you copy a `config.toml` across, delete the stale
-`session_token` line first — otherwise the bridge starts up holding a token the server
-may no longer accept.
-
-That whole first-run path is scripted, so you can prove a fresh clone works rather than
-assume it:
+### Claude Code
 
 ```bash
-JMS_BRIDGE_PASSWORD='...' scripts/verify-onboarding.sh
+claude mcp add --scope user jms-bridge -- /abs/path/to/jms-agent-bridge/.venv/bin/jms-bridge serve
 ```
 
-It runs `init` → `login` → `jms_list_assets` → build `hosts.yaml` → `doctor` (the gate)
-→ `jms_dev_discover` → one real `jms_dev_run`, and stops at the first step that does not
-work, printing that step's actual output. The config, the inventory and the credentials
-file are all pinned inside a scratch directory and the OS keyring is bypassed, so it
-never touches `~/.config/jms-bridge`; `$HOME` is left alone because ssh still needs the
-real `~/.ssh`. Exit status is 0 only when the cross-chip table comes back green.
+- `--scope user` is what makes it available from **every** directory. Leave it off and Claude Code
+  records it as a *local* entry — this project only.
+- If `jms-bridge` is on `PATH`, the shorter `claude mcp add --scope user jms-bridge -- jms-bridge
+  serve` is equivalent.
+- Gotcha: a `local` entry for the same name **shadows** the user-scope one, so if
+  `claude mcp get jms-bridge` still reports `Local config` after you added the user entry, remove
+  the stale one and re-check:
 
-## Register with Claude Code
+  ```bash
+  claude mcp remove jms-bridge -s local
+  claude mcp get jms-bridge     # → Scope: User config (available in all your projects)
+  ```
+
+### Codex
 
 ```bash
-claude mcp add jms-bridge -- jms-bridge serve
+codex mcp add jms-bridge -- /abs/path/to/jms-agent-bridge/.venv/bin/jms-bridge serve
 ```
 
-The server reads your config file, so nothing else is needed once `jms-bridge login`
-has cached a token and `ssh_key` is set. If you are still on the password path, note
-that a shell `export` is **not** what the server sees — pass the variable explicitly
-(and add `--scope user` if you want it available from every directory):
+Codex has **no scope flag** — its `mcp add` is always global: it writes into Codex's home
+(`$CODEX_HOME`, `~/.codex` by default) and every project reads that. If you run Codex with a
+custom home the entry lands there instead, so trust `codex mcp list` over whatever file path you
+happen to open.
+
+### Environment variables
+
+Nothing extra is needed once `jms-bridge login` has cached a session token and `ssh_key` is set.
+On the password path, a shell `export` is **not** what the server sees — the agent launches the
+server in its own environment, so pass the variable in the registration itself:
 
 ```bash
-claude mcp add jms-bridge --scope user -e JMS_BRIDGE_SSH_PASSWORD='...' -- jms-bridge serve
+claude mcp add --scope user jms-bridge -e JMS_BRIDGE_SSH_PASSWORD='...' -- /abs/path/to/.venv/bin/jms-bridge serve
+codex mcp add jms-bridge --env JMS_BRIDGE_SSH_PASSWORD='...' -- /abs/path/to/.venv/bin/jms-bridge serve
 ```
+
+### Verify
+
+```bash
+claude mcp list          # → jms-bridge: … ✔ Connected
+codex mcp list           # → jms-bridge  …  enabled
+```
+
+`✔ Connected` / `enabled` means the agent started the server and completed the MCP handshake, so
+the tools are live. From an agent session, `jms_list_assets` is the quickest end-to-end proof —
+it goes out over the control plane and either returns your assets or tells you what is missing.
+
+### On a second machine
+
+Nothing secret travels in the clone. `config.toml` is a template, the saved password lives in the
+OS keyring or `credentials.toml` (both machine-local), and the session token `login` writes into
+`config.toml` is issued to *that* config file. So a new machine repeats the same sequence as the
+first: `jms-bridge init`, edit both files, copy your own `hosts.yaml` if you have one, then
+`jms-bridge login --save-password` again — and register the server with your agent, which is also
+machine-local. If you copy a `config.toml` across, delete the stale `session_token` line first;
+otherwise the bridge starts up holding a token the server may no longer accept.
 
 ## Tools
 
-24 tools, grouped by what they act on. "REST" = control plane (JumpServer API,
-metadata only); "SSH" = data plane (real execution through the KoKo gateway).
+24 tools, grouped by what they act on. "REST" = control plane (JumpServer API, metadata only);
+"SSH" = data plane (real execution through the KoKo gateway).
 
 | Tool | Plane | What it does |
 |---|---|---|
@@ -273,10 +324,12 @@ metadata only); "SSH" = data plane (real execution through the KoKo gateway).
 | `jms_dev_logs` | SSH | Full traceback for one `test_id` on one workspace (drill into a FAIL) |
 | `jms_inventory_reload` | — | Re-read `hosts.yaml` **and the config** after editing either (drops the cached inventory, credentials and SSH connections; no restart) |
 
-Selectors accept host names, group names, or tags — `["cluster"]`, `["gpu"]`, `["all"]`.
-The `jms_dev_*` tools instead select **workspaces** by name, tag, or `all`.
+Selectors accept host names, group names, or tags — `["cluster"]`, `["gpu"]`, `["all"]`. The
+`jms_dev_*` tools instead select **workspaces** by name, tag, or `all`.
 
-## A Torch-FL run, end to end
+## Usage
+
+### A Torch-FL run, end to end
 
 ```text
 jms_probe(["cluster"])                          # who is up, what accelerator, which CANN/CUDA
@@ -293,9 +346,9 @@ jms_audit_query()                                # confirm the trail in JumpServ
 ### Two kinds of "parallel"
 
 `jms_submit_job` runs the *same command independently* on each host — right for "probe
-everything", "pull logs everywhere". `jms_cluster_submit` runs *one coordinated job*:
-every host is a rank node given the same rendezvous, so a distributed launcher
-(`torchrun`, etc.) forms a single `world_size=N` job.
+everything", "pull logs everywhere". `jms_cluster_submit` runs *one coordinated job*: every host
+is a rank node given the same rendezvous, so a distributed launcher (`torchrun`, etc.) forms a
+single `world_size=N` job.
 
 ```text
 jms_cluster_preflight(["cluster"])              # ready? world_size estimate, port free, cards free?
@@ -309,35 +362,33 @@ jms_cluster_submit(
 jms_cluster_cancel(["ascend-910c", "node-4090-1", "node-4090-2"], "<job-id>")
 ```
 
-`jms_cluster_preflight` also reports how many cards each host already has busy. That
-count is **advisory**: it only ever raises the flag on a *positive* parse, so an
-unrecognized vendor format (or a host with no occupancy probe at all) stays "unknown"
-and blocks nothing — it never gets read as "the cards are free". `jms_cluster_submit`
-refuses to launch onto a host with occupied cards unless you pass `allow_busy=true`;
-the usual honest reason a card is busy is your *own* previous run, which is why the
-override exists.
+`jms_cluster_preflight` also reports how many cards each host already has busy. That count is
+**advisory**: it only ever raises the flag on a *positive* parse, so an unrecognized vendor format
+(or a host with no occupancy probe at all) stays "unknown" and blocks nothing — it never gets read
+as "the cards are free". `jms_cluster_submit` refuses to launch onto a host with occupied cards
+unless you pass `allow_busy=true`; the usual honest reason a card is busy is your *own* previous
+run, which is why the override exists.
 
 All ranks of one `jms_cluster_submit` share a **single job id**, so `jms_job_status`,
-`jms_job_wait`, `jms_job_logs` and `jms_cluster_cancel` each take that one id rather
-than a rank-to-host pairing.
+`jms_job_wait`, `jms_job_logs` and `jms_cluster_cancel` each take that one id rather than a
+rank-to-host pairing.
 
-Each rank gets `JMS_RANK`, `JMS_LOCAL_RANK`, `JMS_NPROC`, `JMS_WORLD_SIZE`,
-`JMS_MASTER_ADDR`, `JMS_MASTER_PORT` exported before its command. The bridge supplies
-the rank/world wiring (the part that must be identical across nodes); you supply the
-launcher. Note: ranks talk to each other **directly** over the rendezvous, not through
-the bastion — so `master_addr` must be the host's own reachable address (set `address:`
-in `hosts.yaml`), and all nodes must be mutually routable.
+Each rank gets `JMS_RANK`, `JMS_LOCAL_RANK`, `JMS_NPROC`, `JMS_WORLD_SIZE`, `JMS_MASTER_ADDR`,
+`JMS_MASTER_PORT` exported before its command. The bridge supplies the rank/world wiring (the part
+that must be identical across nodes); you supply the launcher. Note: ranks talk to each other
+**directly** over the rendezvous, not through the bastion — so `master_addr` must be the host's
+own reachable address (set `address:` in `hosts.yaml`), and all nodes must be mutually routable.
 
 ### Heterogeneous clusters — islands and federation
 
-Ascend (HCCL) and NVIDIA (NCCL) nodes **cannot form one collective** — different
-libraries, different transports. Neither can two vendors whose torch builds each ship
-their own NCCL, even though both call the backend `nccl`. So a mixed cluster is not one
-`world_size`; it is several *islands*, one per **collective engine**, that **federate**
-(exchange model updates between rounds) rather than share a collective.
+Ascend (HCCL) and NVIDIA (NCCL) nodes **cannot form one collective** — different libraries,
+different transports. Neither can two vendors whose torch builds each ship their own NCCL, even
+though both call the backend `nccl`. So a mixed cluster is not one `world_size`; it is several
+*islands*, one per **collective engine**, that **federate** (exchange model updates between
+rounds) rather than share a collective.
 
-`jms_cluster_plan` returns this layout; `jms_cluster_submit` refuses a mixed set and
-points you at it:
+`jms_cluster_plan` returns this layout; `jms_cluster_submit` refuses a mixed set and points you at
+it:
 
 ```text
 jms_cluster_plan(["cluster"])
@@ -351,21 +402,20 @@ jms_cluster_submit(["node-4090-1", "node-4090-2"], "torchrun --nnodes=2 --node_r
 jms_cluster_submit(["ascend-910c"],             "torchrun --nnodes=1 --node_rank=0 ...")
 ```
 
-The island *exchange* (all-reduce across islands, or a parameter server) is
-application logic you write in the training script; the bridge gives each island its
-launch and rendezvous. For a plain same-chip cluster this collapses to a single island
-and a normal `jms_cluster_submit` — no federation needed.
+The island *exchange* (all-reduce across islands, or a parameter server) is application logic you
+write in the training script; the bridge gives each island its launch and rendezvous. For a plain
+same-chip cluster this collapses to a single island and a normal `jms_cluster_submit` — no
+federation needed.
 
-## The flagos development loop
+### The flagos development loop
 
-Training is the *slow* loop (`jms_submit_job` / `jms_cluster_submit`). Development is
-the *fast* one: **write once, verify on every chip.** For a multi-backend plugin like
-Torch-FL, "it works" is only true when the *same* code path passes the *same* UT suite
-on every accelerator — so the loop's whole job is to make that one action and surface
-any cross-chip divergence at a glance.
+Training is the *slow* loop (`jms_submit_job` / `jms_cluster_submit`). Development is the *fast*
+one: **write once, verify on every chip.** For a multi-backend plugin like Torch-FL, "it works" is
+only true when the *same* code path passes the *same* UT suite on every accelerator — so the
+loop's whole job is to make that one action and surface any cross-chip divergence at a glance.
 
-A **workspace** binds the four things that must agree across chips — host, container,
-repo, and how to run UT — and is declared in the inventory under a `workspaces:` key:
+A **workspace** binds the four things that must agree across chips — host, container, repo, and
+how to run UT — and is declared in the inventory under a `workspaces:` key:
 
 ```yaml
 workspaces:
@@ -390,35 +440,34 @@ workspaces:
     tags: [cuda]
 ```
 
-You rarely need to write that block by hand. `jms_dev_discover` inspects a whole host
-set and emits it for you — which container exists, where the checkout lives inside it,
-which python/pytest is there, and whether the container can reach its git remote:
+You rarely need to write that block by hand. `jms_dev_discover` inspects a whole host set and
+emits it for you — which container exists, where the checkout lives inside it, which
+python/pytest is there, and whether the container can reach its git remote:
 
 ```text
 jms_dev_discover(["cluster"], container="lvyufeng-torch-fl")   # -> {workspaces:{...}, yaml:"..."}
 ```
 
-It returns a `workspaces:` YAML fragment to paste into `hosts.yaml` (one workspace per
-host, `fl-<host>`, plus `fl-<host>-2` if a host has two checkouts), alongside the raw
-per-host findings in `hosts`. The emitted `source:` is a **guess from reachability
-alone**, so anything it could not confirm — a container it could not inspect, an
-unreachable origin, a missing pytest — comes back as a `warnings` entry, and a host
-without the container or without a matching checkout is listed in `skipped` rather than
-emitted as a half-formed entry. Confirm the guess (`source`, and any `proxy` / `mount` /
-`local`) before relying on it. `ok` is true only when every requested host produced at
-least one workspace — a skipped host means the picture is incomplete.
+It returns a `workspaces:` YAML fragment to paste into `hosts.yaml` (one workspace per host,
+`fl-<host>`, plus `fl-<host>-2` if a host has two checkouts), alongside the raw per-host findings
+in `hosts`. The emitted `source:` is a **guess from reachability alone**, so anything it could not
+confirm — a container it could not inspect, an unreachable origin, a missing pytest — comes back
+as a `warnings` entry, and a host without the container or without a matching checkout is listed
+in `skipped` rather than emitted as a half-formed entry. Confirm the guess (`source`, and any
+`proxy` / `mount` / `local`) before relying on it. `ok` is true only when every requested host
+produced at least one workspace — a skipped host means the picture is incomplete.
 
-Because the block must be *loadable*, the tool refuses a `source` it cannot complete:
-`proxy-git` requires `proxy`, and `push` requires both `mount` and `local`, so pass them
-(`jms_dev_discover(["all"], source="proxy-git", proxy="http://…:8080")`). The
-reachability probe distinguishes three outcomes rather than one bit — `ok`,
-`denied` (unreachable *or* unauthenticated) and `timeout` (could not tell) — because
-"retry" and "change `source`" are different fixes.
+Because the block must be *loadable*, the tool refuses a `source` it cannot complete: `proxy-git`
+requires `proxy`, and `push` requires both `mount` and `local`, so pass them
+(`jms_dev_discover(["all"], source="proxy-git", proxy="http://…:8080")`). The reachability probe
+distinguishes three outcomes rather than one bit — `ok`, `denied` (unreachable *or*
+unauthenticated) and `timeout` (could not tell) — because "retry" and "change `source`" are
+different fixes.
 
-Once the block is in the inventory, the loop is three calls (workspaces are selected by
-name, by tag, or by `all` — unlike hosts they have no group concept). After pasting the
-block, call `jms_inventory_reload` so the running server drops its cached inventory and
-sees the new workspaces — no MCP restart:
+Once the block is in the inventory, the loop is three calls (workspaces are selected by name, by
+tag, or by `all` — unlike hosts they have no group concept). After pasting the block, call
+`jms_inventory_reload` so the running server drops its cached inventory and sees the new
+workspaces — no MCP restart:
 
 ```text
 jms_inventory_reload()                            # after editing hosts.yaml
@@ -437,46 +486,14 @@ test_layer_norm          PASS        FAIL   ← AssertionError: max diff 1e-3
 test_gemm_dtype          SKIP        PASS   ← divergence: skipped on one backend
 ```
 
-A row is **consistent** only when *every* workspace ran the test and they all agree; a
-chip that skipped a case shows `SKIP`, not a silent omission. `ok` is true only when
-nothing diverged, no chip failed or timed out, and every chip is confirmed to be at the
-**same commit** (`revisions`). A FAIL carries a one-line assertion message inline — enough
-to decide whether to dig; use `jms_dev_logs` for the full traceback.
+A row is **consistent** only when *every* workspace ran the test and they all agree; a chip that
+skipped a case shows `SKIP`, not a silent omission. `ok` is true only when nothing diverged, no
+chip failed or timed out, and every chip is confirmed to be at the **same commit** (`revisions`).
+A FAIL carries a one-line assertion message inline — enough to decide whether to dig; use
+`jms_dev_logs` for the full traceback.
 
-#### The same sha is not the same code path
-
-Two chips at one commit can still run **different code**: a wheel built for `ascend` vs one
-built for `dcu`, or the plugin dispatching a given op to `flaggems` on chip A and
-`flagos_python` on chip B. Both PASS, and a sha-only check reads green — the exact
-divergence the loop exists to catch. So `jms_dev_run` also **attests what ran**.
-
-A probe rides the same SSH round trip as the UT run (no extra call) and reads, from inside
-the checkout: `torch_fl/_build_config.py` (`ACCELERATOR` — the build identity the
-maintainers generate to tell wheels apart), `torch_fl/backends.conf` (the `op -> backend`
-map — the code path), the `_C` extension's ABI tag vs the interpreter's, and a best-effort
-`import torch_fl`. Every field is reported per chip under `attestation`:
-
-```text
-"attestation": {
-  "fl-ascend": {"accelerator": "ascend", "backend_map": {"softmax": "flaggems"},
-                "backend_map_hash": "…", "abi_match": false,
-                "import_error": "ModuleNotFoundError: No module named 'torch_fl._C'"},
-  "fl-4090":   {"accelerator": "dcu",    "backend_map": {"softmax": "flagos_python"}, …}
-}
-```
-
-`ok` additionally requires **`attestation_consistent`**: the `op -> backend` map (and the
-plugin version, where readable) must agree across chips. A chip whose map could not be read
-is listed in `attestation_unverified`, never coerced into agreement — the same rule
-`revisions` follows. The build `accelerator`, the ABI and the installed `torch`
-legitimately differ per chip, so they are surfaced but **not** gated.
-
-The probe is layered precisely because the container often cannot import the plugin at all
-(the `_C` extension is built for one interpreter, the container ships another) — so a
-static read still attests, and "cannot import" is a first-class result, not a crash.
-
-Delivery is per-workspace because reachability differs (direct GitHub, behind a proxy,
-or offline); all three reduce to *"make the container's repo be at `ref`"*:
+Delivery is per-workspace because reachability differs (direct GitHub, behind a proxy, or
+offline); all three reduce to *"make the container's repo be at `ref`"*:
 
 | `source` | Action |
 |---|---|
@@ -487,56 +504,67 @@ or offline); all three reduce to *"make the container's repo be at `ref`"*:
 Two things worth knowing:
 
 - **`ut_cmd` must emit pytest `-rA` lines.** The consistency table is parsed from
-  `PASSED/FAILED/ERROR/SKIPPED … <id> - <msg>` short-summary lines; a custom `ut_cmd`
-  that does not print them yields an empty table and `ok=false` (that is deliberate — an
-  empty result must never read as "everything passed"). The command runs under
-  `set -o pipefail` *inside* the container, so a piped `ut_cmd` (`… | tee log`) cannot
-  mask pytest's failure behind `tee`'s zero exit.
-- **`push` cannot pin a revision in-container.** It has no git in the container, so its
-  reported `revisions` entry is the *local* tree's HEAD; `jms_dev_run` still checks that
-  every chip — push included — reported a revision, and fails the run if one did not.
+  `PASSED/FAILED/ERROR/SKIPPED … <id> - <msg>` short-summary lines; a custom `ut_cmd` that does
+  not print them yields an empty table and `ok=false` (that is deliberate — an empty result must
+  never read as "everything passed"). The command runs under `set -o pipefail` *inside* the
+  container, so a piped `ut_cmd` (`… | tee log`) cannot mask pytest's failure behind `tee`'s zero
+  exit.
+- **`push` cannot pin a revision in-container.** It has no git in the container, so its reported
+  `revisions` entry is the *local* tree's HEAD; `jms_dev_run` still checks that every chip — push
+  included — reported a revision, and fails the run if one did not.
 
-The git hub is your fork: the agent pushes to `lvyufeng/torch-fl` (the `ref` the
-containers fetch), and once the table is green all the way across, opens the PR to
-`flagos-ai/torch-fl`. Registers/indices never cross the bastion by hand.
+#### Same commit, different code path
 
-## Design notes
+Two chips at one commit can still run **different code**: a wheel built for `ascend` vs one built
+for `dcu`, or the plugin dispatching a given op to `flaggems` on chip A and `flagos_python` on
+chip B. Both PASS, and a sha-only check reads green — the exact divergence the loop exists to
+catch. So `jms_dev_run` also **attests what ran**, per chip, under `attestation`: the build's
+`accelerator` identity, the `op -> backend` map (plus its hash), the `_C` extension's ABI against
+the interpreter's, and a best-effort `import torch_fl`.
 
-- **Local, not deployed.** The server runs on your machine, launched by Claude Code. No
-  install on shared bastion infrastructure; credentials stay in your key agent.
-- **Control plane vs data plane.** Discovery/audit/tickets use the REST API; execution
-  uses SSH. Neither alone covers the workflow — see
-  [`docs/plans/2026-10-09-jms-agent-bridge-design.md`](docs/plans/2026-10-09-jms-agent-bridge-design.md).
-- **Connection reuse.** `ControlMaster` means N commands cost one slow KoKo handshake.
-- **Injection-safe.** Remote scripts are piped to `bash -s`; `subprocess` always gets an
-  argv list, so nothing user-supplied is interpreted by the local shell.
-- **No PTY menu scraping.** Only JumpServer's per-asset direct login is used — stable,
-  documented behaviour, not UI simulation.
+```text
+"attestation": {
+  "fl-ascend": {"accelerator": "ascend", "backend_map": {"softmax": "flaggems"},
+                "backend_map_hash": "…", "abi_match": false,
+                "import_error": "ModuleNotFoundError: No module named 'torch_fl._C'"},
+  "fl-4090":   {"accelerator": "dcu",    "backend_map": {"softmax": "flagos_python"}, …}
+}
+```
+
+`ok` additionally requires **`attestation_consistent`**: the `op -> backend` map (and the plugin
+version, where readable) must agree across chips. A chip whose map could not be read is listed in
+`attestation_unverified`, never coerced into agreement — the same rule `revisions` follows. The
+build `accelerator`, the ABI and the installed `torch` legitimately differ per chip, so they are
+surfaced but **not** gated. The attestation is layered because the container often cannot import
+the plugin at all — a static read still attests, and "cannot import" is a first-class result, not
+a crash.
 
 ## Security
 
-- Data plane uses SSH keys and per-asset identity, so every command is attributed in the
-  audit log. The bridge never bypasses the bastion.
-- **Know this about login approval:** JumpServer runs its login-review (登录复核) wait only
-  for *interactive* asset sessions. A non-interactive direct connect — which is exactly
-  what `jms_exec` / `jms_submit_job` use, because the remote script is piped to `bash -s`
-  — **does not enter the approval queue**. Sessions and commands are still recorded in the
-  audit log, but a pending login-approval ticket will not block a one-shot command. If
-  policy requires approval before anything runs, gate at the account/permission layer or
-  raise a `login_asset_confirm` ticket with `jms_create_ticket` and wait for it out of
-  band.
+- Data plane uses SSH keys and per-asset identity, so every command is attributed in the audit
+  log. The bridge never bypasses the bastion.
+- **Know this about login approval:** JumpServer runs its login-review (登录复核) wait only for
+  *interactive* asset sessions. A non-interactive direct connect — which is exactly what
+  `jms_exec` / `jms_submit_job` use, because the remote script is piped to `bash -s` — **does not
+  enter the approval queue**. Sessions and commands are still recorded in the audit log, but a
+  pending login-approval ticket will not block a one-shot command. If policy requires approval
+  before anything runs, gate at the account/permission layer or raise a `login_asset_confirm`
+  ticket with `jms_create_ticket` and wait for it out of band.
 - Every tool that runs a caller-supplied command — `jms_exec`, `jms_submit_job`,
   `jms_cluster_submit`, and `jms_dev_run`'s `ut_cmd` override — applies a small denylist for
-  obviously destructive commands (`rm -rf /`, `mkfs`, `dd if=`, fork bombs), overridable
-  with `allow_dangerous=true`. This is a *typo guard*, not a security boundary —
-  JumpServer's command blacklist and permission model are the real controls. The commands
-  a workspace carries in `hosts.yaml` (`ut_cmd`, `env_setup`) are inventory spec text, not
-  tool arguments, and are not screened here.
+  obviously destructive commands (`rm -rf /`, `mkfs`, `dd if=`, fork bombs), overridable with
+  `allow_dangerous=true`. This is a *typo guard*, not a security boundary — JumpServer's command
+  blacklist and permission model are the real controls. The commands a workspace carries in
+  `hosts.yaml` (`ut_cmd`, `env_setup`) are inventory spec text, not tool arguments, and are not
+  screened here.
+- Remote scripts are piped to `bash -s` and `subprocess` always gets an argv list, so nothing
+  user-supplied is interpreted by the local shell. Only JumpServer's documented per-asset direct
+  login is used — no PTY or menu scraping.
 - Secrets are read from env/config and never logged. A password saved with
-  `login --save-password` goes to the OS keyring when the `[keyring]` extra is present,
-  otherwise to a mode-600 `~/.config/jms-bridge/credentials.toml` (delete that file, or
-  run `login --forget`, to revoke); the session token `login` mints lives in
-  `config.toml`, also mode 600.
+  `login --save-password` goes to the OS keyring when the `[keyring]` extra is present, otherwise
+  to a mode-600 `~/.config/jms-bridge/credentials.toml` (delete that file, or run
+  `login --forget`, to revoke); the session token `login` mints lives in `config.toml`, also mode
+  600.
 
 ## License
 

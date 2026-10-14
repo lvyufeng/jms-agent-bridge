@@ -36,3 +36,24 @@ pytest -q
 
 Integration is verified with `jms-bridge doctor` (read-only) against a real bastion,
 not from CI. CI runs lint + unit tests only.
+
+## Verifying a fresh clone
+
+The first-run path is scripted, so a fresh clone can be *proved* to work rather than
+assumed:
+
+```bash
+JMS_BRIDGE_PASSWORD='...' scripts/verify-onboarding.sh
+```
+
+It runs `init` → `login` → `jms_list_assets` → build `hosts.yaml` → `doctor` (the gate)
+→ `jms_dev_discover` → one real `jms_dev_run`, and stops at the first step that does not
+work, printing that step's actual output. The config, the inventory and the credentials
+file are all pinned inside a scratch directory and the OS keyring is bypassed, so it never
+touches `~/.config/jms-bridge`; `$HOME` is left alone because ssh still needs the real
+`~/.ssh`. Exit status is 0 only when the cross-chip table comes back green.
+
+`scripts/verify_support.py` and `scripts/mcp_call.py` are the helpers it drives: `mcp_call.py`
+speaks the MCP wire protocol (there is no CLI subcommand for the `jms_*` tools), and
+`verify_support.py` turns the `jms_list_assets` result into a `hosts.yaml` (`mkhosts`) and appends
+a discovered `workspaces:` block to it (`discover`).
