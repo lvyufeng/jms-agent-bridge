@@ -385,3 +385,52 @@ def test_target_requires_rest_identity(loopback=None):
     runner = object.__new__(NativeSSHRunner)
     with pytest.raises(ConfigError):
         runner.key(Host("unconfigured"))
+
+
+async def test_jms_exec_keeps_the_legacy_contract(loopback):
+    """`jms_exec` must keep the default mode's contract, not silently become `run`.
+
+    The two differ in control flow even when the snapshot has no `env_setup`/`workdir`
+    (REST never provides them): the legacy path goes through `wrap_command` and reports
+    a dangerous command as `{"ok": false, "error": ...}` instead of raising. Mapping the
+    name onto `run` made one operation mean two things depending on the mode serving it.
+    """
+    t = loopback
+    service = BridgeService(t.cfg, t.settings)
+    service.runner = t.runner
+    service.manager.runner = t.runner
+    service.catalog._fetch = AsyncMock(
+        return_value=[
+            {
+                "id": t.host.asset_id,
+                "name": "node",
+                "address": "192.0.2.21",
+                "active": True,
+                "protocols": ["ssh"],
+                "accounts": ["root"],
+                "account": "root",
+                "login": t.host.login,
+            }
+        ]
+    )
+    await service.catalog.refresh()
+
+    calls = []
+    original = t.runner.exec_on
+
+    async def spy(host, command, *, timeout=60, workdir=True, env_setup=True):
+        calls.append(command)
+        return await original(host, command, timeout=timeout, workdir=workdir, env_setup=env_setup)
+
+    t.runner.exec_on = spy
+    result = await service.call("jms_exec", {"targets": ["node"], "command": "printf legacy-path"})
+    assert result["ok"] and "exec_on" not in str(result)
+    assert calls == ["printf legacy-path"], "jms_exec must go through exec_on, not run"
+    assert result["data"]["results"][0]["result_id"]
+
+    # A dangerous command is refused, not raised: the legacy reply shape.
+    refused = await service.call(
+        "jms_exec", {"targets": ["node"], "command": "rm -rf / --no-preserve-root"}
+    )
+    assert refused["data"]["ok"] is False
+    assert "denylist" in refused["data"]["error"]

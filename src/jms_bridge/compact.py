@@ -126,7 +126,9 @@ class BridgeService:
         }
         for name, desc in {
             "jms_exec": (
-                "Compatibility operation; prefer run for scripts, Docker, and "
+                "Run a short command with the legacy environment: sources the asset's "
+                "env_setup and enters its workdir, as jms_exec does in the default mode. "
+                "Prefer run for scripts, Docker, or a clean environment, and for "
                 "complete output storage."
             ),
             "jms_list_assets": "Search the hourly REST asset snapshot; no YAML inventory is used.",
@@ -252,6 +254,40 @@ class BridgeService:
             **({"inventory_stale": True} if self.catalog.status()["stale"] else {}),
         }
 
+    async def legacy_exec(self, targets, command, *, timeout=60.0, allow_dangerous=False):
+        """`jms_exec` with the contract the default mode gives it.
+
+        That mode runs the command through the asset's ``env_setup`` and ``workdir``,
+        so a probe like ``nvidia-smi`` finds a toolchain that a bare ``bash -s`` would
+        not. ``run`` is deliberately clean instead, which is why this does not delegate
+        to it. The safety guard returns a refusal, matching the legacy reply rather than
+        raising, so a client migrating between modes sees the same shape.
+        """
+        if upstream._looks_dangerous(command) and not allow_dangerous:
+            return {
+                "ok": False,
+                "error": (
+                    "command matched the safety denylist; pass allow_dangerous=true to override"
+                ),
+                "command": command,
+            }
+        inventory = await self.catalog.ensure()
+        hosts = inventory.resolve(targets)
+        if not hosts:
+            raise ValueError(
+                "no permitted SSH assets matched the targets"
+                + (f" — {why}" if (why := self.catalog.explain_no_targets()) else "")
+            )
+        results = await asyncio.gather(
+            *(self.runner.exec_on(host, command, timeout=timeout) for host in hosts)
+        )
+        rows = self.compact_exec_results(results)
+        return {
+            "ok": all(row.get("ok") for row in rows),
+            "results": rows,
+            **({"inventory_stale": True} if self.catalog.status()["stale"] else {}),
+        }
+
     async def discover(self, query="", operation=None, topic="operations", limit=10, offset=0):
         if not 1 <= limit <= 30 or offset < 0:
             raise ValueError("limit must be 1..30; offset must be nonnegative")
@@ -305,13 +341,17 @@ class BridgeService:
         else:
             inventory = await self.catalog.ensure()
             if operation == "jms_exec":
-                return await self.run(
+                # Keep the legacy contract: `jms_exec` sources the asset's `env_setup`
+                # and enters its workdir, which `run` deliberately does not. Mapping
+                # this name onto `run` made the same operation mean two different
+                # things depending on which mode was serving it.
+                value = await self.legacy_exec(
                     arguments["targets"],
-                    script=arguments["command"],
-                    timeout=arguments.get("timeout", 60),
+                    arguments["command"],
+                    timeout=float(arguments.get("timeout", 60)),
                     allow_dangerous=arguments.get("allow_dangerous", False),
                 )
-            if operation == "session_close":
+            elif operation == "session_close":
                 hosts = inventory.resolve([arguments["target"]])
                 if len(hosts) != 1:
                     raise ValueError("session_close requires exactly one asset")
