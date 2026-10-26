@@ -481,3 +481,57 @@ async def test_no_targets_is_silent_when_targets_exist(service):
     assert service.catalog.explain_no_targets() is None
     with pytest.raises(InventoryError, match="not in the REST snapshot"):
         await service.run(["no-such-host"], script="true")
+
+
+async def test_listed_but_unusable_asset_says_why(cfg, tmp_path):
+    """An asset `discover` lists can still be unselectable — and the reply must say so.
+
+    Reporting "not in the REST snapshot" for an entry the listing just showed sends the
+    caller back to `discover` for a name it already has. Every exclusion reason is
+    carried through to the error, keyed by both the display name and the asset id.
+    """
+    catalog = AssetCatalog(cfg, BridgeSettings(state_dir=tmp_path, preferred_account="root"))
+    manifest = [
+        asset(name="good", address="192.0.2.1"),
+        asset(name="switched-off", address="192.0.2.2", active=False),
+        asset(name="sftp-only", address="192.0.2.3", protocols=["sftp"]),
+        asset(name="ambiguous", address="192.0.2.4", accounts=["root", "secure"], account=None),
+    ]
+    catalog._fetch = AsyncMock(return_value=manifest)
+    await catalog.refresh()
+    inventory = catalog.inventory
+    assert len(inventory.hosts) == 1
+
+    for name, reason in [
+        ("switched-off", "is inactive in JumpServer"),
+        ("sftp-only", "permits no ssh protocol"),
+        ("ambiguous", "no unambiguous account selected"),
+    ]:
+        with pytest.raises(InventoryError, match=reason) as excinfo:
+            inventory.resolve([name])
+        assert "in the REST snapshot but is not a usable target" in str(excinfo.value)
+        assert reason in inventory.excluded[name]
+
+    # The id resolves to the same explanation: a caller holding a UUID is not stranded.
+    inactive_id = manifest[1]["id"]
+    with pytest.raises(InventoryError, match="is inactive"):
+        inventory.resolve([inactive_id])
+
+    # A name that is genuinely absent keeps the original, different message.
+    with pytest.raises(InventoryError, match="^target is not in the REST snapshot"):
+        inventory.resolve(["never-existed"])
+
+
+async def test_search_marks_usability(cfg, tmp_path):
+    catalog = AssetCatalog(cfg, BridgeSettings(state_dir=tmp_path, preferred_account="root"))
+    catalog._fetch = AsyncMock(
+        return_value=[
+            asset(name="good", address="192.0.2.1"),
+            asset(name="switched-off", address="192.0.2.2", active=False),
+        ]
+    )
+    await catalog.refresh()
+    rows = {row["name"]: row for row in catalog.search("", 0, 10)["assets"]}
+    assert rows["good"]["usable"] is True and "unusable_because" not in rows["good"]
+    assert rows["switched-off"]["usable"] is False
+    assert "is inactive" in rows["switched-off"]["unusable_because"]

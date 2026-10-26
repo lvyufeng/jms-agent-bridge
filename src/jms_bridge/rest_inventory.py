@@ -10,6 +10,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -20,11 +21,29 @@ from .results import atomic_json
 log = logging.getLogger(__name__)
 
 
+@dataclass
 class RESTInventory(Inventory):
+    #: Why a snapshot asset did not become a target, keyed by both its name and its
+    #: id. A name can be shown by ``discover`` and still be unusable, so "not in the
+    #: REST snapshot" is a lie whenever the entry is right there in the listing.
+    excluded: dict[str, str] = field(default_factory=dict)
+
     def resolve(self, selectors):
         try:
             return super().resolve(selectors)
         except InventoryError:
+            # Name the assets that *are* in the snapshot but were not made targets, so
+            # the reply points at the real cause instead of at discover().
+            reasons = {
+                self.excluded[s]
+                for s in selectors
+                if s in self.excluded and self.excluded[s]
+            }
+            if reasons:
+                raise InventoryError(
+                    "target is in the REST snapshot but is not a usable target: "
+                    f"{'; '.join(sorted(reasons))}"
+                ) from None
             raise InventoryError(
                 'target is not in the REST snapshot; use discover(topic="assets", query=...)'
             ) from None
@@ -130,19 +149,23 @@ class AssetCatalog:
         }
 
     def _build(self, snapshot):
-        hosts, selectors, name_counts, address_counts = {}, {}, {}, {}
+        hosts, selectors, name_counts, address_counts, excluded = {}, {}, {}, {}, {}
         for asset in snapshot["assets"]:
             name_counts[asset["name"]] = name_counts.get(asset["name"], 0) + 1
             address_counts[asset["address"]] = address_counts.get(asset["address"], 0) + 1
         for asset in snapshot["assets"]:
-            if not asset["active"] or not asset["account"] or "ssh" not in asset["protocols"]:
-                continue
+            # Why this asset is not a target, if it is not. ``discover`` lists every
+            # asset the API returned, including ones that can never be selected, so the
+            # reason has to be recorded here — the selector-index loop below only sees
+            # assets that survived.
             asset_id = str(uuid.UUID(asset["id"]))
+            reason = self._exclusion(asset)
+            if reason:
+                for label in {asset["name"], asset_id}:
+                    if label:
+                        excluded.setdefault(label, f"'{asset['name']}' {reason}")
+                continue
             login, account = asset["login"], asset["account"]
-            if not login or not re.fullmatch(r"[A-Za-z0-9_.@-]+", login):
-                continue
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", account):
-                continue
             # UUIDs are canonical, so display names can never overwrite a target.
             hosts[asset_id] = Host(
                 name=asset_id,
@@ -158,7 +181,24 @@ class AssetCatalog:
         groups = {
             k: list(set(v)) for k, v in selectors.items() if len(set(v)) == 1 and k not in hosts
         }
-        return RESTInventory(hosts, groups)
+        return RESTInventory(hosts, groups, excluded=excluded)
+
+    def _exclusion(self, asset) -> str | None:
+        """Why *asset* is not a usable target, or ``None`` when it is one."""
+        if not asset["active"]:
+            # The single most confusing case: the asset is listed, so the caller reads
+            # "not in the snapshot" as a typo in the name.
+            return "is inactive in JumpServer, so it is not a target"
+        if "ssh" not in asset["protocols"]:
+            return f"permits no ssh protocol (has: {', '.join(asset['protocols']) or 'none'})"
+        if not asset["account"]:
+            return "has no unambiguous account selected (see bridge.preferred_account)"
+        login, account = asset["login"], asset["account"]
+        if not login or not re.fullmatch(r"[A-Za-z0-9_.@-]+", login):
+            return f"has an unusable login {login!r}"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", account):
+            return f"has an unusable account name {account!r}"
+        return None
 
     async def _fetch(self):
         api = self.make_api()
@@ -274,13 +314,20 @@ class AssetCatalog:
             for a in self.snapshot["assets"]
             if query.lower() in " ".join([a["name"], a["id"], a["address"]]).lower()
         ]
-        page = [
-            {
-                k: a[k]
-                for k in ("id", "name", "address", "active", "protocols", "accounts", "account")
-            }
-            for a in rows[offset : offset + limit]
-        ]
+        page = []
+        for a in rows[offset : offset + limit]:
+            # A listed asset is not necessarily a selectable target, and a caller that
+            # only sees `active` cannot tell the difference. Say it outright.
+            why = self._exclusion(a)
+            page.append(
+                {k: a[k] for k in ("id", "name", "address", "active", "protocols")}
+                | {
+                    "usable": why is None,
+                    "accounts": a["accounts"],
+                    "account": a["account"],
+                    **({"unusable_because": why} if why else {}),
+                }
+            )
         return {
             "assets": page,
             "matched": len(rows),
