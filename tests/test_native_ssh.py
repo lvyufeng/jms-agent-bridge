@@ -124,7 +124,12 @@ async def loopback(tmp_path):
     await server.wait_closed()
     for proc in list(processes):
         if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
+            # The server's `process_factory` children are spawned with
+            # `start_new_session=True`; on macOS signalling a group whose leader has
+            # already exited but not yet been reaped raises PermissionError (EPERM)
+            # rather than ProcessLookupError, and the teardown reported that as an
+            # error even though the test itself had passed.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(proc.pid, signal.SIGKILL)
             await proc.wait()
 

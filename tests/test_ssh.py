@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import os
+import signal
 
 import pytest
 
@@ -318,8 +320,31 @@ def test_kill_takes_down_the_whole_process_group(monkeypatch):
 
     Signals the *real* group here, unlike the tracker-based tests, because the point is
     that the group is killed rather than only the leader.
+
+    The probe is ``killpg(pgid, 0)`` rather than scraping ``ps``: an orphaned grandchild
+    is reparented and its recorded pgid stops being a reliable handle (on macOS ``ps``
+    then reports the group as already empty while the process is still alive), whereas
+    signal 0 resolves the group in the kernel on every platform.
+
+    The *verdict* must not be "the first probe raises ESRCH". ``proc.wait()`` reaps only
+    the leader; the grandchildren are killed-but-unreaped at that moment, and the kernel
+    drops a process group only when its last member is reaped. On CI (Linux, reaping
+    under load) the group still answers for tens of milliseconds — measured at ~50 ms —
+    while on macOS it answers ESRCH at once, so probing a single time raced and failed
+    on three of four CI versions but never locally. Poll until the group is gone, and
+    keep the budget short enough that a *surviving* grandchild can never pass.
     """
     from jms_bridge.ssh import _kill
+
+    def group_gone(pgid: int) -> bool:
+        """True once the kernel no longer resolves the group at all."""
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:  # pragma: no cover - not reachable for our own child
+            return False
+        return False
 
     async def main():
         proc = await asyncio.create_subprocess_exec(
@@ -333,14 +358,25 @@ def test_kill_takes_down_the_whole_process_group(monkeypatch):
         )
         await asyncio.sleep(0.3)
         pgid = os.getpgid(proc.pid)
-        assert pgid != os.getpgid(0), "child must not share the test runner's group"
+        try:
+            assert pgid != os.getpgid(0), "child must not share the test runner's group"
+            assert not group_gone(pgid), "the group must be alive before the kill"
 
-        await _kill(proc)
-        assert proc.returncode is not None
+            await _kill(proc)
+            assert proc.returncode is not None
 
-        # The whole group is gone, so signal 0 on it raises ESRCH.
-        with pytest.raises(ProcessLookupError):
-            os.killpg(pgid, 0)
+            # Reaping is asynchronous; give the kernel a bounded window to catch up. A
+            # grandchild that truly survived stays resolvable and still fails the assert.
+            for _ in range(50):  # ~1s, far above the ~50ms observed on a loaded CI runner
+                if group_gone(pgid):
+                    break
+                await asyncio.sleep(0.02)
+            assert group_gone(pgid), "a process in the group outlived the leader"
+        finally:
+            # A failing run may leave a survivor behind; never leak a 300s sleeper.
+            if not group_gone(pgid):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pgid, signal.SIGKILL)
 
     asyncio.run(main())
 
