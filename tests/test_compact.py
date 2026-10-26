@@ -535,3 +535,56 @@ async def test_search_marks_usability(cfg, tmp_path):
     assert rows["good"]["usable"] is True and "unusable_because" not in rows["good"]
     assert rows["switched-off"]["usable"] is False
     assert "is inactive" in rows["switched-off"]["unusable_because"]
+
+
+async def test_rest_targets_inherit_hosts_yaml_metadata(cfg, tmp_path, monkeypatch):
+    """REST decides reachability; hosts.yaml supplies the machine's own settings.
+
+    JumpServer exposes neither `env_setup` nor `workdir`, so a REST target otherwise
+    runs with no environment and no working directory. Both files share `asset_id`, so
+    the per-asset settings are keyed off that — without hosts.yaml ever granting access
+    to an asset the REST snapshot did not already permit.
+    """
+    manifest = [
+        asset(id="aaaaaaaa-0000-0000-0000-000000000001", name="known"),
+        asset(id="bbbbbbbb-0000-0000-0000-000000000002", name="not-listed"),
+    ]
+    hosts_yaml = tmp_path / "hosts.yaml"
+    hosts_yaml.write_text(
+        "hosts:\n"
+        "  local-name:\n"
+        "    login: someone-else\n"  # must NOT override the REST login
+        "    account: root\n"
+        "    asset_id: aaaaaaaa-0000-0000-0000-000000000001\n"
+        "    platform: ascend-910c\n"
+        '    env_setup: "source /opt/ascend/set_env.sh"\n'
+        "    workdir: /workspace/repo\n"
+    )
+    monkeypatch.setenv("JMS_BRIDGE_INVENTORY", str(hosts_yaml))
+
+    catalog = AssetCatalog(cfg, BridgeSettings(state_dir=tmp_path / "s", preferred_account="root"))
+    catalog._fetch = AsyncMock(return_value=manifest)
+    await catalog.refresh()
+    hosts = catalog.inventory.hosts
+    known = hosts["aaaaaaaa-0000-0000-0000-000000000001"]
+    assert known.workdir == "/workspace/repo"
+    assert known.env_setup == "source /opt/ascend/set_env.sh"
+    assert known.platform == "ascend-910c"
+    assert known.login == cfg.login_user, "hosts.yaml must not change who we log in as"
+
+    unlisted = hosts["bbbbbbbb-0000-0000-0000-000000000002"]
+    assert unlisted.workdir is None and unlisted.env_setup is None
+    assert unlisted.platform == "generic"
+
+
+def test_asset_metadata_is_optional_and_tolerant(tmp_path, monkeypatch):
+    """A REST-only deployment has no hosts.yaml, and a broken one must not break refresh."""
+    from jms_bridge.inventory import Inventory
+
+    monkeypatch.setenv("JMS_BRIDGE_INVENTORY", str(tmp_path / "absent.yaml"))
+    assert Inventory.asset_metadata() == {}
+
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("hosts: [this is not, a mapping\n")
+    monkeypatch.setenv("JMS_BRIDGE_INVENTORY", str(broken))
+    assert Inventory.asset_metadata() == {}

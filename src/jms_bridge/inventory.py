@@ -196,6 +196,42 @@ class Inventory:
                     picked[w.name] = w
         return list(picked.values())
 
+    @staticmethod
+    def asset_metadata(path: str | Path | None = None) -> dict[str, dict]:
+        """Per-asset settings from ``hosts.yaml``, keyed by ``asset_id``.
+
+        The REST snapshot decides **which** assets are reachable targets, because that
+        is the authority on permission. It cannot describe the machine itself: JumpServer
+        exposes neither ``env_setup`` nor ``workdir``, so an asset reached over REST runs
+        with no environment and no working directory. ``hosts.yaml`` already carries
+        those fields per asset, and ``asset_id`` is the stable key both sides share, so
+        this reads them back without letting the file grant access it does not have.
+
+        Deliberately tolerant: the file is optional here (a REST-only deployment has
+        none), and a malformed one must not take down inventory refresh — the metadata
+        is an enhancement, so failures degrade to "no metadata" rather than raising.
+        """
+        p = inventory_path(path)
+        if not p.exists():
+            return {}
+        try:
+            with p.open("rb") as fh:
+                data = yaml.safe_load(fh) or {}
+        except (OSError, yaml.YAMLError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        metadata: dict[str, dict] = {}
+        for spec in (data.get("hosts") or {}).values():
+            if not isinstance(spec, dict) or spec.get("asset_id") is None:
+                continue
+            fields = {
+                k: spec[k] for k in ("env_setup", "workdir", "platform") if spec.get(k) is not None
+            }
+            if fields:
+                metadata[str(spec["asset_id"])] = fields
+        return metadata
+
     @classmethod
     def load(cls, path: str | Path | None = None) -> Inventory:
         p = inventory_path(path)

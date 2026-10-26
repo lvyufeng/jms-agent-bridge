@@ -150,6 +150,7 @@ class AssetCatalog:
 
     def _build(self, snapshot):
         hosts, selectors, name_counts, address_counts, excluded = {}, {}, {}, {}, {}
+        metadata = Inventory.asset_metadata()
         for asset in snapshot["assets"]:
             name_counts[asset["name"]] = name_counts.get(asset["name"], 0) + 1
             address_counts[asset["address"]] = address_counts.get(asset["address"], 0) + 1
@@ -167,13 +168,19 @@ class AssetCatalog:
                 continue
             login, account = asset["login"], asset["account"]
             # UUIDs are canonical, so display names can never overwrite a target.
+            # `hosts.yaml` supplements the machine's own settings (env_setup, workdir,
+            # platform) keyed by the asset_id both sides share; it never decides
+            # reachability, which stays the REST snapshot's call.
+            meta = metadata.get(asset_id) or {}
             hosts[asset_id] = Host(
                 name=asset_id,
                 login=login,
                 account=account,
                 asset_id=asset_id,
                 address=asset["address"],
-                platform="generic",
+                platform=meta.get("platform", "generic"),
+                env_setup=meta.get("env_setup"),
+                workdir=meta.get("workdir"),
             )
             for label, counts in [(asset["name"], name_counts), (asset["address"], address_counts)]:
                 if label and label not in ("all", "*") and counts[label] == 1:
