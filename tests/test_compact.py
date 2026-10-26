@@ -435,3 +435,49 @@ def test_compact_cli_dispatch(monkeypatch):
     assert calls == [{"transport": "streamable-http", "port": 8767}]
     assert cli.main(["serve", "--transport", "streamable-http"]) == 2
     assert cli.main(["serve", "--compact", "--port", "0"]) == 2
+
+
+async def test_no_targets_names_an_unresolved_account(cfg, tmp_path):
+    """Every asset offering several accounts and no `preferred_account` yields zero targets.
+
+    The assets are all present and every selector matches nothing, so the reply has to
+    name the real cause instead of leaving the reader hunting for a bad selector.
+    """
+    manifest = [asset(accounts=["root", "secure"], account=None) for _ in range(3)]
+    maybe_ambiguous = AssetCatalog(cfg, BridgeSettings(state_dir=tmp_path))
+    maybe_ambiguous._fetch = AsyncMock(return_value=manifest)
+    assert (await maybe_ambiguous.refresh())["ok"]
+    assert maybe_ambiguous.status()["assets"] == 3
+    assert maybe_ambiguous.status()["ssh_targets"] == 0
+    why = maybe_ambiguous.explain_no_targets()
+    assert "bridge.preferred_account" in why and "(typically 2)" in why
+
+    service = BridgeService(cfg, BridgeSettings(state_dir=tmp_path / "svc"))
+    service.catalog._fetch = AsyncMock(return_value=manifest)
+    await service.catalog.refresh()
+    try:
+        with pytest.raises(ValueError, match="no permitted SSH assets.*preferred_account"):
+            await service.run(["all"], script="true")
+    finally:
+        await service.runner.close()
+
+
+async def test_no_targets_distinguishes_the_other_causes(cfg, tmp_path):
+    configured = AssetCatalog(cfg, BridgeSettings(state_dir=tmp_path, preferred_account="root"))
+    configured._fetch = AsyncMock(
+        return_value=[asset(accounts=["ubuntu"], account=None)]  # `root` is not permitted
+    )
+    await configured.refresh()
+    assert "which none of these assets permits" in configured.explain_no_targets()
+
+    no_ssh = AssetCatalog(cfg, BridgeSettings(state_dir=tmp_path / "b", preferred_account="root"))
+    no_ssh._fetch = AsyncMock(return_value=[asset(protocols=["sftp"])])
+    await no_ssh.refresh()
+    assert "none is active with an SSH protocol" in no_ssh.explain_no_targets()
+
+
+async def test_no_targets_is_silent_when_targets_exist(service):
+    """A bad selector on a healthy snapshot gets the plain message, with no diagnosis."""
+    assert service.catalog.explain_no_targets() is None
+    with pytest.raises(InventoryError, match="not in the REST snapshot"):
+        await service.run(["no-such-host"], script="true")

@@ -75,6 +75,46 @@ class AssetCatalog:
             )
         return api
 
+    def explain_no_targets(self) -> str | None:
+        """Why the snapshot has assets but no SSH target, when that is the cause.
+
+        ``run`` reports "no permitted SSH assets matched the targets" for any empty
+        match, but the most common reason in a fresh deployment is not the selector:
+        every asset offers several permitted accounts, ``preferred_account`` is unset,
+        and the account is deliberately left unresolved — an ambiguity the snapshot
+        refuses to guess. The assets are all there and every selector matches nothing,
+        so the generic message sends the reader looking in the wrong place.
+        """
+        if self.inventory.hosts or not self.snapshot["assets"]:
+            return None
+        ssh = [a for a in self.snapshot["assets"] if a["active"] and "ssh" in a["protocols"]]
+        if not ssh:
+            return (
+                f"{len(self.snapshot['assets'])} assets are visible, but none is active with "
+                "an SSH protocol permitted; check the asset/protocol permissions."
+            )
+        accounts = {a["account"] for a in ssh}
+        if accounts == {None}:
+            hint = (
+                "set bridge.preferred_account in config.toml to one the assets permit "
+                "(for example \"root\")"
+                if not self.settings.preferred_account
+                else (
+                    f"bridge.preferred_account is {self.settings.preferred_account!r}, which "
+                    "none of these assets permits"
+                )
+            )
+            offered = sorted(
+                {len([x for x in a["accounts"] if x]) for a in ssh if a.get("accounts")}
+            )
+            plural = f" (typically {offered[0]})" if offered else ""
+            return (
+                f"{len(ssh)} active SSH assets are visible, but every one offers several "
+                f"permitted accounts{plural} and no account is selected, so none becomes a "
+                f"target: {hint}."
+            )
+        return None
+
     def status(self):
         refreshed = self.snapshot["refreshed_at"]
         return {

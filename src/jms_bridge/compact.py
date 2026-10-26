@@ -197,7 +197,10 @@ class BridgeService:
         inventory = await self.catalog.ensure()
         hosts = inventory.resolve(targets)
         if not hosts:
-            raise ValueError("no permitted SSH assets matched the targets")
+            raise ValueError(
+                "no permitted SSH assets matched the targets"
+                + (f" — {why}" if (why := self.catalog.explain_no_targets()) else "")
+            )
 
         async def one(host):
             return await self.runner.execute_to_store(

@@ -150,5 +150,53 @@ dsh Cordis patch:
         toolCallTimeoutMs: 900000
 ```
 
+Claude Code (`.mcp.json` in the project, or `mcpServers` in `~/.claude.json`):
+
+```json
+{
+  "mcpServers": {
+    "jms-bridge": {
+      "type": "http",
+      "url": "http://127.0.0.1:8766/mcp"
+    }
+  }
+}
+```
+
+For a stdio client that should own its own process instead of sharing the resident
+endpoint, drop `type`/`url` and use a command — but give each such process its own
+`bridge.state_dir`, because one process owns one state directory:
+
+```json
+{
+  "mcpServers": {
+    "jms-bridge": {
+      "command": "jms-bridge",
+      "args": ["serve", "--compact"]
+    }
+  }
+}
+```
+
+All three clients negotiate MCP `2025-11-25` and see the same four tools, so a
+single resident endpoint can serve them concurrently.
+
+### Accounts must be unambiguous
+
+The REST snapshot builds SSH targets only from assets whose account is resolved: a
+`preferred_account` that the asset actually permits, or exactly one available
+account. An asset with neither is listed but is **not** a target, and `run` then
+fails with `no permitted SSH assets matched the targets`. Many deployments give
+every asset both `root` and a second account, so without `preferred_account` every
+asset drops out and the snapshot reports `0 SSH targets`. Set it in `config.toml`:
+
+```toml
+[bridge]
+preferred_account = "root"
+```
+
+`discover(topic="status")` reports `ssh_targets`; if it is `0` while `assets` is
+not, this is the cause.
+
 Reload the client's MCP connection after changing the tool surface.
 An optional agent skill is in `examples/skills/jumpserver-access/SKILL.md`.
