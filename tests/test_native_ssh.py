@@ -434,3 +434,41 @@ async def test_jms_exec_keeps_the_legacy_contract(loopback):
     )
     assert refused["data"]["ok"] is False
     assert "denylist" in refused["data"]["error"]
+
+
+def test_rsync_binary_is_resolved_through_path(monkeypatch):
+    """The transfer must not pin /usr/bin/rsync.
+
+    Pinning it bypasses an rsync the user installed with brew/conda and, on macOS,
+    lands on openrsync — which rejects `-s` with a bare "invalid option". Resolving
+    through PATH is what lets an installed rsync 3.x actually be used.
+    """
+    import inspect
+
+    from jms_bridge import native_ssh
+
+    source = inspect.getsource(native_ssh.NativeSSHRunner.rsync)
+    assert '"/usr/bin/rsync"' not in source
+    assert 'argv = ["rsync", "-azs"' in source, "-s is required, see the comment"
+
+    # And the guard names the real problem instead of letting rsync fail opaquely.
+    monkeypatch.setattr(native_ssh.shutil, "which", lambda _: "/usr/bin/rsync")
+    monkeypatch.setitem(
+        native_ssh._RSYNC_CAPABLE,
+        "/usr/bin/rsync",
+        False,
+    )
+    problem = native_ssh._rsync_problem()
+    assert "openrsync" in problem and "--protect-args" in problem
+    assert "brew install rsync" in problem
+
+
+def test_rsync_problem_is_silent_for_a_capable_binary(monkeypatch):
+    from jms_bridge import native_ssh
+
+    monkeypatch.setattr(native_ssh.shutil, "which", lambda _: "/opt/homebrew/bin/rsync")
+    monkeypatch.setitem(native_ssh._RSYNC_CAPABLE, "/opt/homebrew/bin/rsync", True)
+    assert native_ssh._rsync_problem() is None
+
+    monkeypatch.setattr(native_ssh.shutil, "which", lambda _: None)
+    assert "not installed" in native_ssh._rsync_problem()

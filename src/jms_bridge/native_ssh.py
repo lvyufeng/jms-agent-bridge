@@ -8,6 +8,8 @@ import logging
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -21,6 +23,41 @@ from .config import ConfigError
 from .results import atomic_json
 from .scheduling import ExecutionSlots, QueueTimeout, Timings
 from .ssh import ExecResult
+
+#: Cache of ``shutil.which("rsync")`` -> whether that binary accepts ``-s``.
+_RSYNC_CAPABLE: dict[str | None, bool] = {}
+
+
+def _rsync_problem() -> str | None:
+    """Why the local rsync cannot serve a compact transfer, or ``None`` if it can.
+
+    The transfer needs ``--protect-args`` because the relay re-joins the argument
+    vector into a command string for the remote side, so a path with a space would
+    otherwise be split by the remote shell. macOS ships **openrsync** at
+    ``/usr/bin/rsync``, which does not implement ``-s`` and reports the opaque
+    ``invalid option -- s``; the user usually has a real rsync elsewhere. Saying so
+    here turns a confusing failure into an install instruction.
+    """
+    binary = shutil.which("rsync")
+    if binary is None:
+        return "rsync is not installed on this machine; install it (brew/apt install rsync)"
+    if binary not in _RSYNC_CAPABLE:
+        try:
+            probe = subprocess.run(
+                [binary, "--version"], capture_output=True, text=True, timeout=10, check=False
+            )
+            # openrsync prints "openrsync: protocol version 29" and claims only
+            # 2.6.9 compatibility, so the name is the reliable signal, not a version.
+            _RSYNC_CAPABLE[binary] = "openrsync" not in probe.stdout.lower()
+        except (OSError, subprocess.SubprocessError):
+            _RSYNC_CAPABLE[binary] = False
+    if not _RSYNC_CAPABLE[binary]:
+        return (
+            f"{binary} is openrsync, which does not support --protect-args (-s) needed "
+            "for remote paths containing spaces; install GNU rsync (brew install rsync) "
+            "and make sure it comes first on PATH"
+        )
+    return None
 
 
 class ConnectionTimings(asyncssh.SSHClient):
@@ -751,6 +788,8 @@ class NativeSSHRunner:
         """Keep rsync semantics while its SSH stream uses our authenticated connection."""
         if container and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", container):
             raise ValueError("invalid existing container name/ID")
+        if problem := _rsync_problem():
+            raise ConfigError(problem)
         result_id = await self.store.acreate(
             kind="transfer", host=host.name, asset_id=host.asset_id, lane="general"
         )
@@ -855,7 +894,19 @@ class NativeSSHRunner:
                                 str(Path(__file__).with_name("rsync_relay.py")),
                                 socket_path,
                             ]
-                            argv = ["/usr/bin/rsync", "-azs", "-e", shlex.join(bridge)]
+                            # Resolve through PATH rather than pinning /usr/bin/rsync:
+                            # the pinned path bypasses an rsync the user installed with
+                            # brew/conda and, on macOS, lands on openrsync, which rejects
+                            # `-s` outright.
+                            #
+                            # `-s` (--protect-args) is required, not optional: the relay
+                            # hands the arguments to the remote side as a `shlex.join`ed
+                            # command string, so the remote shell *does* split them. Without
+                            # `-s` a path containing a space is rejected with "rejecting
+                            # unrequested file-list name". openrsync therefore cannot work
+                            # here at all — checked with `rsync_supports_protect_args`
+                            # below so the failure names the real problem.
+                            argv = ["rsync", "-azs", "-e", shlex.join(bridge)]
                             if not overwrite:
                                 argv.append("--ignore-existing")
                             argv.append("--itemize-changes")
