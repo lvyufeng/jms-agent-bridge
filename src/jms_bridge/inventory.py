@@ -32,6 +32,7 @@ Example ``~/.config/jms-bridge/hosts.yaml``::
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -197,39 +198,79 @@ class Inventory:
         return list(picked.values())
 
     @staticmethod
-    def asset_metadata(path: str | Path | None = None) -> dict[str, dict]:
-        """Per-asset settings from ``hosts.yaml``, keyed by ``asset_id``.
+    def asset_metadata(
+        path: str | Path | None = None, *, warnings: list[str] | None = None
+    ) -> dict[str, dict]:
+        """Validated optional machine settings, joined to REST assets by UUID.
 
-        The REST snapshot decides **which** assets are reachable targets, because that
-        is the authority on permission. It cannot describe the machine itself: JumpServer
-        exposes neither ``env_setup`` nor ``workdir``, so an asset reached over REST runs
-        with no environment and no working directory. ``hosts.yaml`` already carries
-        those fields per asset, and ``asset_id`` is the stable key both sides share, so
-        this reads them back without letting the file grant access it does not have.
-
-        Deliberately tolerant: the file is optional here (a REST-only deployment has
-        none), and a malformed one must not take down inventory refresh — the metadata
-        is an enhancement, so failures degrade to "no metadata" rather than raising.
+        Missing files are normal for REST-only deployments. Invalid files/fields
+        are ignored with optional diagnostics; valid fields remain usable. Never
+        copy connection/authorization fields or echo configuration values in a
+        warning: scripts and even invalid field values may contain credentials.
         """
+
+        def warn(message):
+            if warnings is not None:
+                warnings.append(message)
+
         p = inventory_path(path)
-        if not p.exists():
-            return {}
         try:
             with p.open("rb") as fh:
-                data = yaml.safe_load(fh) or {}
-        except (OSError, yaml.YAMLError):
+                data = yaml.safe_load(fh)
+        except FileNotFoundError:
+            return {}
+        except (OSError, yaml.YAMLError, UnicodeError) as exc:
+            warn(f"hosts.yaml metadata could not be read ({type(exc).__name__}); overlay ignored")
+            return {}
+        if data is None:
             return {}
         if not isinstance(data, dict):
+            warn("hosts.yaml must be a mapping; metadata overlay ignored")
+            return {}
+        hosts = data.get("hosts")
+        if hosts is None:
+            return {}
+        if not isinstance(hosts, dict):
+            warn("hosts.yaml hosts must be a mapping; metadata overlay ignored")
             return {}
         metadata: dict[str, dict] = {}
-        for spec in (data.get("hosts") or {}).values():
-            if not isinstance(spec, dict) or spec.get("asset_id") is None:
+        seen, duplicates = set(), set()
+        for index, spec in enumerate(hosts.values(), 1):
+            context = f"hosts.yaml entry #{index}"
+            if spec is None:
                 continue
+            if not isinstance(spec, dict):
+                warn(f"{context} must be a mapping; entry ignored")
+                continue
+            # Entries without overlay fields can remain normal legacy/direct-SSH
+            # entries. Only metadata intended for a REST asset needs a UUID join.
             fields = {
                 k: spec[k] for k in ("env_setup", "workdir", "platform") if spec.get(k) is not None
             }
-            if fields:
-                metadata[str(spec["asset_id"])] = fields
+            if not fields:
+                continue
+            try:
+                asset_id = str(uuid.UUID(spec["asset_id"]))
+            except (KeyError, ValueError, TypeError, AttributeError):
+                warn(f"{context} needs a valid asset_id UUID; metadata ignored")
+                continue
+            if asset_id in seen:
+                metadata.pop(asset_id, None)
+                if asset_id not in duplicates:
+                    warn(f"{context} has a duplicate asset_id; all metadata for this asset ignored")
+                    duplicates.add(asset_id)
+                continue
+            seen.add(asset_id)
+            validated = {}
+            for name, value in fields.items():
+                if not isinstance(value, str) or "\x00" in value:
+                    warn(f"{context}.{name} must be a string without NUL; field ignored")
+                elif name == "platform" and value not in PLATFORMS:
+                    warn(f"{context}.platform is not a supported platform key; field ignored")
+                else:
+                    validated[name] = value
+            if validated:
+                metadata[asset_id] = validated
         return metadata
 
     @classmethod
