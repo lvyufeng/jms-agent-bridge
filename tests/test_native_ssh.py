@@ -436,39 +436,61 @@ async def test_jms_exec_keeps_the_legacy_contract(loopback):
     assert "denylist" in refused["data"]["error"]
 
 
-def test_rsync_binary_is_resolved_through_path(monkeypatch):
-    """The transfer must not pin /usr/bin/rsync.
-
-    Pinning it bypasses an rsync the user installed with brew/conda and, on macOS,
-    lands on openrsync — which rejects `-s` with a bare "invalid option". Resolving
-    through PATH is what lets an installed rsync 3.x actually be used.
-    """
-    import inspect
-
+async def test_rsync_executes_the_validated_binary_even_if_path_changes(loopback, monkeypatch):
     from jms_bridge import native_ssh
 
-    source = inspect.getsource(native_ssh.NativeSSHRunner.rsync)
-    assert '"/usr/bin/rsync"' not in source
-    assert 'argv = ["rsync", "-azs"' in source, "-s is required, see the comment"
+    t = loopback
+    binary = str(t.root / "validated rsync")
+    monkeypatch.setattr(t.runner._rsync_binary, "resolve", AsyncMock(return_value=binary))
 
-    # And the guard names the real problem instead of letting rsync fail opaquely.
-    monkeypatch.setattr(native_ssh.shutil, "which", lambda _: "/usr/bin/rsync")
-    monkeypatch.setitem(
-        native_ssh._RSYNC_CAPABLE,
-        "/usr/bin/rsync",
-        False,
+    async def connect(host):
+        monkeypatch.setenv("PATH", "/changed/after/preflight")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(t.runner, "connection", connect)
+    spawn = AsyncMock(side_effect=OSError("stop before transfer"))
+    monkeypatch.setattr(native_ssh.asyncio, "create_subprocess_exec", spawn)
+    result = await t.runner.rsync(t.host, "/local source", "/remote destination")
+    assert not result.ok
+    argv = spawn.call_args.args
+    assert argv[0] == binary
+    assert argv[1] == "-azs"
+    assert "--itemize-changes" in argv and "--" in argv
+    assert argv[-2:] == ("/local source", f"{t.host.asset_id}:/remote destination")
+    assert spawn.call_args.kwargs["start_new_session"] is True
+
+
+async def test_rsync_preflight_failure_creates_no_result_or_ssh_connection(loopback, monkeypatch):
+    t = loopback
+    monkeypatch.setattr(
+        t.runner._rsync_binary,
+        "resolve",
+        AsyncMock(side_effect=ConfigError("local rsync capability check failed")),
     )
-    problem = native_ssh._rsync_problem()
-    assert "openrsync" in problem and "--protect-args" in problem
-    assert "brew install rsync" in problem
+    connection = AsyncMock()
+    monkeypatch.setattr(t.runner, "connection", connection)
+    with pytest.raises(ConfigError, match="capability check failed"):
+        await t.runner.rsync(t.host, "/local", "/remote")
+    connection.assert_not_awaited()
+    assert not list(t.runner.store.root.iterdir())
+    assert sum(t.runner.scheduler.active.values()) == 0
 
 
-def test_rsync_problem_is_silent_for_a_capable_binary(monkeypatch):
-    from jms_bridge import native_ssh
+async def test_rsync_cancel_during_preflight_does_not_start_transfer(loopback, monkeypatch):
+    t = loopback
+    started = asyncio.Event()
 
-    monkeypatch.setattr(native_ssh.shutil, "which", lambda _: "/opt/homebrew/bin/rsync")
-    monkeypatch.setitem(native_ssh._RSYNC_CAPABLE, "/opt/homebrew/bin/rsync", True)
-    assert native_ssh._rsync_problem() is None
+    async def pending_probe():
+        started.set()
+        await asyncio.Event().wait()
 
-    monkeypatch.setattr(native_ssh.shutil, "which", lambda _: None)
-    assert "not installed" in native_ssh._rsync_problem()
+    monkeypatch.setattr(t.runner._rsync_binary, "resolve", pending_probe)
+    connection = AsyncMock()
+    monkeypatch.setattr(t.runner, "connection", connection)
+    task = asyncio.create_task(t.runner.rsync(t.host, "/local", "/remote"))
+    await asyncio.wait_for(started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    connection.assert_not_awaited()
+    assert not list(t.runner.store.root.iterdir())
