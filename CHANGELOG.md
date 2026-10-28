@@ -66,6 +66,12 @@
 
 ### Fixed
 
+- **Compact transfers use the installed rsync instead of pinning `/usr/bin/rsync`.**
+  Resolve `PATH`, verify `-s --version` without blocking other MCP calls, and execute
+  that same binary. Missing/incompatible binaries and failed probes have distinct
+  errors; only unchanged successful checks are cached, so an upgrade or retry does
+  not require restarting the service. The required `-s` path protection is retained.
+
 - **A self-review of the fixes above found three of them half-done.** Each was a case of
   the right intent applied inconsistently, so the corrections are recorded rather than
   quietly folded in:

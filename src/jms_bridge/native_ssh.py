@@ -19,6 +19,7 @@ import asyncssh
 from .async_io import offload
 from .config import ConfigError
 from .results import atomic_json
+from .rsync_binary import RsyncBinary
 from .scheduling import ExecutionSlots, QueueTimeout, Timings
 from .ssh import ExecResult
 
@@ -132,6 +133,7 @@ class ShellSession:
 class NativeSSHRunner:
     def __init__(self, cfg, settings, *, store):
         self.cfg, self.settings, self.store = cfg, settings, store
+        self._rsync_binary = RsyncBinary()
         limit = settings.execution_limit or cfg.max_parallel
         reserved = settings.inspection_reserved
         self.scheduler = ExecutionSlots(limit, reserved)
@@ -751,6 +753,7 @@ class NativeSSHRunner:
         """Keep rsync semantics while its SSH stream uses our authenticated connection."""
         if container and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", container):
             raise ValueError("invalid existing container name/ID")
+        binary = await self._rsync_binary.resolve()
         result_id = await self.store.acreate(
             kind="transfer", host=host.name, asset_id=host.asset_id, lane="general"
         )
@@ -855,7 +858,11 @@ class NativeSSHRunner:
                                 str(Path(__file__).with_name("rsync_relay.py")),
                                 socket_path,
                             ]
-                            argv = ["/usr/bin/rsync", "-azs", "-e", shlex.join(bridge)]
+                            # Use the exact executable which passed local preflight.
+                            # `-s` sends remote paths through rsync's protocol, avoiding
+                            # rsync's legacy shell escaping being quoted again by the
+                            # relay. Keep it for spaces and other literal path bytes.
+                            argv = [binary, "-azs", "-e", shlex.join(bridge)]
                             if not overwrite:
                                 argv.append("--ignore-existing")
                             argv.append("--itemize-changes")

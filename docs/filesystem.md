@@ -97,6 +97,19 @@ folder. Parent destinations must exist. Host/container transfers need `rsync`
 in the selected remote environment; unsupported/missing binaries return an error
 without installing software or switching channels.
 
+The MCP server machine also needs rsync 3.x with `--protect-args` (`-s`). On macOS,
+install it with `brew install rsync` and put Homebrew's binary first on `PATH`;
+the system openrsync does not support this option. Compact transfers resolve
+`PATH`, check `-s --version` off the event loop with a 3-second probe timeout, and
+execute the same resolved binary. Remote paths are sent through rsync's protocol;
+the relay's shell quoting is not a replacement for `-s`.
+
+Only successful checks are cached per SSH runner. Concurrent cold calls share a
+check; a changed binary or `PATH` triggers a new check, and failures can be retried
+without restarting the service. A failed or cancelled preflight starts no SSH
+transfer and creates no transfer result. The separate remote rsync requirement
+still applies; a successful local check does not validate the remote installation.
+
 Transfers use the resident SSH connection and the existing concurrency queue.
 `overwrite=false` skips existing destination files; it does not assert equality
 with skipped files and directory metadata may still synchronize. Use

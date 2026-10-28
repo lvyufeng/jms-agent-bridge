@@ -268,7 +268,14 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(
                 self.runner.rsync(self.host, "/unused/local", "/unused/remote")
             )
-            await asyncio.sleep(0.01)
+            for _ in range(200):
+                if self.runner.scheduler.status()["queued"]["general"]:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                self.fail("transfer never reached the execution queue")
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task

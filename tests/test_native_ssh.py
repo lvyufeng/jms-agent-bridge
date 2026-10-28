@@ -434,3 +434,63 @@ async def test_jms_exec_keeps_the_legacy_contract(loopback):
     )
     assert refused["data"]["ok"] is False
     assert "denylist" in refused["data"]["error"]
+
+
+async def test_rsync_executes_the_validated_binary_even_if_path_changes(loopback, monkeypatch):
+    from jms_bridge import native_ssh
+
+    t = loopback
+    binary = str(t.root / "validated rsync")
+    monkeypatch.setattr(t.runner._rsync_binary, "resolve", AsyncMock(return_value=binary))
+
+    async def connect(host):
+        monkeypatch.setenv("PATH", "/changed/after/preflight")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(t.runner, "connection", connect)
+    spawn = AsyncMock(side_effect=OSError("stop before transfer"))
+    monkeypatch.setattr(native_ssh.asyncio, "create_subprocess_exec", spawn)
+    result = await t.runner.rsync(t.host, "/local source", "/remote destination")
+    assert not result.ok
+    argv = spawn.call_args.args
+    assert argv[0] == binary
+    assert argv[1] == "-azs"
+    assert "--itemize-changes" in argv and "--" in argv
+    assert argv[-2:] == ("/local source", f"{t.host.asset_id}:/remote destination")
+    assert spawn.call_args.kwargs["start_new_session"] is True
+
+
+async def test_rsync_preflight_failure_creates_no_result_or_ssh_connection(loopback, monkeypatch):
+    t = loopback
+    monkeypatch.setattr(
+        t.runner._rsync_binary,
+        "resolve",
+        AsyncMock(side_effect=ConfigError("local rsync capability check failed")),
+    )
+    connection = AsyncMock()
+    monkeypatch.setattr(t.runner, "connection", connection)
+    with pytest.raises(ConfigError, match="capability check failed"):
+        await t.runner.rsync(t.host, "/local", "/remote")
+    connection.assert_not_awaited()
+    assert not list(t.runner.store.root.iterdir())
+    assert sum(t.runner.scheduler.active.values()) == 0
+
+
+async def test_rsync_cancel_during_preflight_does_not_start_transfer(loopback, monkeypatch):
+    t = loopback
+    started = asyncio.Event()
+
+    async def pending_probe():
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(t.runner._rsync_binary, "resolve", pending_probe)
+    connection = AsyncMock()
+    monkeypatch.setattr(t.runner, "connection", connection)
+    task = asyncio.create_task(t.runner.rsync(t.host, "/local", "/remote"))
+    await asyncio.wait_for(started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    connection.assert_not_awaited()
+    assert not list(t.runner.store.root.iterdir())
