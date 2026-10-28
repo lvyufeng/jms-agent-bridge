@@ -659,20 +659,19 @@ class NativeSSHRunner:
             self.performance_log(meta)
         return meta
 
-    async def exec_on(self, host, command, *, timeout=60, workdir=True, env_setup=True):
-        from .inventory import wrap_command
-
-        script = wrap_command(
-            host.env_setup if env_setup else None, host.workdir if workdir else None, command
-        )
-        meta = await self.execute_to_store(host, script, timeout, wrapped=True)
+    async def _stored_result(self, host, meta, *, preview_only):
+        """Materialize either full parser input or a bounded presentation snapshot."""
         result_id = meta["result_id"]
-        out, err = await offload(
-            lambda: (
-                self.store.path(result_id, "stdout").read_bytes(),
-                self.store.path(result_id, "stderr").read_bytes(),
+        if preview_only:
+            preview = await offload(self.store.preview_snapshot, result_id)
+            out, err = preview.stdout_head, preview.stderr_head
+        else:
+            out, err = await offload(
+                lambda: (
+                    self.store.path(result_id, "stdout").read_bytes(),
+                    self.store.path(result_id, "stderr").read_bytes(),
+                )
             )
-        )
         result = ExecResult(
             host.name,
             meta["exit_code"],
@@ -680,13 +679,30 @@ class NativeSSHRunner:
             err.decode(errors="replace"),
             meta["timed_out"],
         )
-        result._bridge_output = (out, err)
+        if preview_only:
+            result.output_preview = preview
+        # Full parser inputs keep decoded strings only, not a second full raw copy.
         result.result_id = result_id
         return result
 
-    async def exec_many(self, hosts, command, *, timeout=60):
+    async def exec_on(
+        self, host, command, *, timeout=60, workdir=True, env_setup=True, preview_only=False
+    ):
+        """Full output by default; presentation-only callers explicitly opt in."""
+        from .inventory import wrap_command
+
+        script = wrap_command(
+            host.env_setup if env_setup else None, host.workdir if workdir else None, command
+        )
+        meta = await self.execute_to_store(host, script, timeout, wrapped=True)
+        return await self._stored_result(host, meta, preview_only=preview_only)
+
+    async def exec_many(self, hosts, command, *, timeout=60, preview_only=False):
+        options = {"preview_only": True} if preview_only else {}
         return list(
-            await asyncio.gather(*(self.exec_on(host, command, timeout=timeout) for host in hosts))
+            await asyncio.gather(
+                *(self.exec_on(host, command, timeout=timeout, **options) for host in hosts)
+            )
         )
 
     async def close_session(self, host, session_id, *, _internal=False):
@@ -749,8 +765,9 @@ class NativeSSHRunner:
         timeout=900,
         container=None,
         overwrite=True,
+        preview_only=True,
     ):
-        """Keep rsync semantics while its SSH stream uses our authenticated connection."""
+        """Transfer logs stay on disk; replies use bounded snapshots by default."""
         if container and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", container):
             raise ValueError("invalid existing container name/ID")
         binary = await self._rsync_binary.resolve()
@@ -934,10 +951,4 @@ class NativeSSHRunner:
                 else ("unknown" if transfer_sent else "not_started"),
             )
             self.performance_log(meta)
-        out, err = await offload(lambda: (out_path.read_bytes(), err_path.read_bytes()))
-        result = ExecResult(
-            host.name, code, out.decode(errors="replace"), err.decode(errors="replace"), timed_out
-        )
-        result._bridge_output = (out, err)
-        result.result_id = result_id
-        return result
+        return await self._stored_result(host, meta, preview_only=preview_only)

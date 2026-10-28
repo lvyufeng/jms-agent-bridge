@@ -25,9 +25,13 @@ import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import BastionConfig, ConfigError
 from .inventory import Host, InventoryError, wrap_command
+
+if TYPE_CHECKING:
+    from .results import OutputPreview
 
 #: Echoed by a data-plane reachability check and required back in the reply. KoKo
 #: rejects a connection (no permission, asset offline, bad address) with ssh **exit
@@ -145,6 +149,15 @@ class ExecResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    output_preview: OutputPreview | None = None
+
+    @property
+    def stdout_truncated(self):
+        return self.output_preview is not None and self.output_preview.stdout_truncated
+
+    @property
+    def stderr_truncated(self):
+        return self.output_preview is not None and self.output_preview.stderr_truncated
 
     @property
     def ok(self) -> bool:
@@ -162,6 +175,27 @@ class ExecResult:
         `stdout_truncated` / `stderr_truncated` say whether a preview is partial, so a
         clipped stream can never be mistaken for a complete one.
         """
+        if self.output_preview is not None:
+            # This legacy serializer intentionally retains stdout-first prefixes;
+            # compact diagnostics use OutputPreview.compact's reserved error tail.
+            preview = self.output_preview
+            raw_out, raw_err = preview.stdout_head, preview.stderr_head
+            shown_out = raw_out[:max(0, limit)]
+            shown_err = raw_err[:max(0, limit - len(shown_out))]
+            sizes = preview.sizes
+            return {
+                "host": self.host,
+                "ok": self.ok,
+                "exit_code": self.exit_code,
+                "timed_out": self.timed_out,
+                "stdout": shown_out.decode(errors="replace"),
+                "stderr": shown_err.decode(errors="replace"),
+                "stdout_bytes": sizes.get("stdout", 0),
+                "stderr_bytes": sizes.get("stderr", 0),
+                "stdout_truncated": sizes.get("stdout", 0) > len(shown_out),
+                "stderr_truncated": sizes.get("stderr", 0) > len(shown_err),
+                "result_id": self.result_id,
+            }
         out, out_len = _clip(self.stdout, limit)
         # Give stderr what stdout did not use, so the two together stay within `limit`.
         remaining = max(0, limit - len(out))

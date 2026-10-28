@@ -134,6 +134,22 @@ protected; old orphan outputs from a prior service expire from creation time.
 Cleanup never removes remote source files or job directories. Request receipts
 are stored separately and retained so output expiry never enables re-execution.
 
+Compact `jms_exec` and native transfer replies do not reload complete log files
+into memory. They cache at most 16 KiB of stdout's prefix and each end of stderr;
+compact replies still share their existing 4096-byte head/stdout, tail/stderr budget.
+The bounded snapshots report truncation from the true on-disk byte counts. Read
+`result_id` with `read_result` to access all bytes/pages; non-UTF-8 bytes are never
+re-encoded back into the stored logs. Preview reads run off the event loop.
+
+Internal `NativeSSHRunner.exec_on` / `exec_many` keep full parser input by default;
+presentation-only callers explicitly use `preview_only=True`. Native `rsync`
+defaults to bounded previews, with `preview_only=False` available for internal full
+output consumers. Legacy short error summaries keep stderr's prefix, while compact
+fan-out diagnostics retain its tail. Full parser results no longer retain a second
+complete raw-byte copy. Job log paging, launcher acknowledgments, probe sections,
+pytest/attestation and workspace parsing remain full-input paths; this is not a
+claim that every parser is memory-bounded. The legacy OpenSSH runner is unchanged.
+
 Set a unique `request_id` on `run` or on
 `call(operation="jms_submit_job", arguments={...}, request_id="...")` before
 starting important work. After a lost response, discover/call `request_status`
