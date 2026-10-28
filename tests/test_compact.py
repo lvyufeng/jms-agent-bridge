@@ -21,6 +21,11 @@ from jms_bridge.results import ResultStore
 from jms_bridge.runtime_config import BridgeSettings, default_state_dir, load_settings
 
 
+@pytest.fixture(autouse=True)
+def isolated_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("JMS_BRIDGE_INVENTORY", str(tmp_path / "optional-hosts.yaml"))
+
+
 @pytest.fixture
 def settings(tmp_path):
     return BridgeSettings(state_dir=tmp_path, preferred_account="root")

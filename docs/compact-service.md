@@ -94,6 +94,32 @@ Background refresh runs hourly even when idle; retries after failure are bounded
 An unavailable API does not prevent MCP initialization or status inspection.
 No password login or credential-renewal behavior is added by compact mode.
 
+Optional `hosts.yaml` metadata supplies only `env_setup`, `workdir`, and `platform`,
+joined by canonical `asset_id` UUID. It cannot add permitted assets or override
+REST login/accounts. A missing or empty file is normal. A malformed mapping or
+unreadable YAML is ignored; invalid fields are skipped while other valid fields
+remain usable. Shell fields must be strings without NUL (empty strings are allowed),
+and `platform` must be a supported key; invalid platforms fall back to `generic`.
+Repeated UUIDs with overlay fields are ambiguous, so their overlays are all ignored.
+
+`discover(topic="status")`, asset search and `jms_inventory_reload` report up to
+five `metadata_warnings`, with `metadata_warning_count` and
+`metadata_warnings_truncated`. Diagnostics use one-based host entry positions and
+field names, never configuration values, host keys, file paths or raw parser errors.
+Fix the file and refresh to clear warnings. Metadata warnings do not mark REST
+refresh as failed; failure retains the last published metadata and its warnings.
+
+Refresh reads/parses metadata, builds selectors and writes/fsyncs the cache in a
+worker thread. The new snapshot, metadata and warnings are published together only
+after success; status and existing targets remain available during disk work.
+Calls with an existing snapshot do not queue behind an in-progress refresh, even
+when the snapshot is stale; freshness remains visible in inventory status and
+execution replies. The first refresh must still finish before targets are usable.
+Cancellation waits for outstanding disk work before releasing the refresh lock and
+keeps the old in-memory view. A complete newer cache may already be on disk and is
+eligible for normal cache recovery after restart. Cache recovery during service
+construction remains synchronous. No command or request is replayed by refresh.
+
 ## Output and shell semantics
 
 Every execution gets private `meta.json`, `stdout.log`, and `stderr.log` files;

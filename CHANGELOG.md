@@ -66,6 +66,16 @@
 
 ### Fixed
 
+- **Optional metadata errors no longer break REST asset discovery or hide silently.**
+  Validate host mappings, UUID joins, shell-field types and platform keys, retain
+  valid fields, and expose bounded value-free warnings in inventory status. Duplicate
+  overlay UUIDs are ignored rather than choosing an order-dependent configuration.
+  REST permissions and login/account selection remain authoritative.
+- **Resident inventory refresh no longer performs metadata/durable cache I/O on the
+  event loop.** Build and fsync off-loop, then publish the complete snapshot and its
+  diagnostics together. Failed/cancelled refreshes retain the previous in-memory
+  view; cancellation waits for outstanding disk work before releasing the lock.
+
 - **Compact transfers use the installed rsync instead of pinning `/usr/bin/rsync`.**
   Resolve `PATH`, verify `-s --version` without blocking other MCP calls, and execute
   that same binary. Missing/incompatible binaries and failed probes have distinct

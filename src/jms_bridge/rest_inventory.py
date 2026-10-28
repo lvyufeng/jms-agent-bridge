@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from .api import JumpServerAPI, JumpServerError
+from .async_io import offload
 from .inventory import Host, Inventory, InventoryError
 from .results import atomic_json
 
@@ -27,6 +28,7 @@ class RESTInventory(Inventory):
     #: id. A name can be shown by ``discover`` and still be unusable, so "not in the
     #: REST snapshot" is a lie whenever the entry is right there in the listing.
     excluded: dict[str, str] = field(default_factory=dict)
+    metadata_warnings: list[str] = field(default_factory=list)
 
     def resolve(self, selectors):
         try:
@@ -35,9 +37,7 @@ class RESTInventory(Inventory):
             # Name the assets that *are* in the snapshot but were not made targets, so
             # the reply points at the real cause instead of at discover().
             reasons = {
-                self.excluded[s]
-                for s in selectors
-                if s in self.excluded and self.excluded[s]
+                self.excluded[s] for s in selectors if s in self.excluded and self.excluded[s]
             }
             if reasons:
                 raise InventoryError(
@@ -116,7 +116,7 @@ class AssetCatalog:
         if accounts == {None}:
             hint = (
                 "set bridge.preferred_account in config.toml to one the assets permit "
-                "(for example \"root\")"
+                '(for example "root")'
                 if not self.settings.preferred_account
                 else (
                     f"bridge.preferred_account is {self.settings.preferred_account!r}, which "
@@ -136,6 +136,7 @@ class AssetCatalog:
 
     def status(self):
         refreshed = self.snapshot["refreshed_at"]
+        warnings = self.inventory.metadata_warnings
         return {
             "source": "JumpServer REST",
             "refresh_interval_seconds": self.interval,
@@ -146,11 +147,21 @@ class AssetCatalog:
             "ssh_targets": len(self.inventory.hosts),
             "last_error": self.error,
             "refresh_in_progress": self._lock.locked(),
+            **(
+                {
+                    "metadata_warnings": warnings[:5],
+                    "metadata_warning_count": len(warnings),
+                    "metadata_warnings_truncated": len(warnings) > 5,
+                }
+                if warnings
+                else {}
+            ),
         }
 
     def _build(self, snapshot):
         hosts, selectors, name_counts, address_counts, excluded = {}, {}, {}, {}, {}
-        metadata = Inventory.asset_metadata()
+        warnings = []
+        metadata = Inventory.asset_metadata(warnings=warnings)
         for asset in snapshot["assets"]:
             name_counts[asset["name"]] = name_counts.get(asset["name"], 0) + 1
             address_counts[asset["address"]] = address_counts.get(asset["address"], 0) + 1
@@ -188,7 +199,7 @@ class AssetCatalog:
         groups = {
             k: list(set(v)) for k, v in selectors.items() if len(set(v)) == 1 and k not in hosts
         }
-        return RESTInventory(hosts, groups, excluded=excluded)
+        return RESTInventory(hosts, groups, excluded=excluded, metadata_warnings=warnings)
 
     def _exclusion(self, asset) -> str | None:
         """Why *asset* is not a usable target, or ``None`` when it is one."""
@@ -259,31 +270,57 @@ class AssetCatalog:
         finally:
             await api.aclose()
 
+    def _prepare(self, snapshot):
+        """Read/build/persist off-loop; return failures for safe caller handling.
+
+        Returning an error as data lets offload finish and propagate cancellation
+        even when the disk worker fails at the same time. No raw worker exception
+        reaches the event loop's unhandled shield-future logging.
+        """
+        try:
+            inventory = self._build(snapshot)
+            atomic_json(self.cache, snapshot)
+        except Exception as exc:
+            return None, exc
+        return inventory, None
+
     async def refresh(self):
+        """Publish only fully prepared snapshots; cancellation keeps the old view.
+
+        An outstanding disk worker finishes before the refresh lock is released.
+        It may leave a complete newer cache on disk, but a cancelled caller never
+        publishes it in memory. No replay or partial selector updates occur.
+        """
         async with self._lock:
             self._last_attempt = time.time()
+            stage, hint = "API fetch", "check API access/configuration"
             try:
                 assets = await self._fetch()
+                stage, hint = "snapshot preparation", "check snapshot data and local state storage"
                 snapshot = {
                     "refreshed_at": time.time(),
                     "assets": assets,
                     "identity": self.identity,
                 }
-                inventory = self._build(snapshot)
-                atomic_json(self.cache, snapshot)
+                inventory, preparation_error = await offload(self._prepare, snapshot)
+                if preparation_error is not None:
+                    raise preparation_error
+                # No await between publishing the snapshot, metadata and diagnostics.
                 self.snapshot, self.inventory, self.error = snapshot, inventory, None
                 log.info(
                     "REST refresh: %d assets, %d SSH targets", len(assets), len(inventory.hosts)
                 )
             except Exception as exc:
                 # Never publish raw HTTP bodies, proxy URLs, or authentication material.
-                self.error = (
-                    f"REST refresh failed ({type(exc).__name__}); check API access/configuration"
-                )
+                self.error = f"REST refresh failed during {stage} ({type(exc).__name__}); {hint}"
                 log.warning("%s; previous snapshot retained", self.error)
             return {"ok": self.error is None, **self.status(), "refresh_in_progress": False}
 
     async def ensure(self):
+        if self.snapshot["refreshed_at"] and self._lock.locked():
+            # Keep the last complete view usable while another request refreshes,
+            # even if slow storage takes longer than the retry pacing interval.
+            return self.inventory
         if not self.snapshot["refreshed_at"] and self._lock.locked():
             async with self._lock:
                 pass
