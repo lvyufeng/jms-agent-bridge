@@ -50,6 +50,8 @@ preferred_account = "root"
 # execution_limit = 8       # Unset: use bastion.max_parallel.
 # inspection_reserved = 2   # Default 0; must be less than the effective limit.
 # queue_timeout = 60        # Separate from remote execution timeout.
+# queue_limit = 64          # General execution-slot waiters; 0 means no waiting.
+# inspection_queue_limit = 16 # Separate inspection waiters; not borrowed by general.
 # result_ttl_seconds = 604800
 # result_cleanup_interval_seconds = 3600
 ```
@@ -176,6 +178,72 @@ Status reports active/queued work, retention and owned requests. Performance log
 separate queue, connection, channel, execution, login wait/pacing, handshake and
 authentication timing without logging scripts or credentials. Login pacing stays
 at its existing five seconds.
+
+### Execution queue capacity and backpressure
+
+Active commands and waiting commands have separate limits. Compact mode defaults
+to at most **64 general** execution-slot waiters and **16 inspection** waiters per
+resident process. These are conservative initial bounds, not fleet measurements
+or throughput/SLO promises. Both settings accept nonnegative integers: `0` refuses
+waiting but still permits immediate execution when a slot is free. They are not
+constrained by `execution_limit`. Ordinary work cannot borrow inspection waiting
+space; inspection cannot overflow into the general queue either. Each lane keeps
+FIFO among eligible requests; active inspection capacity still follows
+`inspection_reserved` and the global execution limit.
+
+When a lane's waiting allowance is exhausted and no slot can be granted, only the
+new execution is refused. Existing active/queued work is not cancelled or displaced.
+The refusal does not open a command channel, transmit the script, or start an rsync
+transfer.
+It is a saved terminal result, not a timeout or an uncertain remote side effect:
+
+```json
+{
+  "ok": false,
+  "exit_code": 75,
+  "reason": "queue_full",
+  "retryable": true,
+  "queue": {"lane": "general", "limit": 64, "depth": 64},
+  "execution_state": "not_started",
+  "executed": false,
+  "completion_unknown": false,
+  "timed_out": false,
+  "queue_timed_out": false,
+  "failure_stage": "execution_queue"
+}
+```
+
+`retryable` means this **particular execution** was not sent and can be considered
+for a later attempt; it does not schedule a retry or bypass authorization. Reduce
+concurrent dispatch or retry with bounded exponential backoff and jitter. No fixed
+`retry_after_seconds` estimate is provided, because command durations are unknown.
+If a `request_id` was used, the rejected request remains claimed: the same ID and
+arguments return its saved rejection even after capacity frees or the service
+restarts. Use a **new** ID for a deliberate later attempt. A mixed fan-out may have
+successful, unknown and rejected targets: retry only confirmed refused targets,
+not the entire batch. `completion_unknown=false` alone does not prove the whole
+batch was not executed. An inspection's later detail-collection refusal likewise
+does not undo its earlier successful sample; `backpressure` identifies the refused
+execution and its result ID.
+
+`run`, compact legacy command/transfer replies, `fs`, inspection details, job
+submission receipts and `request_status` retain the machine-readable evidence.
+Legacy collector parsers may still show an unavailable/unprobed host; inspect
+per-host `execution_results` rather than inferring a hardware failure. Cluster
+preflight conservatively blocks launch when a probe did not run and includes the
+queue refusal reason; this is not proof that the machine is actually offline.
+
+`discover(topic="status").execution` reports `queue_limits`, current `queued`, and
+lifetime per-lane `queue_full_rejections` (reset on process restart). Timeout and
+cancellation release waiting space and do not increment the rejection counter.
+`queue_scope` identifies these as **execution-slot waiters only**: authentication
+and named-shell serialization occur before slot admission and do not count here.
+Thus a cold call can wait for its existing paced login before receiving a refusal;
+this is not a global MCP/request inflight cap or protection against every resource
+exhaustion path. REST refresh, local validation and durable result/receipt creation
+can also happen before rejection. Existing request/output retention still applies;
+a sustained rejected-request flood needs a separate client/transport admission
+policy and storage management. No real deployment config is rewritten.
 
 Default runs start isolated `bash -s` processes with `set -euo pipefail`.
 An explicit `session_id` retains a Bash shell's directory, exports, functions, and

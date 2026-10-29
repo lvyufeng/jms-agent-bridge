@@ -6,6 +6,7 @@ from pathlib import Path
 from .async_io import offload
 from .bash_fs import WIRE_LIMIT, decode, remote_script
 from .fs_workers import FilesystemWorkers
+from .scheduling import queue_rejection
 
 OPERATION = "jms_fs"
 ACTIONS = [
@@ -323,6 +324,7 @@ class Filesystem:
                     )
                 }
                 | await offload(self.store.preview, transfer.result_id, 4096)
+                | queue_rejection(meta)
                 | {
                     "action": arguments["action"],
                     "local_path": arguments["local_path"],
@@ -340,21 +342,25 @@ class Filesystem:
         )
         rid = meta["result_id"]
         if not meta["ok"]:
-            return {
-                k: v
-                for k, v in meta.items()
-                if k
-                in (
-                    "ok",
-                    "result_id",
-                    "host",
-                    "exit_code",
-                    "execution_state",
-                    "completion_unknown",
-                    "timing",
-                    "warning",
-                )
-            } | await offload(self.store.preview, rid, 2048)
+            return (
+                {
+                    k: v
+                    for k, v in meta.items()
+                    if k
+                    in (
+                        "ok",
+                        "result_id",
+                        "host",
+                        "exit_code",
+                        "execution_state",
+                        "completion_unknown",
+                        "timing",
+                        "warning",
+                    )
+                }
+                | await offload(self.store.preview, rid, 2048)
+                | queue_rejection(meta)
+            )
         path = self.store.path(rid, "stdout")
         if (await offload(path.stat)).st_size > WIRE_LIMIT * 2 + 65536:
             return dict(ok=False, result_id=rid, error="filesystem probe exceeded wire limit")
