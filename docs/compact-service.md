@@ -177,6 +177,12 @@ separate queue, connection, channel, execution, login wait/pacing, handshake and
 authentication timing without logging scripts or credentials. Login pacing stays
 at its existing five seconds.
 
+For repeatable ten-worker local measurements and the inspection-reserve tradeoff,
+see [the concurrency benchmark](concurrency-benchmark.md). It uses synthetic assets
+and loopback SSH, not a production fleet or LLM orchestration. Reservation applies
+only to the inspection lane; ordinary coordinator `run`/`jms_exec` calls remain
+in the general queue. The benchmark changes no runtime defaults.
+
 Default runs start isolated `bash -s` processes with `set -euo pipefail`.
 An explicit `session_id` retains a Bash shell's directory, exports, functions, and
 options on each target, with calls serialized per shell. Named shells use normal

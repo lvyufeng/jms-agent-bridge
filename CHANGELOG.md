@@ -8,6 +8,12 @@
 
 ### Added
 
+- **Repeatable local ten-worker concurrency evidence.** A disposable loopback SSH
+  benchmark measures paced cold/warm connections, inspection reserve tradeoffs,
+  burst queues, cancellation, not-started queue expiry, slow refresh and disconnect
+  cleanup. It reports independent local child peaks and timing scope; no production
+  defaults, real cluster credentials or agent-orchestration behavior are changed.
+
 - **`jms_asset_detail` — one asset's accounts, and a paste-ready `hosts.yaml` entry.**
   `jms_list_assets` deliberately omits accounts (it is one REST request, and enumerating
   `#account` per asset would be one request each), but the account is exactly the field a
