@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .async_io import offload
 from .inspection_vendor.families import FAMILIES, Proc
+from .scheduling import queue_rejection
 
 OPERATION = "jms_accelerator_status"
 MAX_HOSTS = 8
@@ -318,6 +319,8 @@ def compact_host(host):
         row["errors"] = host["errors"][:4]
     if host.get("warnings"):
         row["warnings"] = host["warnings"][:3]
+    if host.get("backpressure"):
+        row["backpressure"] = host["backpressure"]
     return row
 
 
@@ -412,6 +415,10 @@ class AcceleratorInspector:
 
         def record(result):
             row["execution_results"].append(result["result_id"])
+            if rejection := queue_rejection(result):
+                row.setdefault("backpressure", []).append(
+                    {"result_id": result["result_id"], **rejection}
+                )
             for key, value in result.get("timing", {}).items():
                 row["timing"][key] = round(row["timing"].get(key, 0) + value, 3)
 
@@ -420,7 +427,11 @@ class AcceleratorInspector:
             record(result)
             if snapshot is None:
                 row["state"] = (
-                    "down" if result.get("connection_state") != "connected" else "unknown"
+                    "unknown"
+                    if result.get("reason") == "queue_full"
+                    else "down"
+                    if result.get("connection_state") != "connected"
+                    else "unknown"
                 )
                 row["errors"].append(
                     "collection failed; inspect execution result " + result["result_id"]

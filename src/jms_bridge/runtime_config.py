@@ -24,6 +24,8 @@ class BridgeSettings:
     execution_limit: int | None = None
     inspection_reserved: int = 0
     queue_timeout: float = 60
+    queue_limit: int = 64
+    inspection_queue_limit: int = 16
     result_ttl_seconds: float = 604800
     result_cleanup_interval_seconds: float = 3600
     preferred_account: str | None = None
@@ -55,6 +57,10 @@ def load_settings() -> BridgeSettings:
             type(value) is not int or value < (0 if name == "inspection_reserved" else 1)
         ):
             raise ConfigError(f"bridge.{name} must be a valid integer")
+    for name in ("queue_limit", "inspection_queue_limit"):
+        value = data.get(name, 0)
+        if type(value) is not int or value < 0:
+            raise ConfigError(f"bridge.{name} must be a nonnegative integer")
     for name in ("queue_timeout", "result_ttl_seconds", "result_cleanup_interval_seconds"):
         value = data.get(name, 1)
         if (
@@ -94,6 +100,8 @@ def load_settings() -> BridgeSettings:
                 "execution_limit",
                 "inspection_reserved",
                 "queue_timeout",
+                "queue_limit",
+                "inspection_queue_limit",
                 "result_ttl_seconds",
                 "result_cleanup_interval_seconds",
             )

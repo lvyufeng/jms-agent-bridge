@@ -20,7 +20,7 @@ from .async_io import offload
 from .config import ConfigError
 from .results import atomic_json
 from .rsync_binary import RsyncBinary
-from .scheduling import ExecutionSlots, QueueTimeout, Timings
+from .scheduling import ExecutionSlots, QueueFull, QueueTimeout, Timings, queue_rejection
 from .ssh import ExecResult
 
 
@@ -136,7 +136,12 @@ class NativeSSHRunner:
         self._rsync_binary = RsyncBinary()
         limit = settings.execution_limit or cfg.max_parallel
         reserved = settings.inspection_reserved
-        self.scheduler = ExecutionSlots(limit, reserved)
+        self.scheduler = ExecutionSlots(
+            limit,
+            reserved,
+            queue_limit=settings.queue_limit,
+            inspection_queue_limit=settings.inspection_queue_limit,
+        )
         self.queue_timeout = settings.queue_timeout
         self._timings_context = contextvars.ContextVar("execution_timings", default=None)
         self._session_gates = {}
@@ -185,6 +190,9 @@ class NativeSSHRunner:
             "timing",
             "connection_timing",
             "queue_timed_out",
+            "reason",
+            "retryable",
+            "queue",
             "failure_stage",
             "completion_unknown",
         )
@@ -415,6 +423,7 @@ class NativeSSHRunner:
         timing_token = self._timings_context.set(timing)
         session_gate, session_held = None, False
         execution_started, failure_stage, queue_timed_out = None, None, False
+        rejection = {}
         try:
             if session_id:
                 key = (self.key(host), session_id)
@@ -578,6 +587,10 @@ class NativeSSHRunner:
                             "SSH channel ended without a completion status; "
                             "remote completion is unknown."
                         )
+        except QueueFull as exc:
+            code = 75
+            failure_stage, warning = exc.stage, str(exc)
+            rejection = exc.response()
         except QueueTimeout as exc:
             code, timed_out, queue_timed_out = 124, True, True
             failure_stage, warning = exc.stage, str(exc)
@@ -655,6 +668,7 @@ class NativeSSHRunner:
                 queue_timed_out=queue_timed_out,
                 connection_timing=timing.connection_snapshot(),
                 failure_stage=failure_stage if warning else None,
+                **rejection,
             )
             self.performance_log(meta)
         return meta
@@ -683,6 +697,7 @@ class NativeSSHRunner:
             result.output_preview = preview
         # Full parser inputs keep decoded strings only, not a second full raw copy.
         result.result_id = result_id
+        result.rejection = queue_rejection(meta)
         return result
 
     async def exec_on(
@@ -798,6 +813,7 @@ class NativeSSHRunner:
         token = self._timings_context.set(timing)
         execution_started, transfer_sent, complete = None, False, False
         failure_stage, warning, queue_timed_out = "connection", None, False
+        rejection = {}
         try:
             connection = await self.connection(host)
             failure_stage = "execution_queue"
@@ -914,6 +930,10 @@ class NativeSSHRunner:
                                 for task in list(tasks):
                                     task.cancel()
                                 await asyncio.gather(*list(tasks), return_exceptions=True)
+        except QueueFull as exc:
+            code = 75
+            failure_stage, warning = exc.stage, str(exc)
+            rejection = exc.response()
         except QueueTimeout as exc:
             timed_out, queue_timed_out, code = True, True, 124
             failure_stage, warning = exc.stage, str(exc)
@@ -949,6 +969,7 @@ class NativeSSHRunner:
                 execution_state="completed"
                 if complete
                 else ("unknown" if transfer_sent else "not_started"),
+                **rejection,
             )
             self.performance_log(meta)
         return await self._stored_result(host, meta, preview_only=preview_only)

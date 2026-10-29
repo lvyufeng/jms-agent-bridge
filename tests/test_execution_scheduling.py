@@ -284,6 +284,83 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta["exit_code"], 130)
             self.assertFalse(meta["completion_unknown"])
 
+    async def test_ten_requests_have_six_active_two_queued_two_rejected_and_inspection_runs(self):
+        self.runner.scheduler = ExecutionSlots(8, 2, queue_limit=2, inspection_queue_limit=1)
+        self.runner.queue_timeout = 3
+        release = Path(self.tmp.name) / "release"
+        script = (
+            "printf STARTED; while [ ! -e "
+            + shlex.quote(str(release))
+            + " ]; do sleep 0.01; done; printf DONE"
+        )
+        tasks = [
+            asyncio.create_task(self.runner.execute_to_store(self.host, script, 3))
+            for _ in range(10)
+        ]
+
+        async def saturated():
+            while True:
+                status = self.runner.scheduler.status()
+                if (
+                    status["active"]["general"] == 6
+                    and status["queued"]["general"] == 2
+                    and sum(t.done() for t in tasks) == 2
+                    and len(self.connection.processes) == 6
+                ):
+                    break
+                await asyncio.sleep(0.005)
+
+        try:
+            await asyncio.wait_for(saturated(), 2)
+            self.assertEqual(self.runner.scheduler.status()["queue_full_rejections"]["general"], 2)
+            rejected = [t.result() for t in tasks if t.done()]
+            self.assertTrue(all(r["reason"] == "queue_full" for r in rejected))
+            self.assertTrue(all(r["executed"] is False for r in rejected))
+            inspector = await self.runner.execute_to_store(
+                self.host, "printf inspected", 1, lane="inspection"
+            )
+            self.assertTrue(inspector["ok"])
+            self.assertEqual(self.runner.scheduler.status()["queued"]["general"], 2)
+            release.touch()
+            rows = await asyncio.wait_for(asyncio.gather(*tasks), 3)
+            self.assertEqual(sum(r["ok"] for r in rows), 8)
+            self.assertEqual(sum(r.get("reason") == "queue_full" for r in rows), 2)
+            self.assertEqual(len(self.connection.processes), 9)
+            self.assertEqual(self.store.retention_status()["active_results"], 0)
+        finally:
+            release.touch()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(sum(self.runner.scheduler.active.values()), 0)
+        self.assertEqual(len(self.runner.scheduler.waiters), 0)
+
+    async def test_named_session_queue_rejection_releases_gate_without_losing_shell(self):
+        first = await self.runner.execute_to_store(
+            self.host, "export JMS_TEST_VALUE=42", 1, session_id="s"
+        )
+        self.assertTrue(first["ok"])
+        self.runner.scheduler.queue_limits["general"] = 0
+        async with AsyncExitStack() as stack:
+            for _ in range(6):
+                await stack.enter_async_context(self.runner.scheduler.slot("general", 1, Timings()))
+            rejected = await self.runner.execute_to_store(
+                self.host, "echo unsafe", 1, session_id="s"
+            )
+            self.assertEqual(rejected["reason"], "queue_full")
+            self.assertFalse(rejected["executed"])
+            self.assertEqual(rejected["session_state"], "active")
+            key = (self.runner.key(self.host), "s")
+            self.assertFalse(self.runner._session_gates[key].locked())
+            self.assertFalse(self.runner._shells[key].lost)
+        second = await self.runner.execute_to_store(
+            self.host, 'echo "$JMS_TEST_VALUE"', 1, session_id="s"
+        )
+        self.assertTrue(second["ok"])
+        self.assertEqual(self.store.path(second["result_id"], "stdout").read_text(), "42\n")
+        self.assertEqual(len(self.connection.processes), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

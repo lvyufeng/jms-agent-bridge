@@ -34,6 +34,7 @@ from .request_journal import RequestJournal
 from .rest_inventory import AssetCatalog
 from .results import ResultStore
 from .runtime_config import StateLock, load_settings
+from .scheduling import queue_rejection
 
 CATEGORIES = {
     "assets": ["jms_list_assets", "jms_asset_detail", "jms_inventory_reload"],
@@ -237,6 +238,9 @@ class BridgeService:
                         "completion_unknown",
                         "timed_out",
                         "queue_timed_out",
+                        "reason",
+                        "retryable",
+                        "queue",
                         "failure_stage",
                         "finished_at",
                     )
@@ -255,6 +259,7 @@ class BridgeService:
                     "ok": r.ok,
                     "exit_code": r.exit_code,
                     "result_id": r.result_id,
+                    **getattr(r, "rejection", {}),
                     **(
                         r.output_preview.compact(budget)
                         if getattr(r, "output_preview", None) is not None
@@ -450,6 +455,7 @@ class BridgeService:
                 )
             }
             | preview
+            | queue_rejection(r)
             | ({"warning": r["warning"]} if r.get("warning") else {})
             for r, preview in zip(results, previews, strict=True)
         ]
@@ -626,6 +632,12 @@ class BridgeService:
                 try:
                     value = unwrap(await upstream.server.call_tool(operation, arguments))
                     if executions:
+                        for execution in executions:
+                            try:
+                                meta = await offload(self.store.metadata, execution["result_id"])
+                            except (ValueError, OSError):
+                                continue
+                            execution.update(queue_rejection(meta))
                         value = (
                             {**value, "execution_results": executions}
                             if isinstance(value, dict)
@@ -799,11 +811,13 @@ class BridgeService:
             by default; task session_id retains cd/env/functions per asset. Lost shells need a
             new ID or session_close. Idle SSH reconnects; channel opening retries only before
             transmission. completion_unknown/timeout must never trigger blind replay.
-            queue_timed_out with not_started means unsent. Set request_id before work;
-            reconcile request_status after reply loss. Timeout 1..600s; use jobs for background
-            work. Full stdout/stderr are saved; previews share max_output_bytes across targets
-            (default4096), read_result fetches more. allow_dangerous acknowledges the local guard
-            for an already-authorized action.
+            queue_timed_out with not_started means unsent. queue_full is a saved per-target
+            refusal, not a timeout: throttle dispatch; retry only refused targets with a new
+            request_id. The same ID returns its receipt and never replays. Set request_id before
+            work; reconcile request_status after reply loss. Timeout 1..600s; use jobs for
+            background work. Full stdout/stderr are saved. Previews share max_output_bytes
+            across targets (default4096); read_result fetches more. allow_dangerous acknowledges
+            the local guard for an already-authorized action.
             """
             try:
                 return await self.run(
