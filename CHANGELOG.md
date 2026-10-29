@@ -14,7 +14,9 @@
   with a durable `queue_full`/`not_started` result, without transmission or replay.
   Status exposes limits and per-lane rejection counts; tools and request recovery
   retain per-execution evidence. This bounds execution-slot waiters, not all login,
-  named-shell or MCP requests. Existing OpenSSH mode and deployment files are unchanged.
+  named-shell or MCP requests. Queue waits also preserve caller cancellation when
+  a slot is granted concurrently on older Python versions. Existing OpenSSH mode
+  and deployment files are unchanged.
 
 - **`jms_asset_detail` — one asset's accounts, and a paste-ready `hosts.yaml` entry.**
   `jms_list_assets` deliberately omits accounts (it is one REST request, and enumerating

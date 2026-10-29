@@ -807,17 +807,14 @@ class BridgeService:
             request_id: str | None = None,
         ) -> dict:
             """Run literal Bash or absolute local script_path on REST assets. container/image
-            selects Docker without nested quoting; cwd/env/docker_args apply there. Isolated
-            by default; task session_id retains cd/env/functions per asset. Lost shells need a
-            new ID or session_close. Idle SSH reconnects; channel opening retries only before
-            transmission. completion_unknown/timeout must never trigger blind replay.
-            queue_timed_out with not_started means unsent. queue_full is a saved per-target
-            refusal, not a timeout: throttle dispatch; retry only refused targets with a new
-            request_id. The same ID returns its receipt and never replays. Set request_id before
-            work; reconcile request_status after reply loss. Timeout 1..600s; use jobs for
-            background work. Full stdout/stderr are saved. Previews share max_output_bytes
-            across targets (default4096); read_result fetches more. allow_dangerous acknowledges
-            the local guard for an already-authorized action.
+            selects Docker; cwd/env/docker_args apply there. Isolated by default; session_id
+            retains shell state. Lost shells need a new ID or session_close. Idle SSH reconnects;
+            channel opening retries only before transmission. Never blindly replay unknown
+            completion/timeouts. queue_full is a per-target unsent refusal: throttle, then retry
+            only refused targets with a new request_id. Same ID returns its receipt, never replays;
+            reconcile request_status after reply loss. Timeout 1..600s; use jobs for long work.
+            Full output is saved; previews share max_output_bytes across targets (default4096).
+            read_result fetches more. allow_dangerous acknowledges the guard, not authorization.
             """
             try:
                 return await self.run(

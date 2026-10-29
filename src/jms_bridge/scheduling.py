@@ -147,10 +147,12 @@ class ExecutionSlots:
         self._wake()
         try:
             with timings.phase("queue_seconds"):
-                try:
-                    await asyncio.wait_for(asyncio.shield(waiter["future"]), timeout)
-                except asyncio.TimeoutError:
-                    raise QueueTimeout("execution_queue") from None
+                # wait_for on older Python can swallow caller cancellation when
+                # its inner future has just completed. wait leaves that future
+                # untouched and lets cancellation propagate to our slot cleanup.
+                done, _ = await asyncio.wait((waiter["future"],), timeout=timeout)
+                if not done:
+                    raise QueueTimeout("execution_queue")
             yield
         finally:
             if waiter["granted"]:
