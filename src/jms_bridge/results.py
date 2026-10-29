@@ -12,6 +12,7 @@ import shutil
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from .runtime_config import default_state_dir
@@ -40,20 +41,47 @@ def atomic_json(path, value):
         temp.unlink(missing_ok=True)
 
 
-def preview_buffers(stdout, stderr, budget):
-    """Same preview policy for compatibility operations which already read both streams."""
-    err_budget = min(len(stderr), max(0, budget // 2))
-    out_budget = min(len(stdout), max(0, budget - err_budget))
-    err_budget = min(len(stderr), max(0, budget - out_budget))
+def preview_buffers(stdout, stderr, budget, *, sizes=None):
+    """Preview head/tail buffers using true stream sizes, not cached lengths."""
+    sizes = sizes or {"stdout": len(stdout), "stderr": len(stderr)}
+    out_size, err_size = sizes.get("stdout", 0), sizes.get("stderr", 0)
+    err_budget = min(err_size, max(0, budget // 2))
+    out_budget = min(out_size, max(0, budget - err_budget))
+    err_budget = min(err_size, max(0, budget - out_budget))
     result = {}
-    for name, data, limit in [("stdout", stdout, out_budget), ("stderr", stderr, err_budget)]:
+    for name, data, limit, size in [
+        ("stdout", stdout, out_budget, out_size),
+        ("stderr", stderr, err_budget, err_size),
+    ]:
+        limit = min(limit, len(data))
         if data and limit:
             result[name] = (data[-limit:] if name == "stderr" else data[:limit]).decode(
                 "utf-8", errors="replace"
             )
-        if len(data) > limit:
+        if size > limit:
             result[name + "_truncated"] = True
     return result
+
+
+@dataclass(frozen=True)
+class OutputPreview:
+    """Bounded raw windows; full stream sizes refer to the unchanged disk logs."""
+
+    stdout_head: bytes
+    stderr_head: bytes
+    stderr_tail: bytes
+    sizes: dict[str, int]
+
+    @property
+    def stdout_truncated(self):
+        return self.sizes.get("stdout", 0) > len(self.stdout_head)
+
+    @property
+    def stderr_truncated(self):
+        return self.sizes.get("stderr", 0) > len(self.stderr_head)
+
+    def compact(self, budget):
+        return preview_buffers(self.stdout_head, self.stderr_tail, budget, sizes=self.sizes)
 
 
 class ResultStore:
@@ -143,6 +171,34 @@ class ResultStore:
         atomic_json(self.path(result_id, "result"), value)
         self.finish(result_id, ok=not (isinstance(value, dict) and value.get("ok") is False))
         return result_id
+
+    @locked
+    def preview_snapshot(self, result_id, limit=16384):
+        """Cache fixed-size raw prefixes and an error suffix for sync consumers.
+
+        Keep both ends of stderr: legacy short summaries use its prefix, whereas
+        compact diagnostic previews use its suffix. Preserve raw bytes so decoding
+        and smaller per-host budgets have the same policy as direct file previews.
+        """
+        if type(limit) is not int or not 0 <= limit <= 16384:
+            raise ValueError("preview snapshot limit must be 0..16384 bytes")
+        sizes = self.metadata(result_id).get("bytes", {})
+        prefixes = []
+        stderr_tail = b""
+        for stream in ("stdout", "stderr"):
+            size = sizes.get(stream, 0)
+            prefix = b""
+            if size and limit:
+                with self.path(result_id, stream).open("rb") as fh:
+                    prefix = fh.read(min(size, limit))
+                    if stream == "stderr":
+                        if size <= limit:
+                            stderr_tail = prefix
+                        else:
+                            fh.seek(size - limit)
+                            stderr_tail = fh.read(limit)
+            prefixes.append(prefix)
+        return OutputPreview(prefixes[0], prefixes[1], stderr_tail, sizes)
 
     @locked
     def preview(self, result_id, budget=4096):

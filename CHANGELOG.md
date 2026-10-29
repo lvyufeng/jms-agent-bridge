@@ -66,6 +66,12 @@
 
 ### Fixed
 
+- **Compact command/transfer previews no longer load complete disk logs into memory.**
+  Explicit presentation reads cache fixed stdout/error windows, preserve true byte
+  sizes and truncation, and keep stderr-tail diagnostics. Complete outputs remain
+  readable by result ID. Parser inputs remain full by default and no longer keep a
+  duplicate full raw-byte buffer; legacy OpenSSH and parser contracts are unchanged.
+
 - **Optional metadata errors no longer break REST asset discovery or hide silently.**
   Validate host mappings, UUID joins, shell-field types and platform keys, retain
   valid fields, and expose bounded value-free warnings in inventory status. Duplicate

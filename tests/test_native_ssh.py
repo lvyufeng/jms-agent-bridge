@@ -7,7 +7,9 @@ import shlex
 import shutil
 import signal
 import sys
+import threading
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -356,10 +358,7 @@ async def test_facade_script_file_and_hidden_execution_results(loopback):
     response = await service.server.call_tool(
         "run", {"targets": ["node"], "script_path": str(script), "env": {"VALUE": "literal $PATH"}}
     )
-    assert (
-        not response.is_error
-        and unwrap(response)["results"][0]["stdout"] == "literal $PATH"
-    )
+    assert not response.is_error and unwrap(response)["results"][0]["stdout"] == "literal $PATH"
     legacy = await service.call("jms_exec", {"targets": ["node"], "command": "printf legacy"})
     assert legacy["ok"]
     probe = await service.call("jms_probe", {"targets": ["node"]})
@@ -418,9 +417,17 @@ async def test_jms_exec_keeps_the_legacy_contract(loopback):
     calls = []
     original = t.runner.exec_on
 
-    async def spy(host, command, *, timeout=60, workdir=True, env_setup=True):
+    async def spy(host, command, *, timeout=60, workdir=True, env_setup=True, preview_only=False):
         calls.append(command)
-        return await original(host, command, timeout=timeout, workdir=workdir, env_setup=env_setup)
+        assert preview_only, "jms_exec is a presentation-only consumer"
+        return await original(
+            host,
+            command,
+            timeout=timeout,
+            workdir=workdir,
+            env_setup=env_setup,
+            preview_only=preview_only,
+        )
 
     t.runner.exec_on = spy
     result = await service.call("jms_exec", {"targets": ["node"], "command": "printf legacy-path"})
@@ -494,3 +501,121 @@ async def test_rsync_cancel_during_preflight_does_not_start_transfer(loopback, m
         await task
     connection.assert_not_awaited()
     assert not list(t.runner.store.root.iterdir())
+
+
+async def test_large_legacy_exec_previews_preserve_full_logs_and_error_tail(loopback, monkeypatch):
+    import json
+
+    t = loopback
+    service = BridgeService(t.cfg, t.settings)
+    service.runner = t.runner
+    service.manager.runner = t.runner
+    service.catalog._fetch = AsyncMock(
+        return_value=[
+            {
+                "id": t.host.asset_id,
+                "name": "node",
+                "address": "192.0.2.20",
+                "active": True,
+                "protocols": ["ssh"],
+                "accounts": ["root"],
+                "account": "root",
+                "login": t.host.login,
+            }
+        ]
+    )
+    await service.catalog.refresh()
+    code = "import sys; sys.stdout.write('x'*2000000); sys.stderr.write('y'*2000000+'ERROR-TAIL')"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+    def forbid_full_read(*args, **kwargs):
+        raise AssertionError("preview consumer read a complete output file")
+
+    monkeypatch.setattr("pathlib.Path.read_bytes", forbid_full_read)
+    reply = await service.call("jms_exec", {"targets": ["node"], "command": command})
+    rows = json.loads(service.store.path(reply["result_id"], "result").read_text())["results"]
+    row = rows[0]
+    assert row["ok"] and row["stdout_truncated"] and row["stderr_truncated"]
+    assert row["stderr"].endswith("ERROR-TAIL")
+    assert len(row["stdout"].encode()) + len(row["stderr"].encode()) <= 4096
+    execution_id = row["result_id"]
+    meta = service.store.metadata(execution_id)
+    assert meta["bytes"]["stdout"] == 2000000 and meta["bytes"]["stderr"] == 2000010
+    offset, total = 0, 0
+    while True:
+        page = service.store.read(execution_id, offset=offset, limit=16384)
+        assert page["text"] == "x" * len(page["text"])
+        total += len(page["text"])
+        offset = page["next_offset"]
+        if page["eof"]:
+            break
+    assert total == 2000000
+    assert service.store.read(execution_id, "stderr", tail=True)["text"].endswith("ERROR-TAIL")
+
+
+async def test_rsync_finalization_does_not_materialize_large_logs(loopback, monkeypatch):
+    from jms_bridge import native_ssh
+
+    t = loopback
+    monkeypatch.setattr(
+        t.runner._rsync_binary, "resolve", AsyncMock(return_value="/validated/rsync")
+    )
+
+    async def spawn(*args, **kwargs):
+        kwargs["stdout"].write(b"i" * 2000000)
+        kwargs["stderr"].write(b"e" * 2000000 + b"FINAL-RSYNC-ERROR")
+        return SimpleNamespace(wait=AsyncMock(return_value=1), returncode=1)
+
+    monkeypatch.setattr(native_ssh.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(t.runner, "connection", AsyncMock(return_value=SimpleNamespace()))
+
+    def forbid_full_read(*args, **kwargs):
+        raise AssertionError("transfer finalization read a complete output file")
+
+    original_read = Path.read_bytes
+    monkeypatch.setattr("pathlib.Path.read_bytes", forbid_full_read)
+    result = await t.runner.rsync(t.host, "/local", "/remote")
+    assert not result.ok and result.exit_code == 1
+    assert result.stdout_truncated and result.stderr_truncated
+    assert len(result.stdout) == 16384 and len(result.stderr) == 16384
+    service = BridgeService(t.cfg, t.settings)
+    rows = service.compact_exec_results([result])
+    assert rows[0]["stderr"].endswith("FINAL-RSYNC-ERROR")
+    assert rows[0]["stdout_truncated"] and rows[0]["stderr_truncated"]
+    assert result.output_preview.sizes == {"stdout": 2000000, "stderr": 2000017}
+    monkeypatch.setattr(Path, "read_bytes", original_read)
+    full = await t.runner.rsync(t.host, "/local", "/remote", preview_only=False)
+    assert full.stdout == "i" * 2000000
+    assert full.stderr == "e" * 2000000 + "FINAL-RSYNC-ERROR"
+    assert full.output_preview is None and not hasattr(full, "_bridge_output")
+    await service.runner.close()
+
+
+async def test_other_ssh_work_remains_responsive_during_large_preview_io(loopback, monkeypatch):
+    t = loopback
+    await run(t, "true")  # Warm the one shared connection before measuring storage behavior.
+    entered, release = threading.Event(), threading.Event()
+    original = t.runner.store.preview_snapshot
+    loop_thread = threading.get_ident()
+
+    def slow(*args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(t.runner.store, "preview_snapshot", slow)
+    code = "import sys; sys.stdout.write('x'*2000000)"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    task = asyncio.create_task(t.runner.exec_on(t.host, command, preview_only=True))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert not task.done()
+        assert sum(t.runner.scheduler.active.values()) == 0
+        small = await asyncio.wait_for(run(t, "printf STILL-RESPONSIVE"), 2)
+        assert small["ok"] and stdout(t, small) == "STILL-RESPONSIVE"
+        assert not task.done()
+    finally:
+        release.set()
+        result = await task
+    assert result.ok and result.stdout_truncated

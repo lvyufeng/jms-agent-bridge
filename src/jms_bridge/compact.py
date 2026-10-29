@@ -32,7 +32,7 @@ from .native_ssh import NativeSSHRunner
 from .recoverable_jobs import RecoverableJobManager
 from .request_journal import RequestJournal
 from .rest_inventory import AssetCatalog
-from .results import ResultStore, preview_buffers
+from .results import ResultStore
 from .runtime_config import StateLock, load_settings
 
 CATEGORIES = {
@@ -256,8 +256,8 @@ class BridgeService:
                     "exit_code": r.exit_code,
                     "result_id": r.result_id,
                     **(
-                        preview_buffers(*r._bridge_output, budget)
-                        if hasattr(r, "_bridge_output")
+                        r.output_preview.compact(budget)
+                        if getattr(r, "output_preview", None) is not None
                         else self.store.preview(r.result_id, budget)
                     ),
                 }
@@ -484,9 +484,12 @@ class BridgeService:
                 + (f" — {why}" if (why := self.catalog.explain_no_targets()) else "")
             )
         results = await asyncio.gather(
-            *(self.runner.exec_on(host, command, timeout=timeout) for host in hosts)
+            *(
+                self.runner.exec_on(host, command, timeout=timeout, preview_only=True)
+                for host in hosts
+            )
         )
-        rows = self.compact_exec_results(results)
+        rows = await offload(self.compact_exec_results, results)
         return {
             "ok": all(row.get("ok") for row in rows),
             "results": rows,
