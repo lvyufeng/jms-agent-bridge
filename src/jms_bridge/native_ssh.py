@@ -18,6 +18,11 @@ import asyncssh
 
 from .async_io import offload
 from .config import ConfigError
+from .connection_recovery import (
+    ConnectionRecovery,
+    connection_operation,
+    recover_isolated_startup,
+)
 from .results import atomic_json
 from .rsync_binary import RsyncBinary
 from .scheduling import ExecutionSlots, QueueTimeout, Timings
@@ -87,6 +92,68 @@ class ShellSession:
         self.last_used = time.monotonic()
         self.started = False
         self.buffers = {"stdout": b"", "stderr": b""}
+        self.ready = False
+        self.startup_output = {"stdout": b"", "stderr": b""}
+
+    async def prime(self, timeout):
+        """Confirm both streams before transmitting any script."""
+        nonce = uuid.uuid4().hex
+        marker = b"\x1eREADY" + nonce.encode() + b"\x1f"
+        self.ready_marker = marker
+
+        async def acknowledge(stream):
+            buffer = self.buffers[stream]
+            while True:
+                position = buffer.find(marker)
+                if position >= 0:
+                    self.buffers[stream] = buffer[position + len(marker) :]
+                    return
+                buffer = buffer[-(len(marker) - 1) :]
+                chunk = await getattr(self.process, stream).read(65536)
+                if not chunk:
+                    raise ConnectionError(
+                        "remote shell closed during startup; script was not sent. "
+                        "SSH authentication alone does not confirm remote execution is available; "
+                        "check the gateway execution policy and target connection"
+                    )
+                self.startup_output[stream] = (self.startup_output[stream] + chunk)[-2048:]
+                buffer += chunk
+
+        async def exchange():
+            packet = (
+                f"printf '\\036READY{nonce}\\037'; printf '\\036READY{nonce}\\037' >&2\n"
+            ).encode()
+            self.process.stdin.write(packet)
+            await self.process.stdin.drain()
+            tasks = [asyncio.create_task(acknowledge(s)) for s in ("stdout", "stderr")]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            await asyncio.wait_for(exchange(), timeout)
+        except ConnectionError:
+            # Preserve a bounded gateway error even if one stream closed before
+            # the other readiness reader had a chance to collect it.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.process.wait_closed(), 0.5)
+            for stream in ("stdout", "stderr"):
+                with contextlib.suppress(Exception):
+                    chunk = await asyncio.wait_for(getattr(self.process, stream).read(2048), 0.1)
+                    self.startup_output[stream] = (self.startup_output[stream] + chunk)[-2048:]
+            raise
+        self.ready = True
+
+    def save_startup_output(self, paths):
+        for stream, data in self.startup_output.items():
+            data = data.replace(getattr(self, "ready_marker", b"__UNSET__"), b"")
+            if data:
+                with open_output(paths[stream]) as output:
+                    output.write(data)
 
     async def capture(self, stream, path, start, end):
         reader = getattr(self.process, stream)
@@ -142,6 +209,7 @@ class NativeSSHRunner:
         self._session_gates = {}
         self._connect_lock = asyncio.Lock()
         self._connections = {}
+        self._connection_recovery = ConnectionRecovery()
         self._shells = {}
         self._shells_lock = asyncio.Lock()
         self._last_login = 0.0
@@ -225,6 +293,7 @@ class NativeSSHRunner:
         return {
             "connected": sum(not c.is_closed() for c in self._connections.values()),
             "disconnected": sum(c.is_closed() for c in self._connections.values()),
+            "recovery": self._connection_recovery.status(),
         }
 
     def key(self, host):
@@ -233,8 +302,47 @@ class NativeSSHRunner:
         return (host.login, host.account, str(uuid.UUID(host.asset_id)))
 
     async def connection(self, host):
+        with self.phase("queue_seconds"):
+            await self._connection_recovery.enter(self.key(host), self.queue_timeout)
         with self.phase("connection_seconds"):
-            return await self._connection(host)
+            connection = await self._connection(host)
+            self._connection_recovery.bind(self.key(host), connection)
+            return connection
+
+    def connection_use(self, host):
+        return self._connection_recovery.use(self.key(host))
+
+    def protected_shells(self, host):
+        key = self.key(host)
+        return any(
+            target == key
+            and not sid.startswith("_fs:")
+            and not shell.lost
+            and not shell.process.is_closing()
+            for (target, sid), shell in self._shells.items()
+        )
+
+    async def recover_connection(self, host, generation):
+        async def replace():
+            # The per-target gate is closed and all operation leases are gone.
+            # Only idle private workers may remain; user shell state is protected.
+            key = self.key(host)
+            for target, sid in list(self._shells):
+                if target == key and sid.startswith("_fs:"):
+                    await self.close_session(host, sid, _internal=True)
+            connection = self._connections.pop(key, None)
+            if connection:
+                connection.close()
+                await asyncio.wait_for(connection.wait_closed(), 5)
+            await self.connection(host)
+
+        return await self._connection_recovery.request(
+            self.key(host),
+            generation,
+            replace,
+            lambda: self.protected_shells(host),
+            wait_seconds=self.queue_timeout,
+        )
 
     def connection_phase(self, name):
         timing = self._timings_context.get()
@@ -336,6 +444,8 @@ class NativeSSHRunner:
             raise ValueError("docker_args requires container or image")
         return shlex.join(shell)
 
+    @recover_isolated_startup
+    @connection_operation
     async def execute_to_store(
         self,
         host,
@@ -352,6 +462,7 @@ class NativeSSHRunner:
         lane="general",
         queue_timeout=None,
         _internal_session=False,
+        _startup_probe=False,
     ):
         if env and any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in env):
             raise ValueError("invalid environment variable name")
@@ -378,7 +489,7 @@ class NativeSSHRunner:
             raise ValueError("queue_timeout must be positive")
         command = self.command(container, image, docker_args, bool(session_id))
         result_id = await self.store.acreate(
-            kind="fs_worker" if _internal_session else "run",
+            kind="fs_worker" if _internal_session or _startup_probe else "run",
             host=host.name,
             asset_id=host.asset_id,
             container=container,
@@ -496,6 +607,16 @@ class NativeSSHRunner:
                             "session state was lost; "
                             "use a new session_id or call session_close to reset it"
                         )
+                    if not shell.ready:
+                        failure_stage = "shell_startup"
+                        try:
+                            with timing.phase("channel_seconds"):
+                                await shell.prime(min(timeout, 10))
+                        except BaseException:
+                            shell.save_startup_output(paths)
+                            shell.lost = True
+                            shell.process.close()
+                            raise
                     shell.started = False
                     nonce = uuid.uuid4().hex.encode()
                     start, end = b"\x1eSTART" + nonce + b"\x1f", b"\x1eEND" + nonce + b":"
@@ -538,6 +659,17 @@ class NativeSSHRunner:
                     marker = ("__JMS_EXEC_" + uuid.uuid4().hex + "__\n").encode()
                     process, channel_reconnected = await self.open_process(host, command)
                     reconnected = reconnected or channel_reconnected
+                    failure_stage = "shell_startup"
+                    startup = ShellSession(process, ())
+                    try:
+                        with timing.phase("channel_seconds"):
+                            await startup.prime(min(timeout, 10))
+                    except BaseException:
+                        startup.save_startup_output(paths)
+                        process.close()
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(process.wait_closed(), 5)
+                        raise
                     tasks = [
                         asyncio.create_task(
                             pump(process.stdout, paths["stdout"], marker, progress)
@@ -558,7 +690,11 @@ class NativeSSHRunner:
                         await asyncio.wait_for(process.wait_closed(), timeout)
                         await asyncio.gather(*tasks)
                         executed = progress["started"]
-                        completed = process.exit_status is not None and process.exit_status >= 0
+                        completed = (
+                            executed
+                            and process.exit_status is not None
+                            and process.exit_status >= 0
+                        )
                     except BaseException:
                         process.close()
                         with contextlib.suppress(Exception):
@@ -573,7 +709,14 @@ class NativeSSHRunner:
                     code = process.exit_status if process.exit_status is not None else 255
                     if not executed and code == 0:
                         code = 75
-                    if not completed:
+                    if not executed:
+                        failure_stage = "execution_ack"
+                        warning = (
+                            "SSH channel ended without the script start acknowledgment after "
+                            "transmission; remote completion is unknown; "
+                            "do not replay automatically."
+                        )
+                    elif not completed:
                         warning = (
                             "SSH channel ended without a completion status; "
                             "remote completion is unknown."
@@ -654,6 +797,7 @@ class NativeSSHRunner:
                 timing=timing.snapshot(),
                 queue_timed_out=queue_timed_out,
                 connection_timing=timing.connection_snapshot(),
+                connection_generation=self._connection_recovery.generation(self.key(host)),
                 failure_stage=failure_stage if warning else None,
             )
             self.performance_log(meta)
@@ -728,6 +872,7 @@ class NativeSSHRunner:
                 await offload(self.save_sessions)
             if _internal:
                 self._session_gates.pop(key, None)
+            self._connection_recovery.notify(self.key(host))
         return {"ok": True, "closed": existed}
 
     def sessions(self):
@@ -743,6 +888,7 @@ class NativeSSHRunner:
         ]
 
     async def close(self):
+        await self._connection_recovery.close()
         for shell in self._shells.values():
             shell.process.close()
         for connection in self._connections.values():
@@ -753,6 +899,7 @@ class NativeSSHRunner:
         self._shells.clear()
         self._connections.clear()
 
+    @connection_operation
     async def rsync(
         self,
         host,

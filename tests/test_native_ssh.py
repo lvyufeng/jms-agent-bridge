@@ -204,7 +204,9 @@ async def test_idle_disconnect_recovers_without_replaying_session(loopback):
     assert result["ok"] and result["reconnected"] and stdout(t, result) == "recovered"
     lost = await run(t, "echo forbidden", session_id="task")
     assert lost["session_state"] == "lost" and lost["execution_state"] == "not_started"
-    assert t.runner.connection_status() == {"connected": 1, "disconnected": 0}
+    status = t.runner.connection_status()
+    assert status["connected"] == 1 and status["disconnected"] == 0
+    assert status["recovery"]["resets"] == 0
 
 
 async def test_mid_execution_disconnect_keeps_partial_output_and_never_replays(loopback):

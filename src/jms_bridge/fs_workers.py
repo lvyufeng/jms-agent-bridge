@@ -4,6 +4,8 @@ import asyncio
 import time
 import uuid
 
+from .connection_recovery import recover_startup
+
 
 class FilesystemWorkers:
     def __init__(self, runner, *, limit=16, per_target=2, idle_seconds=300):
@@ -18,6 +20,7 @@ class FilesystemWorkers:
         self.sweeper = None
         self.closing = False
         self.hits, self.misses, self.fallbacks = 0, 0, 0
+        self.startup_retries = 0
 
     def status(self):
         return dict(
@@ -29,6 +32,7 @@ class FilesystemWorkers:
             reused=self.hits,
             created=self.misses,
             isolated_fallbacks=self.fallbacks,
+            startup_retries=self.startup_retries,
         )
 
     async def retire(self, entry):
@@ -51,6 +55,15 @@ class FilesystemWorkers:
             await self.sweep()
 
     async def execute(self, host, script, timeout, *, container=None):
+        async def attempt():
+            return await self._execute_once(host, script, timeout, container=container)
+
+        def retried():
+            self.startup_retries += 1
+
+        return await recover_startup(self.runner, host, attempt, on_retry=retried)
+
+    async def _execute_once(self, host, script, timeout, *, container=None):
         if self.sweeper is None:
             self.sweeper = asyncio.create_task(self.loop(), name="jms-fs-worker-cleanup")
         key = (self.runner.key(host), container)
@@ -85,27 +98,30 @@ class FilesystemWorkers:
         # Saturation uses the existing isolated execution path; global execution
         # slots still bound concurrency. No caller-owned shell state is involved.
         if entry is None:
-            return await self.runner.execute_to_store(host, script, timeout, container=container)
-        result = None
-        try:
             result = await self.runner.execute_to_store(
-                host,
-                script,
-                timeout,
-                container=container,
-                session_id=entry["session_id"],
-                _internal_session=True,
+                host, script, timeout, container=container, _startup_probe=True
             )
-            return result
-        finally:
-            async with self.lock:
-                if result is None or not result.get("ok"):
-                    try:
-                        await self.retire(entry)
-                    finally:
-                        self.entries.remove(entry)
-                else:
-                    entry.update(busy=False, last_used=time.monotonic())
+        else:
+            result = None
+            try:
+                result = await self.runner.execute_to_store(
+                    host,
+                    script,
+                    timeout,
+                    container=container,
+                    session_id=entry["session_id"],
+                    _internal_session=True,
+                )
+            finally:
+                async with self.lock:
+                    if result is None or not result.get("ok"):
+                        try:
+                            await self.retire(entry)
+                        finally:
+                            self.entries.remove(entry)
+                    else:
+                        entry.update(busy=False, last_used=time.monotonic())
+        return result
 
     async def close(self):
         self.closing = True

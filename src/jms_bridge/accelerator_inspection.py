@@ -411,7 +411,16 @@ class AcceleratorInspector:
         }
 
         def record(result):
-            row["execution_results"].append(result["result_id"])
+            recovered = result.get("connection_recovery", {})
+            for result_id in (
+                result.get("startup_retry_result_id"),
+                recovered.get("previous_result_id"),
+                result["result_id"],
+            ):
+                if result_id and result_id not in row["execution_results"]:
+                    row["execution_results"].append(result_id)
+            if recovered:
+                row["connection_recovery"] = recovered
             for key, value in result.get("timing", {}).items():
                 row["timing"][key] = round(row["timing"].get(key, 0) + value, 3)
 
@@ -422,9 +431,14 @@ class AcceleratorInspector:
                 row["state"] = (
                     "down" if result.get("connection_state") != "connected" else "unknown"
                 )
-                row["errors"].append(
-                    "collection failed; inspect execution result " + result["result_id"]
+                message = (
+                    "collector startup failed; script was not sent"
+                    if result.get("failure_stage") == "shell_startup"
+                    else "collector completion unknown after transmission"
+                    if result.get("completion_unknown")
+                    else "collection failed"
                 )
+                row["errors"].append(message + "; inspect execution result " + result["result_id"])
             else:
                 row["sample_received_at"] = time.time()
                 row.update(parse_snapshot(snapshot))

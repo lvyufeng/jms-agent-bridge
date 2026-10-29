@@ -451,6 +451,7 @@ class BridgeService:
             }
             | preview
             | ({"warning": r["warning"]} if r.get("warning") else {})
+            | {k: r[k] for k in ("startup_retry_result_id", "connection_recovery") if k in r}
             for r, preview in zip(results, previews, strict=True)
         ]
         return {

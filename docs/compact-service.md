@@ -193,9 +193,23 @@ With a named session, an image container lives for the shell's lifetime.
 | Situation | Behavior |
 | --- | --- |
 | Idle SSH connection closes | Next isolated run reconnects automatically. |
+| A new shell closes before readiness | No script is sent. Isolated runs and inspection share fs's bounded fresh-channel/target-connection recovery. |
 | Transport fails before script transmission | Opening a channel can retry once. |
 | Disconnect/timeout after transmission | Save partial output, return `completion_unknown=true`; never replay. |
 | Named shell exits, disconnects, or service restarts | Mark state lost; require a new ID or explicit `session_close` reset. |
+
+All new shells acknowledge readiness on both stdout and stderr before a script
+is sent. This includes default `run`, accelerator inspection and fs. Isolated
+calls can replace a failed startup channel once, then request one per-target SSH
+recovery and make one final attempt. Failed startup receipts and recovery details
+remain available. User-named shells are never automatically recreated. Image mode is not retried
+automatically, because creating the temporary container is itself an operation.
+
+After transmission, an absent start marker remains `unknown` even if the SSH
+channel reports exit 0. It must not be interpreted as proof that a command never
+ran. A script's own exit 75, with a confirmed start marker, is an ordinary script
+result and does not trigger connection recovery. Startup failure diagnostics are
+bounded and saved to the failed receipt's stdout/stderr.
 
 `execution_state` is `not_started`, `completed`, or `unknown`. `executed=true`
 confirms receipt of the start marker; `executed=null` means start itself is
