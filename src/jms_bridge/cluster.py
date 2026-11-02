@@ -9,7 +9,7 @@ master address and port so every rank agrees.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .inventory import Host, InventoryError, wrap_command
 from .platforms import Platform
@@ -33,6 +33,7 @@ class HostHealth:
     #: How many accelerators currently hold a compute process, or ``None`` when that is
     #: unknown (no occupancy probe for this platform, or an unparseable reply).
     busy_devices: int | None = None
+    rejection: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -46,6 +47,7 @@ class HostHealth:
             "detail": self.detail,
             "busy_devices": self.busy_devices,
             "busy": self.busy,
+            **self.rejection,
         }
 
     @property
@@ -169,6 +171,7 @@ async def preflight(
                 port=port,
                 port_free=None,
                 detail=(res.stderr or "unreachable").strip()[:300],
+                rejection=getattr(res, "rejection", {}),
             )
         return _parse_preflight(host, platform, port, res.stdout)
 

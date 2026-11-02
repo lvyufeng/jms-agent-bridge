@@ -18,6 +18,7 @@ from jms_bridge.jobs import (
 from jms_bridge.ssh import ExecResult
 
 from .async_io import offload
+from .scheduling import queue_rejection
 
 
 class RecoverableJobManager(JobManager):
@@ -68,6 +69,7 @@ class RecoverableJobManager(JobManager):
                 if acknowledged
                 else metadata.get("execution_state", "unknown"),
                 "completion_unknown": metadata.get("completion_unknown", not acknowledged),
+                **queue_rejection(metadata),
             }
         )
         if acknowledged:

@@ -23,7 +23,7 @@ import shlex
 import shutil
 import signal
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -150,6 +150,7 @@ class ExecResult:
     stderr: str
     timed_out: bool = False
     output_preview: OutputPreview | None = None
+    rejection: dict = field(default_factory=dict)
 
     @property
     def stdout_truncated(self):
@@ -180,8 +181,8 @@ class ExecResult:
             # compact diagnostics use OutputPreview.compact's reserved error tail.
             preview = self.output_preview
             raw_out, raw_err = preview.stdout_head, preview.stderr_head
-            shown_out = raw_out[:max(0, limit)]
-            shown_err = raw_err[:max(0, limit - len(shown_out))]
+            shown_out = raw_out[: max(0, limit)]
+            shown_err = raw_err[: max(0, limit - len(shown_out))]
             sizes = preview.sizes
             return {
                 "host": self.host,
@@ -195,6 +196,7 @@ class ExecResult:
                 "stdout_truncated": sizes.get("stdout", 0) > len(shown_out),
                 "stderr_truncated": sizes.get("stderr", 0) > len(shown_err),
                 "result_id": self.result_id,
+                **self.rejection,
             }
         out, out_len = _clip(self.stdout, limit)
         # Give stderr what stdout did not use, so the two together stay within `limit`.
@@ -211,6 +213,7 @@ class ExecResult:
             "stderr_bytes": err_len,
             "stdout_truncated": out_len > len(out),
             "stderr_truncated": err_len > len(err),
+            **self.rejection,
         }
 
 
