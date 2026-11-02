@@ -11,10 +11,35 @@ from user-named shells and do not change the default isolation of `run`.
 Idle channels expire after 5 minutes; the pool keeps at most 16 channels, with 2
 per asset/account/container. If busy, queries use isolated execution under the
 same global concurrency limit. `discover(topic="status").filesystem_workers`
-reports reuse and saturation. A failed query is not silently replayed.
+reports reuse and saturation. New private channels must acknowledge startup on
+both output streams before any filesystem script is transmitted. If a channel
+closes during this handshake, the service retires it and tries one fresh channel.
+The original failed result remains accessible as `startup_retry_result_id`.
+A repeated startup failure requests replacement of that target's SSH connection,
+then allows one final query attempt. The original channel failures remain in the
+result store; `connection_recovery` describes the replacement and links the second
+failure. Successful SSH authentication alone does not establish that a gateway can
+start remote execution. If recovery cannot complete, the query still returns
+`execution_state="not_started"`, `completion_unknown=false`, and
+`failure_stage="shell_startup"`.
+There is no automatic replay after script transmission, timeout, cancellation,
+or a transfer; this recovery never switches account, protocol or approval path.
 The exploration actions are read-only. Upload/download write their destination,
 so the tool as a whole is accurately marked as potentially destructive.
 It does not change authorization scope or bypass a client/JumpServer denial.
+
+Recovery drains only the exact asset/login/account identity, across its containers.
+Commands and transfers already using that connection finish before it is closed.
+New operations for that identity wait at connection acquisition, bounded by the
+existing queue timeout; a timeout is `not_started`. Other identities continue.
+Idle private fs shells can be rebuilt, while a live user-named shell postpones
+replacement so its state survives. Recovery resumes automatically after the user
+closes that shell. A long drain may return `connection_recovery.status="deferred"`;
+the background task reconnects only, never submits or replays the waiting query.
+Concurrent failures share one recovery, and a 60-second per-identity cooldown
+limits repeated reconnects. Existing authentication pacing/backoff still applies.
+`discover(topic="status").ssh_connections.recovery` exposes pending drains,
+completed resets and failures. No MCP service restart is needed for this recovery.
 
 Every request needs `target` (one exact REST asset) and `action`. Supply an absolute
 remote `path`, or `paths` for `read_many`. Optional `container` selects an existing

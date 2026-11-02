@@ -8,6 +8,14 @@
 
 ### Added
 
+- **Confirm shell startup before sending scripts and recover one target safely.**
+  Isolated runs, inspection and private filesystem workers share bounded recovery
+  only for confirmed pre-transmission startup failures. Connection replacement
+  drains the affected identity, preserves user shells, and retains failed receipts.
+  Waiting private workers enter recovery before taking shell locks; deferred recovery
+  also detects natural shell closure. Queue backpressure and uncertain completion
+  never trigger automatic replay. Based on #31 with integration and race fixes.
+
 - **Compact execution queue limits and explicit backpressure.** General and
   inspection waiting allowances default to 64/16, independent of active capacity;
   zero allows only immediate execution. A full lane refuses only the new command
