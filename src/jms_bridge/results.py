@@ -166,6 +166,14 @@ class ResultStore:
         return meta
 
     @locked
+    def annotate(self, result_id, **values):
+        """Attach diagnostic associations without changing completion or retention."""
+        meta = self.metadata(result_id)
+        meta.update(values)
+        atomic_json(self.directory(result_id) / "meta.json", meta)
+        return meta
+
+    @locked
     def save_json(self, value, **meta):
         result_id = self.create(**meta)
         atomic_json(self.path(result_id, "result"), value)

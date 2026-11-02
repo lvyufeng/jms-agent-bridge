@@ -151,6 +151,7 @@ class ExecResult:
     timed_out: bool = False
     output_preview: OutputPreview | None = None
     rejection: dict = field(default_factory=dict)
+    recovery: dict = field(default_factory=dict)
 
     @property
     def stdout_truncated(self):
@@ -197,6 +198,7 @@ class ExecResult:
                 "stderr_truncated": sizes.get("stderr", 0) > len(shown_err),
                 "result_id": self.result_id,
                 **self.rejection,
+                **self.recovery,
             }
         out, out_len = _clip(self.stdout, limit)
         # Give stderr what stdout did not use, so the two together stay within `limit`.
@@ -214,6 +216,7 @@ class ExecResult:
             "stdout_truncated": out_len > len(out),
             "stderr_truncated": err_len > len(err),
             **self.rejection,
+            **self.recovery,
         }
 
 

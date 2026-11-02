@@ -242,6 +242,8 @@ class BridgeService:
                         "retryable",
                         "queue",
                         "failure_stage",
+                        "startup_retry_result_id",
+                        "connection_recovery",
                         "finished_at",
                     )
                     if key in meta
@@ -260,6 +262,7 @@ class BridgeService:
                     "exit_code": r.exit_code,
                     "result_id": r.result_id,
                     **getattr(r, "rejection", {}),
+                    **getattr(r, "recovery", {}),
                     **(
                         r.output_preview.compact(budget)
                         if getattr(r, "output_preview", None) is not None
@@ -457,6 +460,7 @@ class BridgeService:
             | preview
             | queue_rejection(r)
             | ({"warning": r["warning"]} if r.get("warning") else {})
+            | {k: r[k] for k in ("startup_retry_result_id", "connection_recovery") if k in r}
             for r, preview in zip(results, previews, strict=True)
         ]
         return {

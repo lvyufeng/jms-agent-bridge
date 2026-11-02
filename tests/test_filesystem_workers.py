@@ -113,3 +113,93 @@ class Workers(unittest.IsolatedAsyncioTestCase):
             self.host, 'printf "%s" "${JMS_ISOLATION_TEST-unset}"', 1
         )
         self.assertEqual(self.store.path(result["result_id"], "stdout").read_text(), "unset")
+
+    async def install_startup_failure(self, count, *, stall=False):
+        original = self.connection.create_process
+        writes = []
+
+        async def create(command, **kwargs):
+            nonlocal count
+            if count > 0:
+                count -= 1
+                process = await original("sleep 2" if stall else "sleep 0.01", **kwargs)
+                writer = process.stdin
+
+                class RecordingWriter:
+                    def write(self, data):
+                        writes.append(data)
+                        writer.write(data)
+
+                    async def drain(self):
+                        await writer.drain()
+
+                    def close(self):
+                        writer.close()
+
+                process.stdin = RecordingWriter()
+                return process
+            return await original(command, **kwargs)
+
+        self.connection.create_process = create
+        return writes
+
+    async def test_startup_eof_rebuilds_once_without_sending_query_to_dead_channel(self):
+        writes = await self.install_startup_failure(1)
+        result = await self.fs.execute(target="x", action="read", path=str(self.path))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["data"]["text"], self.path.read_text())
+        self.assertEqual(len(self.connection.processes), 2)
+        self.assertTrue(writes)
+        self.assertTrue(all(b"READY" in p and b"__JMS_FS_BASH__" not in p for p in writes))
+        failed = self.store.metadata(result["startup_retry_result_id"])
+        self.assertEqual(failed["execution_state"], "not_started")
+        self.assertFalse(failed["completion_unknown"])
+        self.assertEqual(failed["failure_stage"], "shell_startup")
+        self.assertEqual(self.fs.workers.status()["startup_retries"], 1)
+
+    async def test_repeated_startup_eof_is_bounded_and_never_completion_unknown(self):
+        self.runner.recover_connection = AsyncMock(return_value=dict(status="failed"))
+        await self.install_startup_failure(2)
+        result = await self.fs.execute(target="x", action="list", path=str(self.root))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["execution_state"], "not_started")
+        self.assertFalse(result["completion_unknown"])
+        self.assertEqual(result["failure_stage"], "shell_startup")
+        self.assertEqual(len(self.connection.processes), 2)
+        self.assertEqual(self.fs.workers.status()["total"], 0)
+        self.assertEqual(self.runner._shells, {})
+
+    async def test_after_transmission_eof_is_not_replayed(self):
+        result = await self.fs.workers.execute(self.host, "printf partial; exit", 1)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["completion_unknown"])
+        self.assertEqual(result["failure_stage"], "execution")
+        self.assertEqual(len(self.connection.processes), 1)
+        self.assertEqual(self.fs.workers.status()["startup_retries"], 0)
+
+    async def test_startup_timeout_is_not_retried_or_marked_as_transmitted(self):
+        await self.install_startup_failure(1, stall=True)
+        result = await self.fs.workers.execute(self.host, "printf query", 0.03)
+        self.assertTrue(result["timed_out"])
+        self.assertFalse(result["completion_unknown"])
+        self.assertEqual(result["execution_state"], "not_started")
+        self.assertEqual(len(self.connection.processes), 1)
+        self.assertEqual(self.fs.workers.status()["startup_retries"], 0)
+
+    async def test_saturated_pool_fallback_also_confirms_startup_before_script(self):
+        self.fs.workers.limit = 0
+        self.runner.recover_connection = AsyncMock(return_value=dict(status="failed"))
+        writes = await self.install_startup_failure(2)
+        result = await self.fs.workers.execute(self.host, "printf secret_query", 1)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["completion_unknown"])
+        self.assertEqual(result["failure_stage"], "shell_startup")
+        self.assertTrue(all(b"secret_query" not in p for p in writes))
+
+    async def test_user_named_shell_is_not_automatically_rebuilt(self):
+        result = await self.runner.execute_to_store(
+            self.host, "printf partial; exit", 1, session_id="user-shell"
+        )
+        self.assertTrue(result["completion_unknown"])
+        self.assertEqual(len(self.connection.processes), 1)
+        self.assertEqual(self.fs.workers.status()["startup_retries"], 0)
