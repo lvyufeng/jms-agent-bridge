@@ -291,7 +291,15 @@ async def test_catalog_listener_does_not_wait_for_network(cfg, settings):
 
 async def test_compact_discovery_and_runtime_isolation(service):
     tools = await service.server.list_tools()
-    assert {t.name for t in tools} == {"run", "read_result", "discover", "call", "fs"}
+    assert {t.name for t in tools} == {
+        "run",
+        "read_result",
+        "discover",
+        "call",
+        "fs",
+        "meta",
+        "terminal",
+    }
     assert len(json.dumps([t.model_dump(mode="json") for t in tools if t.name != "fs"])) < 6000
     assert len(json.dumps(next(t for t in tools if t.name == "fs").model_dump(mode="json"))) < 6000
     assert (await service.discover())["categories"]["jobs"]
@@ -426,6 +434,8 @@ async def test_compact_stdio_protocol(tmp_path):
                 "read_result",
                 "discover",
                 "call",
+                "meta",
+                "terminal",
             }
             status = unwrap(await session.call_tool("discover", {"topic": "status"}))
             assert status["inventory"]["source"] == "JumpServer REST"

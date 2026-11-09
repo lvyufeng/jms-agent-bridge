@@ -5,8 +5,16 @@ description: Run scripts, remote Docker commands, jobs, accelerator occupancy, a
 
 # JumpServer access
 
-Use the configured bridge's five tools: `fs`, `run`, `read_result`, `discover`, `call`.
+Use `fs`, `run`, `terminal`, `read_result`, `discover`, `call` and `meta`.
 Client-specific prefixes may differ.
+
+- For repeated commands on one target, open a `terminal` bound to that target,
+  then use its handle for exec/read/write and close it when done. Discover
+  `terminal_<action>` for options. Running is not completion; after shell loss,
+  inspect saved output and request receipts before taking further action.
+- Routine replies are compact; use `meta` for diagnostics or `detail="full"`
+  for the previous response shape. `fs` accepts advanced fields in `options`;
+  `discover(operation="jms_fs", query="read")` shows a single action's fields.
 
 - Find authorized targets with `discover(topic="assets", query="<name or address>")`.
   Use an exact returned name or UUID. REST refreshes hourly; YAML does not grant

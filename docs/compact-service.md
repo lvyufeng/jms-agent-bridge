@@ -406,7 +406,28 @@ content, error behavior, metadata and whitespace inside string values. Full save
 files and byte offsets are unchanged. Shared initialization instructions carry
 only cross-tool rules; usage details live in the relevant tool description and
 discovered operation schema. Clients should parse JSON rather than depend on
-presentation indentation. Schemas are still published with the same input shapes.
+presentation indentation. The filesystem schema exposes common fields; existing flat
+arguments remain accepted, and action-specific fields can be passed in `options`.
+
+### Compact views and interactive terminals
+
+Compact replies omit routine timing, transport and duplicate receipt fields. Use
+`detail="full"` to retain the previous presentation, or `meta` to inspect saved
+result/request metadata without repeating the payload. Queue rejections, unknown
+completion, failures, truncation and paging information remain visible.
+
+To reuse a target and shell, open `terminal(action="open", options={"target": ...})`,
+then use the returned session handle with `terminal(session=..., script=...)`,
+`terminal(action="read", session=...)` and `terminal(action="write", session=...,
+input=...)`. Read calls use byte cursors and preserve complete saved output. A
+running response is not completion. Reconcile request IDs after a lost reply;
+never replay unknown work. Lost shells are not silently restored. Close only
+task-owned terminals. Discover `terminal_<action>` for advanced fields.
+
+For files, `discover(operation="jms_fs", query="read")` describes just that
+action; advanced fields go into `fs(options={...})`. The existing flat input
+fields are still accepted for older clients. Clients need tool rediscovery to see
+the new top-level tools; compatibility operations are available through `call`.
 
 Validators for trusted generated operation schemas are compiled once per service;
 validation still reports the same best-match argument error. The `jms_fs` alias

@@ -214,7 +214,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["hosts"][0]["state"], "free")
         self.assertEqual(result["hosts"][1]["state"], "unknown")
 
-    async def test_tool_surface_stays_five_and_hidden_operation_is_discoverable(self):
+    async def test_tool_surface_and_hidden_operation_is_discoverable(self):
         from jms_bridge.compact import BridgeService
         from jms_bridge.config import BastionConfig
         from jms_bridge.runtime_config import BridgeSettings
@@ -224,7 +224,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             BridgeSettings(state_dir=Path(self.tmp.name) / "service"),
         )
         tools = await service.server.list_tools()
-        self.assertEqual({t.name for t in tools}, {"run", "read_result", "discover", "call", "fs"})
+        self.assertEqual(
+            {t.name for t in tools},
+            {"run", "read_result", "discover", "call", "fs", "meta", "terminal"},
+        )
         schema = await service.discover(operation=OPERATION)
         self.assertEqual(schema["inputSchema"]["properties"]["targets"]["maxItems"], 8)
         self.assertTrue(schema["annotations"]["readOnlyHint"])
