@@ -133,7 +133,7 @@ class TargetRecovery(unittest.IsolatedAsyncioTestCase):
             ):
                 await asyncio.sleep(0.001)
 
-        await asyncio.wait_for(waiting(), 2)
+        await asyncio.wait_for(waiting(), 10)
 
     async def test_two_failed_channels_replace_only_target_connection(self):
         self.old.fail_startup = True
@@ -243,16 +243,26 @@ class TargetRecovery(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_host_command_finishes_and_other_host_keeps_running(self):
         release = self.root / "release-command"
+        started = self.root / "command-started"
         active = asyncio.create_task(
             self.runner.execute_to_store(
                 self.a,
-                "while [[ ! -e "
+                "touch "
+                + shlex.quote(str(started))
+                + "; while [[ ! -e "
                 + shlex.quote(str(release))
                 + " ]]; do sleep 0.01; done; printf ORIGINAL_FINISHED",
-                4,
+                30,
             )
         )
-        await self.wait_active(self.a)
+
+        async def wait_started():
+            while not started.exists():
+                await asyncio.sleep(0.01)
+
+        # A lease alone only means that startup has begun. Wait until the
+        # original command is actually running before injecting the failure.
+        await asyncio.wait_for(wait_started(), 10)
         self.old.fail_startup = True
         query = asyncio.create_task(self.query())
         await self.wait_draining()

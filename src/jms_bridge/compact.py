@@ -1,4 +1,4 @@
-"""Five-tool MCP facade with progressive disclosure and REST-backed targets."""
+"""Compact MCP facade with progressive disclosure and REST-backed targets."""
 
 import asyncio
 import contextvars
@@ -27,14 +27,18 @@ from .filesystem import OPERATION as FS_OPERATION
 from .filesystem import SCHEMA as FS_SCHEMA
 from .filesystem import Filesystem
 from .filesystem import validate as validate_fs
+from .interactive import Interactive
+from .interactive import schemas as terminal_schemas
 from .inventory import InventoryError
 from .native_ssh import NativeSSHRunner
 from .recoverable_jobs import RecoverableJobManager
 from .request_journal import RequestJournal
+from .response_views import compact as compact_response
 from .rest_inventory import AssetCatalog
 from .results import ResultStore
 from .runtime_config import StateLock, load_settings
-from .scheduling import queue_rejection
+from .scheduling import QueueFull, QueueTimeout, queue_rejection
+from .schema_views import advertised, fs_action_schema, merge_fs_options
 
 CATEGORIES = {
     "assets": ["jms_list_assets", "jms_asset_detail", "jms_inventory_reload"],
@@ -60,14 +64,21 @@ CATEGORIES = {
     "requests": ["request_status"],
     "fs": [FS_OPERATION],
     "guard": ["script_guard_check"],
+    "metadata": ["result_metadata"],
+    "terminal": [
+        "terminal_open",
+        "terminal_exec",
+        "terminal_read",
+        "terminal_write",
+        "terminal_close",
+    ],
 }
 DANGEROUS_FLAG_DESCRIPTION = (
-    "Acknowledge the bridge's local destructive-pattern guard for this specific, already "
-    "user-authorized command (default false). This flag does not grant authorization, request "
-    "or record approval, or override Codex automatic review, OS permissions, or JumpServer "
-    "policy. Do not use it to retry an external approval denial."
+    "Acknowledge the local guard for this authorized command; "
+    "does not grant authorization or override client or server policy."
 )
-INSTRUCTIONS = """JumpServer: run, fs, read_result, discover, call. Use REST-authorized targets.
+INSTRUCTIONS = """JumpServer: run, fs, terminal, read_result, discover, call, meta.
+Use REST-authorized targets. Compact responses omit routine metadata; detail=full restores it.
 After a lost reply, query request_status with the original request_id; never blindly replay
 uncertain work. allow_dangerous acknowledges only the local guard for an already-authorized
 action; it grants no approval and cannot override client/JumpServer denial.
@@ -76,7 +87,13 @@ Active results are protected; deduplication receipts are retained separately."""
 
 
 class CompactMCPServer(MCPServer):
-    """Minify the SDK's JSON text view without changing structured data or storage."""
+    """Project compact views while retaining canonical saved responses."""
+
+    async def list_tools(self, *args, **kwargs):
+        tools = await super().list_tools(*args, **kwargs)
+        return [
+            t.model_copy(update={"input_schema": advertised(t.name, t.input_schema)}) for t in tools
+        ]
 
     async def call_tool(self, name, arguments, context=None):
         started = time.monotonic()
@@ -119,7 +136,7 @@ class CompactMCPServer(MCPServer):
     async def compact_call(self, name, arguments, context=None):
         result = await super().call_tool(name, arguments, context)
         if (
-            name in {"run", "fs", "read_result", "discover", "call"}
+            name in {"run", "fs", "terminal", "meta", "read_result", "discover", "call"}
             and isinstance(result, CallToolResult)
             and not result.is_error
             and len(result.content) == 1
@@ -130,16 +147,22 @@ class CompactMCPServer(MCPServer):
             try:
                 # These five tools return dicts. This SDK also emits JSON text when
                 # structured_content is absent. Preserve either structured view as-is.
-                text = json.dumps(json.loads(block.text), ensure_ascii=False, separators=(",", ":"))
+                value = original = json.loads(block.text)
+                if (arguments or {}).get("detail", "compact") == "compact" and hasattr(
+                    self, "response_view"
+                ):
+                    value = self.response_view(name, value, arguments or {})
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             except (ValueError, TypeError):
                 return result
             finally:
                 metrics = io_metrics.get()
                 if metrics is not None:
                     metrics["compaction_seconds"] = time.monotonic() - serialization_started
-            result = result.model_copy(
-                update={"content": [block.model_copy(update={"text": text})]}
-            )
+            update = {"content": [block.model_copy(update={"text": text})]}
+            if result.structured_content == original and value != original:
+                update["structured_content"] = value
+            result = result.model_copy(update=update)
         return result
 
 
@@ -183,6 +206,9 @@ class BridgeService:
         self.filesystem = Filesystem(self.catalog, self.runner, self.store)
         self.inspector = AcceleratorInspector(self.catalog, self.runner, self.store)
         self.manager = RecoverableJobManager(self.runner, self.record_submission)
+        self.terminals = Interactive(
+            self.catalog, self.runner, self.store, self.requests, script_is_dangerous
+        )
         self.schemas = {}
         self.validators = {}
         self.fs_validator = jsonschema.validators.validator_for(FS_SCHEMA["inputSchema"])(
@@ -194,10 +220,12 @@ class BridgeService:
             with StateLock(self.settings.state_dir):
                 await self.catalog.start()
                 await self.store.start_retention()
+                await self.terminals.start()
                 try:
                     yield {}
                 finally:
                     await self.requests.drain()
+                    await self.terminals.close_all()
                     await self.filesystem.workers.close()
                     await self.store.close_retention()
                     await self.catalog.close()
@@ -206,7 +234,150 @@ class BridgeService:
         self.server = CompactMCPServer(
             "jms-agent-bridge", version=__version__, instructions=INSTRUCTIONS, lifespan=lifespan
         )
+        self.server.response_view = self.response_view
         self.register()
+
+    def response_view(self, tool, value, arguments):
+        # IPs are used only when the REST inventory resolves them uniquely.
+        assets = self.catalog.snapshot.get("assets", [])
+        counts = {}
+        for asset in assets:
+            address = asset.get("address")
+            counts[address] = counts.get(address, 0) + 1
+        addresses = {
+            a["name"]: a["address"]
+            for a in assets
+            if a.get("address") and counts[a["address"]] == 1
+        }
+        return compact_response(tool, value, arguments, addresses)
+
+    async def meta(self, ref="service", section="summary"):
+        if section not in ("summary", "all", "timing", "transport", "request", "policy"):
+            raise ValueError("unknown metadata section")
+        if ref == "service":
+            if section == "summary":
+                value = {
+                    "version": __version__,
+                    "response_detail": "compact",
+                    "active_requests": len(self.requests.tasks),
+                }
+                if self.catalog.status()["stale"]:
+                    value["inventory_stale"] = True
+                return value
+            value = await self.discover(topic="status")
+            if section == "transport":
+                return {k: value[k] for k in ("ssh_connections", "persistent_shells", "execution")}
+            if section == "policy":
+                return {
+                    k: value[k] for k in ("result_retention", "inventory", "execution", "login")
+                }
+            return value
+        if ref.startswith("request:"):
+            value = await self.request_status(ref[len("request:") :])
+            # Do not re-emit command output or arbitrary operation data here.
+            keys = (
+                "request_id",
+                "operation",
+                "request_state",
+                "completion_unknown",
+                "accepted_at",
+                "finished_at",
+                "duplicate",
+                "execution_replayed",
+                "execution_results",
+                "submission_receipts",
+                "error",
+            )
+            return {k: value[k] for k in keys if k in value}
+        if ref.startswith("result:"):
+            ref = ref[len("result:") :]
+        value = await offload(self.store.metadata, ref)
+        if section == "summary":
+            keys = (
+                "result_id",
+                "kind",
+                "operation",
+                "host",
+                "status",
+                "ok",
+                "exit_code",
+                "execution_state",
+                "completion_unknown",
+                "producer",
+                "expires_at",
+            )
+            return {k: value[k] for k in keys if k in value}
+        if section == "timing":
+            keys = (
+                "result_id",
+                "host",
+                "created_at",
+                "finished_at",
+                "elapsed_seconds",
+                "timing",
+                "connection_timing",
+            )
+        elif section == "transport":
+            keys = (
+                "result_id",
+                "host",
+                "asset_id",
+                "container",
+                "image",
+                "lane",
+                "session_id",
+                "connection_state",
+                "session_state",
+                "reconnected",
+                "executed",
+                "execution_state",
+                "completion_unknown",
+                "timed_out",
+                "queue_timed_out",
+                "failure_stage",
+                "reason",
+                "retryable",
+                "queue",
+                "startup_retry_result_id",
+                "connection_recovery",
+                "warning",
+            )
+        else:
+            keys = tuple(value)
+        result = {k: value[k] for k in keys if k in value}
+        if value.get("execution_result_id"):
+            parent = await offload(self.store.metadata, value["execution_result_id"])
+            result["execution_result_id"] = value["execution_result_id"]
+            if section in ("timing", "transport"):
+                result["execution"] = {k: parent[k] for k in keys if k in parent}
+        if value.get("kind") in ("call", "filesystem") and section in ("all", "request", "policy"):
+            # Canonical operation results are already saved. Only expose links
+            # and metadata here, not log contents or arbitrary result bodies.
+            raw = await offload(self.store.path(ref, "result").read_text)
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for key in ("execution_results", "submission_receipts", "policy"):
+                    if key in data:
+                        result[key] = data[key]
+                if value.get("kind") == "filesystem":
+                    result["file"] = {
+                        k: data[k]
+                        for k in (
+                            "path",
+                            "encoding",
+                            "decoding_errors",
+                            "fingerprint",
+                            "start_line",
+                            "next_line",
+                            "byte_offset",
+                            "next_byte_offset",
+                            "total_bytes",
+                            "eof",
+                            "truncated",
+                        )
+                        if k in data
+                    }
+        return result
 
     async def record_submission(self, receipt):
         rows = self.submissions_context.get()
@@ -284,6 +455,7 @@ class BridgeService:
         }
         self.schemas[INSPECT_OPERATION] = INSPECT_SCHEMA
         self.schemas[FS_OPERATION] = FS_SCHEMA
+        self.schemas.update(terminal_schemas())
         for schema in self.schemas.values():
             flag = schema.get("inputSchema", {}).get("properties", {}).get("allow_dangerous")
             if flag is not None:
@@ -306,6 +478,18 @@ class BridgeService:
         }.items():
             self.schemas[name]["description"] = desc
         for name, description, props, required in [
+            (
+                "result_metadata",
+                "Read saved metadata without running a command.",
+                {
+                    "ref": {"type": "string"},
+                    "section": {
+                        "type": "string",
+                        "enum": ["summary", "all", "timing", "transport", "request", "policy"],
+                    },
+                },
+                ["ref"],
+            ),
             (
                 "request_status",
                 "Read saved request/job/result receipts; never executes work. "
@@ -338,7 +522,7 @@ class BridgeService:
                 },
                 "annotations": {
                     "readOnlyHint": name
-                    in ("session_list", "request_status", "script_guard_check"),
+                    in ("session_list", "request_status", "script_guard_check", "result_metadata"),
                     "destructiveHint": name == "session_close",
                 },
             }
@@ -535,6 +719,8 @@ class BridgeService:
         if operation:
             if operation not in self.schemas:
                 raise ValueError("unknown operation; use discover(query=...)")
+            if operation == FS_OPERATION and query:
+                return fs_action_schema(self.schemas[operation], query)
             return self.schemas[operation]
         if not query:
             return {
@@ -569,6 +755,10 @@ class BridgeService:
             return await self.requests.execute(
                 request_id, operation, arguments, lambda: self.call(operation, arguments)
             )
+        if operation == "result_metadata":
+            return await self.meta(**arguments)
+        if operation.startswith("terminal_"):
+            return await self.terminal(operation[len("terminal_") :], arguments)
         if operation == FS_OPERATION:
             return await self.fs(arguments, _validated=True)
         if operation == INSPECT_OPERATION:
@@ -693,8 +883,53 @@ class BridgeService:
             return await self.requests.execute(request_id, "fs", args, perform)
         return await self.filesystem.execute(**args)
 
+    async def terminal(self, action, arguments):
+        await self.load_schemas()
+        validate_cached(self.validators["terminal_" + action], arguments)
+        args = dict(arguments)
+        request_id = args.pop("request_id", None)
+
+        async def perform():
+            method = self.terminals.execute if action == "exec" else getattr(self.terminals, action)
+            try:
+                return await method(**args)
+            except (QueueFull, QueueTimeout) as exc:
+                return {
+                    "ok": False,
+                    "execution_state": "not_started",
+                    "executed": False,
+                    "completion_unknown": False,
+                    "failure_stage": exc.stage,
+                    "queue_timed_out": isinstance(exc, QueueTimeout),
+                    "error": str(exc),
+                    **(exc.response() if isinstance(exc, QueueFull) else {}),
+                }
+
+        if request_id is not None:
+            # Preview/wait settings do not affect execution identity.
+            identity = {
+                k: v for k, v in args.items() if k not in ("wait_ms", "max_bytes", "cursor")
+            }
+            return await self.requests.execute(request_id, "terminal_" + action, identity, perform)
+        return await perform()
+
     def register(self):
         server = self.server
+
+        @server.tool(
+            name="meta", annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+        )
+        async def meta(
+            ref: str = "service",
+            section: Literal[
+                "summary", "all", "timing", "transport", "request", "policy"
+            ] = "summary",
+        ) -> dict:
+            """Read service, result or request:<ID> metadata; use read_result for output."""
+            try:
+                return await self.meta(ref, section)
+            except (ValueError, OSError) as exc:
+                raise ToolError(str(exc)) from None
 
         @server.tool(
             name="fs",
@@ -740,6 +975,8 @@ class BridgeService:
             context_lines: int | None = None,
             max_file_bytes: int | None = None,
             timeout: int | None = None,
+            detail: Literal["compact", "full"] = "compact",
+            options: dict | None = None,
         ) -> dict:
             """Explore files or transfer them on one exact REST asset; optional existing container.
             Absolute paths/patterns are data, not shell.
@@ -749,7 +986,7 @@ class BridgeService:
             deleted. Set request_id for transfers; recover via request_status. Bounded pages:
             read uses byte_offset; list/glob/search/tree use offset/limit. Search defaults
             literal, case-sensitive. result_id saves this page, not unseen pages.
-            discover(operation='jms_fs') provides action-specific options, defaults and limits.
+            Put advanced fields in options; discover(operation='jms_fs', query=action) lists them.
             """
             import jsonschema
 
@@ -782,7 +1019,9 @@ class BridgeService:
                 timeout=timeout,
             )
             try:
-                return await self.fs({k: v for k, v in arguments.items() if v is not None})
+                return await self.fs(
+                    merge_fs_options({k: v for k, v in arguments.items() if v is not None}, options)
+                )
             except jsonschema.ValidationError as exc:
                 raise ToolError(
                     "Invalid fs arguments at "
@@ -790,6 +1029,36 @@ class BridgeService:
                     + "; discover jms_fs for details"
                 ) from None
             except (ValueError, OSError, ConfigError, InventoryError) as exc:
+                raise ToolError(str(exc)) from None
+
+        @server.tool(
+            name="terminal", annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True)
+        )
+        async def terminal(
+            action: Literal["open", "exec", "read", "write", "close"] = "exec",
+            session: str | None = None,
+            script: str | None = None,
+            input: str | None = None,
+            options: dict | None = None,
+        ) -> dict:
+            """Open a bound shell using options.target; use its handle for exec/read/write/close.
+            Running is not completion. Discover terminal_<action> for advanced options.
+            """
+            args = dict(options or {})
+            for key, value in (("session", session), ("script", script), ("input", input)):
+                if value is not None:
+                    if key in args:
+                        raise ToolError("duplicate terminal argument: " + key)
+                    args[key] = value
+            try:
+                return await self.terminal(action, args)
+            except (
+                ValueError,
+                OSError,
+                ConfigError,
+                InventoryError,
+                jsonschema.ValidationError,
+            ) as exc:
                 raise ToolError(str(exc)) from None
 
         @server.tool(
@@ -809,16 +1078,11 @@ class BridgeService:
             max_output_bytes: int = 4096,
             allow_dangerous: Annotated[bool, Field(description=DANGEROUS_FLAG_DESCRIPTION)] = False,
             request_id: str | None = None,
+            detail: Literal["compact", "full"] = "compact",
         ) -> dict:
-            """Run literal Bash or absolute local script_path on REST assets. container/image
-            selects Docker; cwd/env/docker_args apply there. Isolated by default; session_id
-            retains shell state. Lost shells need a new ID or session_close. Idle SSH reconnects;
-            channel opening retries only before transmission. Never blindly replay unknown
-            completion/timeouts. queue_full is a per-target unsent refusal: throttle, then retry
-            only refused targets with a new request_id. Same ID returns its receipt, never replays;
-            reconcile request_status after reply loss. Timeout 1..600s; use jobs for long work.
-            Full output is saved; previews share max_output_bytes across targets (default4096).
-            read_result fetches more. allow_dangerous acknowledges the guard, not authorization.
+            """Run Bash on REST targets; session_id retains shell state. Use request_id for
+            writes, then reconcile lost replies. queue_full is an unsent per-target refusal.
+            Full output is saved; read_result fetches it. allow_dangerous is not authorization.
             """
             try:
                 return await self.run(
@@ -849,6 +1113,7 @@ class BridgeService:
             limit: int = 4096,
             tail: bool = False,
             pattern: str | None = None,
+            detail: Literal["compact", "full"] = "compact",
         ) -> dict:
             """Read saved output by byte offset (limit <=16384), tail, or literal pattern; continue
             with next_offset.
@@ -869,12 +1134,10 @@ class BridgeService:
             topic: Literal["operations", "assets", "status"] = "operations",
             limit: int = 10,
             offset: int = 0,
+            detail: Literal["compact", "full"] = "compact",
         ) -> dict:
-            """topic=assets searches hourly REST targets; status shows service/SSH health and work
-            queues. Inventory is not hardware health:
-            discover(operation='jms_accelerator_status') for live GPU/NPU occupancy on 1-8
-            explicit hosts; unknown is not free. query finds operation names or categories (e.g.
-            jobs); operation returns one full schema; no query lists categories.
+            """Search assets or operation names; operation returns one schema. Inventory does
+            not show accelerator occupancy; use jms_accelerator_status for live checks.
             """
             try:
                 return await self.discover(query, operation, topic, limit, offset)
@@ -884,9 +1147,13 @@ class BridgeService:
         @server.tool(
             name="call", annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True)
         )
-        async def call(operation: str, arguments: dict, request_id: str | None = None) -> dict:
-            """Invoke an operation disclosed by discover. Top-level request_id supports only
-            jms_submit_job: set it before submission, then use request_status after a lost reply.
+        async def call(
+            operation: str,
+            arguments: dict,
+            request_id: str | None = None,
+            detail: Literal["compact", "full"] = "compact",
+        ) -> dict:
+            """Call a discovered operation. request_id applies to jms_submit_job.
             Full responses: read_result(stream='result').
             """
             import jsonschema

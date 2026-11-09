@@ -130,7 +130,9 @@ async def test_saved_bytes_cursors_and_native_tool_surface_are_preserved(tmp_pat
     path = service.store.path(rid, "stdout")
     path.write_bytes(raw)
     service.store.finish(rid)
-    response = await service.server.call_tool("read_result", {"result_id": rid, "limit": 7})
+    response = await service.server.call_tool(
+        "read_result", {"result_id": rid, "limit": 7, "detail": "full"}
+    )
     assert json.loads(response.content[0].text) == service.store.read(rid, limit=7)
     assert response.structured_content is None
     assert path.read_bytes() == raw
@@ -140,6 +142,8 @@ async def test_saved_bytes_cursors_and_native_tool_surface_are_preserved(tmp_pat
         "discover",
         "call",
         "fs",
+        "meta",
+        "terminal",
     }
     assert len(INSTRUCTIONS.encode()) < 1024
     await service.runner.close()

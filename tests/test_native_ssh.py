@@ -370,6 +370,65 @@ async def test_facade_script_file_and_hidden_execution_results(loopback):
     assert result["data"]["closed"]
 
 
+async def test_terminal_interaction_over_real_loopback_ssh(loopback):
+    t = loopback
+    service = BridgeService(t.cfg, t.settings)
+    service.runner = t.runner
+    service.terminals.runner = t.runner
+    service.catalog._fetch = AsyncMock(
+        return_value=[
+            {
+                "id": t.host.asset_id,
+                "name": "node",
+                "address": "192.0.2.20",
+                "active": True,
+                "protocols": ["ssh"],
+                "accounts": ["root"],
+                "account": "root",
+                "login": t.host.login,
+            }
+        ]
+    )
+    await service.catalog.refresh()
+    opened = unwrap(
+        await service.server.call_tool(
+            "terminal", {"action": "open", "options": {"target": "node", "env": {"CASE": "bound"}}}
+        )
+    )
+    sid = opened["session"]
+    try:
+        started = unwrap(
+            await service.server.call_tool(
+                "terminal",
+                {
+                    "session": sid,
+                    "script": "printf '%s?' \"$CASE\"; read -r answer; printf '%s' \"$answer\"",
+                    "options": {"wait_ms": 100},
+                },
+            )
+        )
+        assert started["state"] == "running" and started["stdout"] == "bound?"
+        await service.server.call_tool(
+            "terminal",
+            {"action": "write", "session": sid, "input": "yes\n", "options": {"wait_ms": 1000}},
+        )
+        await service.terminals.binding(sid).command.task
+        page = unwrap(
+            await service.server.call_tool(
+                "terminal",
+                {
+                    "action": "read",
+                    "session": sid,
+                    "options": {"wait_ms": 0, "cursor": {"stdout": 0, "stderr": 0}},
+                },
+            )
+        )
+        assert page["state"] == "completed" and page["stdout"] == "bound?yes"
+        assert page["exit_code"] == 0
+    finally:
+        await service.terminals.close(sid)
+
+
 async def test_marker_boundary_pump(tmp_path):
     reader = asyncio.StreamReader()
     reader.feed_data(b"prefixMAR")

@@ -304,7 +304,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(kwargs["delete"])
             self.assertFalse(kwargs["overwrite"])
 
-    async def test_schema_five_tools_and_fs_dispatch(self):
+    async def test_schema_tools_and_fs_dispatch(self):
         from jms_bridge.compact import BridgeService
 
         with tempfile.TemporaryDirectory() as td:
@@ -314,7 +314,8 @@ class Integration(unittest.IsolatedAsyncioTestCase):
             )
             tools = await service.server.list_tools()
             self.assertEqual(
-                {t.name for t in tools}, {"run", "read_result", "discover", "call", "fs"}
+                {t.name for t in tools},
+                {"run", "read_result", "discover", "call", "fs", "meta", "terminal"},
             )
             schema = await service.discover(operation="jms_fs")
             self.assertFalse(schema["annotations"]["readOnlyHint"])
